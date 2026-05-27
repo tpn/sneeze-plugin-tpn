@@ -12,6 +12,24 @@ dependencies = [
   "sneeze",
 ]
 
+[project.optional-dependencies]
+pdf = [
+  "pdf2image",
+  "pillow",
+  "tqdm",
+]
+ocr = [
+  "huggingface_hub",
+  "pdf2image",
+  "pillow",
+  "tqdm",
+  "transformers",
+]
+dev = [
+  "pytest",
+  "ruff",
+]
+
 [project.entry-points."sneeze.plugins"]
 tpn = "sneeze.tpn"
 
