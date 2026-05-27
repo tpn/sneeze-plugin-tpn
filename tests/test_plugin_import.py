@@ -233,6 +233,24 @@ def test_bootstrap_commands_support_dry_run():
     assert "deepseek-ai/DeepSeek-OCR" in text
 
 
+def test_command_docstrings_explain_workflow_prerequisites():
+    from sneeze.tpn.commands import (
+        DeepseekOcrCreateEnv,
+        DeepseekOcrDownloadModel,
+        OcrPdfPages,
+        PdfToPages,
+    )
+
+    assert "pdftocairo" in PdfToPages.__doc__
+    assert "pdftotext" in PdfToPages.__doc__
+    assert "sne ocr-pdf-pages" in PdfToPages.__doc__
+    assert "sne pdf-to-pages" in OcrPdfPages.__doc__
+    assert "sne deepseek-ocr-create-env" in OcrPdfPages.__doc__
+    assert "sne deepseek-ocr-download-model" in OcrPdfPages.__doc__
+    assert "sne ocr-pdf-pages" in DeepseekOcrCreateEnv.__doc__
+    assert "sne ocr-pdf-pages" in DeepseekOcrDownloadModel.__doc__
+
+
 def test_documented_commands_are_visible_to_sneeze_cli():
     from sneeze import cli as sneeze_cli
 
