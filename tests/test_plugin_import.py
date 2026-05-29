@@ -1,6 +1,9 @@
 import base64
+import json
 from io import StringIO
 from types import SimpleNamespace
+
+import pytest
 
 VALID_PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+Xk6cAAAAASUVORK5CYII="
@@ -164,6 +167,41 @@ def test_ocr_task_collection_skips_existing_outputs(tmp_path):
     assert tasks[0].output_path == str(dest_dir / "page-2.md")
 
 
+def test_ocr_full_collection_skips_only_complete_bundles(tmp_path):
+    from sneeze.tpn.ocr_vllm import collect_ocr_full_items
+
+    source_dir = tmp_path / "pages"
+    dest_dir = tmp_path / "ocr"
+    source_dir.mkdir()
+    dest_dir.mkdir()
+    (source_dir / "page-1.png").write_bytes(VALID_PNG_BYTES)
+    (source_dir / "page-2.png").write_bytes(VALID_PNG_BYTES)
+    for suffix in ("ocr", "md", "json"):
+        (dest_dir / f"page-1.{suffix}").write_text(
+            "done",
+            encoding="utf-8",
+        )
+    (dest_dir / "page-2.ocr").write_text("ocr", encoding="utf-8")
+
+    items, pdf_count = collect_ocr_full_items(
+        source_dir=str(source_dir),
+        dest_dir=str(dest_dir),
+        text_source_dir=None,
+        force=False,
+        scan_parallelism=1,
+    )
+
+    assert pdf_count == 1
+    assert len(items) == 1
+    assert items[0].image_path == str(source_dir / "page-2.png")
+    assert items[0].ocr_path == str(dest_dir / "page-2.ocr")
+    assert items[0].markdown_path == str(dest_dir / "page-2.md")
+    assert items[0].json_path == str(dest_dir / "page-2.json")
+    assert items[0].need_ocr is False
+    assert items[0].need_markdown is True
+    assert items[0].need_json is True
+
+
 def test_ocr_pdf_pages_uses_processor(tmp_path, monkeypatch):
     import sneeze.tpn.ocr_vllm as ocr_vllm
     from sneeze.tpn.commands import OcrPdfPages
@@ -202,6 +240,110 @@ def test_ocr_pdf_pages_uses_processor(tmp_path, monkeypatch):
     assert captured["kwargs"]["temperature"] == 0.2
     assert len(captured["tasks"]) == 1
     assert captured["tasks"][0].output_path == str(dest_dir / "page-1.md")
+
+
+def test_ocr_pdf_pages_full_mode_writes_bundle(tmp_path, monkeypatch):
+    import sneeze.tpn.ocr_vllm as ocr_vllm
+    from sneeze.tpn.commands import OcrPdfPages
+
+    source_dir = tmp_path / "pages"
+    dest_dir = tmp_path / "ocr"
+    source_dir.mkdir()
+    (source_dir / "page-1.png").write_bytes(VALID_PNG_BYTES)
+    (source_dir / "page-1.txt").write_text("raw text", encoding="utf-8")
+    captured = {"runs": []}
+
+    class FakeProcessor:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+            self.output_format = kwargs["output_format"]
+            self.prompt_mode = kwargs["prompt_mode"]
+            self.use_grounding = kwargs["use_grounding"]
+            self.keep_grounding = kwargs["keep_grounding"]
+
+        def init_progressbar(self, total=None):
+            captured["total"] = total
+
+        def close_progressbar(self):
+            captured["closed"] = True
+
+        def update_progressbar(self, amount=1):
+            captured["updates"] = captured.get("updates", 0) + amount
+
+        def prepare_engine(self):
+            captured["prepared"] = True
+            return object(), object()
+
+        def shutdown_engine(self, llm):
+            captured["shutdown"] = llm is not None
+
+        def run(self, tasks, *, llm=None, sampling_params=None):
+            tasks = list(tasks)
+            captured["runs"].append(
+                {
+                    "prompt_mode": self.prompt_mode,
+                    "use_grounding": self.use_grounding,
+                    "keep_grounding": self.keep_grounding,
+                    "outputs": [task.output_path for task in tasks],
+                    "llm": llm is not None,
+                    "sampling_params": sampling_params is not None,
+                }
+            )
+            for task in tasks:
+                with open(task.output_path, "w", encoding="utf-8") as handle:
+                    handle.write(f"{self.prompt_mode} output\n")
+            self.update_progressbar(len(tasks))
+
+    monkeypatch.setattr(
+        ocr_vllm,
+        "DeepSeekOcrOfflineProcessor",
+        FakeProcessor,
+    )
+    out = StringIO()
+    command = OcrPdfPages(None, out, None)
+    command._source_dir = str(source_dir)
+    command.dest_dir = str(dest_dir)
+    command.output_format = "md"
+    command.prompt_mode = "full"
+    command._scan_parallelism = 1
+
+    command.run()
+
+    assert captured["prepared"] is True
+    assert captured["total"] == 3
+    assert captured["updates"] == 3
+    assert [run["prompt_mode"] for run in captured["runs"]] == [
+        "plain_ocr",
+        "markdown",
+    ]
+    assert captured["runs"][0]["use_grounding"] is True
+    assert captured["runs"][0]["keep_grounding"] is True
+    assert captured["runs"][1]["use_grounding"] is False
+    assert captured["runs"][1]["keep_grounding"] is False
+    assert captured["runs"][0]["llm"] is True
+    assert captured["runs"][1]["sampling_params"] is True
+    payload = json.loads((dest_dir / "page-1.json").read_text())
+    assert payload["ocr_text"] == "plain_ocr output\n"
+    assert payload["markdown_text"] == "markdown output\n"
+    assert payload["raw_text"] == "raw text"
+    assert payload["image_dims"] == {"w": 1, "h": 1}
+
+
+def test_ocr_pdf_pages_full_rejects_html_output(tmp_path):
+    from sneeze.command import CommandError
+
+    from sneeze.tpn.commands import OcrPdfPages
+
+    source_dir = tmp_path / "pages"
+    source_dir.mkdir()
+    out = StringIO()
+    command = OcrPdfPages(None, out, None)
+    command._source_dir = str(source_dir)
+    command.output_format = "html"
+    command.prompt_mode = "full"
+
+    with pytest.raises(CommandError, match="requires --output-format md"):
+        command.run()
 
 
 def test_bootstrap_commands_support_dry_run():
@@ -247,6 +389,8 @@ def test_command_docstrings_explain_workflow_prerequisites():
     assert "sne pdf-to-pages" in OcrPdfPages.__doc__
     assert "sne deepseek-ocr-create-env" in OcrPdfPages.__doc__
     assert "sne deepseek-ocr-download-model" in OcrPdfPages.__doc__
+    assert "--prompt-mode full" in OcrPdfPages.__doc__
+    assert "--output-format html" in OcrPdfPages.__doc__
     assert "sne ocr-pdf-pages" in DeepseekOcrCreateEnv.__doc__
     assert "sne ocr-pdf-pages" in DeepseekOcrDownloadModel.__doc__
 

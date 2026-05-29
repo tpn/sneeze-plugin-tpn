@@ -185,6 +185,9 @@ class OcrPdfPages(InvariantAwareCommand):
     Before running, render pages with `sne pdf-to-pages`, create a vLLM env
     with `sne deepseek-ocr-create-env`, and cache the model with
     `sne deepseek-ocr-download-model`. Run this command inside that env.
+    Use `--prompt-mode full` to write `.ocr`, `.md`, and `.json` page
+    bundles from existing page images. HTML output is a separate
+    `--output-format html` mode, not part of `full`.
     """
 
     _verbose_ = True
@@ -243,7 +246,7 @@ class OcrPdfPages(InvariantAwareCommand):
 
     class PromptModeArg(StringInvariant):
         _help = (
-            "Prompt mode: plain_ocr, markdown, or html. "
+            "Prompt mode: plain_ocr, markdown, html, or full. "
             "[default: %default]"
         )
         _mandatory = False
@@ -404,6 +407,7 @@ class OcrPdfPages(InvariantAwareCommand):
     def run(self):
         from .ocr_vllm import (
             DeepSeekOcrOfflineProcessor,
+            collect_ocr_full_items,
             collect_ocr_tasks,
             resolve_scan_workers,
         )
@@ -424,9 +428,14 @@ class OcrPdfPages(InvariantAwareCommand):
             raise CommandError("--output-format must be md, html, or ocr")
         prompt_mode = _option_value(self, "prompt_mode", "markdown")
         prompt_mode = prompt_mode.lower().strip()
-        if prompt_mode not in {"plain_ocr", "markdown", "html"}:
+        if prompt_mode not in {"plain_ocr", "markdown", "html", "full"}:
             raise CommandError(
-                "--prompt-mode must be plain_ocr, markdown, or html"
+                "--prompt-mode must be plain_ocr, markdown, html, or full"
+            )
+        if prompt_mode == "full" and output_format != "md":
+            raise CommandError(
+                "--prompt-mode full writes .ocr, .md, and .json and "
+                "requires --output-format md"
             )
         output_ext = "ocr" if output_format == "ocr" else output_format
         text_source_dir = _option_value(
@@ -441,31 +450,53 @@ class OcrPdfPages(InvariantAwareCommand):
 
         scan_workers = resolve_scan_workers(self._scan_parallelism)
         self._out(f"Scanning page images under {source_dir}...")
-        tasks, pdf_count = collect_ocr_tasks(
-            source_dir=source_dir,
-            dest_dir=dest_dir,
-            text_source_dir=text_source_dir,
-            output_ext=output_ext,
-            force=bool(self.force),
-            scan_parallelism=scan_workers,
-            out=self._out,
-        )
-        if self._offset:
-            tasks = tasks[self._offset :]
-        if self._limit:
-            tasks = tasks[: self._limit]
-        if not tasks:
-            self._out("No page images found to OCR.")
-            return
+        items = []
+        if prompt_mode == "full":
+            items, pdf_count = collect_ocr_full_items(
+                source_dir=source_dir,
+                dest_dir=dest_dir,
+                text_source_dir=text_source_dir,
+                force=bool(self.force),
+                scan_parallelism=scan_workers,
+                out=self._out,
+            )
+            if self._offset:
+                items = items[self._offset :]
+            if self._limit:
+                items = items[: self._limit]
+            if not items:
+                self._out("No page images need full OCR.")
+                return
+            work_count = len(items)
+        else:
+            tasks, pdf_count = collect_ocr_tasks(
+                source_dir=source_dir,
+                dest_dir=dest_dir,
+                text_source_dir=text_source_dir,
+                output_ext=output_ext,
+                force=bool(self.force),
+                scan_parallelism=scan_workers,
+                out=self._out,
+            )
+            if self._offset:
+                tasks = tasks[self._offset :]
+            if self._limit:
+                tasks = tasks[: self._limit]
+            if not tasks:
+                self._out("No page images found to OCR.")
+                return
+            work_count = len(tasks)
 
-        self._out(f"Found {len(tasks)} page(s) across {pdf_count} PDF(s).")
+        self._out(f"Found {work_count} page(s) across {pdf_count} PDF(s).")
         self._out(f"Writing OCR output to {dest_dir}.")
         try:
             processor = DeepSeekOcrOfflineProcessor(
                 model=_option_value(self, "model", DEFAULT_OCR_MODEL),
                 output_format=output_format,
                 prompt=_option_value(self, "prompt"),
-                prompt_mode=prompt_mode,
+                prompt_mode=(
+                    "plain_ocr" if prompt_mode == "full" else prompt_mode
+                ),
                 keep_grounding=bool(self.keep_grounding),
                 use_grounding=False if self.no_grounding else None,
                 batch_size=self._batch_size,
@@ -495,9 +526,67 @@ class OcrPdfPages(InvariantAwareCommand):
                 out=self._out,
                 verbose=self._verbose,
             )
-            processor.run(tasks)
+            if prompt_mode == "full":
+                self._run_full_mode(processor, items)
+            else:
+                processor.run(tasks)
         except RuntimeError as exc:
             raise CommandError(str(exc)) from exc
+
+    def _run_full_mode(self, processor, items) -> None:
+        from .ocr_vllm import OcrPageTask, write_ocr_page_bundle
+
+        ocr_tasks = [
+            OcrPageTask(
+                image_path=item.image_path,
+                output_path=item.ocr_path,
+                text_source_path=item.text_path,
+            )
+            for item in items
+            if item.need_ocr
+        ]
+        markdown_tasks = [
+            OcrPageTask(
+                image_path=item.image_path,
+                output_path=item.markdown_path,
+                text_source_path=item.text_path,
+            )
+            for item in items
+            if item.need_markdown
+        ]
+        total_actions = len(ocr_tasks) + len(markdown_tasks) + len(items)
+        llm = None
+        sampling_params = None
+        try:
+            processor.init_progressbar(total=total_actions)
+            if ocr_tasks or markdown_tasks:
+                llm, sampling_params = processor.prepare_engine()
+            if ocr_tasks:
+                processor.output_format = "ocr"
+                processor.prompt_mode = "plain_ocr"
+                processor.use_grounding = True
+                processor.keep_grounding = True
+                processor.run(
+                    ocr_tasks,
+                    llm=llm,
+                    sampling_params=sampling_params,
+                )
+            if markdown_tasks:
+                processor.output_format = "md"
+                processor.prompt_mode = "markdown"
+                processor.use_grounding = False
+                processor.keep_grounding = False
+                processor.run(
+                    markdown_tasks,
+                    llm=llm,
+                    sampling_params=sampling_params,
+                )
+            for item in items:
+                write_ocr_page_bundle(item)
+                processor.update_progressbar(1)
+        finally:
+            processor.close_progressbar()
+            processor.shutdown_engine(llm)
 
 
 class DeepseekOcrCreateEnv(InvariantAwareCommand):

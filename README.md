@@ -30,6 +30,17 @@ OCR rendered page images with a local vLLM DeepSeek OCR environment:
 sne ocr-pdf-pages --source-dir ./pages --dest-dir ./ocr --limit 4
 ```
 
+For the full OCR bundle, render pages first and then run:
+
+```bash
+sne pdf-to-pages --source-dir ./pdfs --dest-dir ./pages --recursive
+sne ocr-pdf-pages --source-dir ./pages --dest-dir ./ocr --prompt-mode full
+```
+
+`--prompt-mode full` consumes existing page PNGs and writes `.ocr`, `.md`, and
+`.json` outputs. It does not render PDFs itself. HTML OCR remains a separate
+single-output mode via `--output-format html`.
+
 Useful constrained run for a single GPU:
 
 ```bash

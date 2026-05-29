@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import multiprocessing
 import os
 import re
@@ -26,6 +27,20 @@ class OcrScanCandidate:
     image_path: str
     base: str
     text_path: str | None = None
+
+
+@dataclass(frozen=True)
+class OcrFullItem:
+    image_path: str
+    base: str
+    ocr_path: str
+    markdown_path: str
+    json_path: str
+    text_path: str | None = None
+    need_ocr: bool = False
+    need_markdown: bool = False
+    need_json: bool = False
+    image_dims: dict[str, int] | None = None
 
 
 def resolve_scan_workers(scan_parallelism: int | None) -> int:
@@ -83,6 +98,40 @@ def collect_ocr_tasks(
     return tasks, pdf_count
 
 
+def collect_ocr_full_items(
+    *,
+    source_dir: str,
+    dest_dir: str,
+    text_source_dir: str | None,
+    force: bool,
+    scan_parallelism: int,
+    out: Callable[[str], None] | None = None,
+) -> tuple[list[OcrFullItem], int]:
+    candidates, pdf_count = collect_ocr_scan_candidates(
+        source_dir=source_dir,
+        dest_dir=dest_dir,
+        text_source_dir=text_source_dir,
+    )
+    if not candidates:
+        return [], pdf_count
+    if out:
+        label = "image" if len(candidates) == 1 else "images"
+        out(
+            f"Indexed {len(candidates)} page {label}; collecting full OCR "
+            f"work with {scan_parallelism} scan worker(s)..."
+        )
+    records = collect_ocr_scan_results(
+        candidates,
+        partial(
+            ocr_full_item_from_candidate,
+            dest_dir=os.path.abspath(dest_dir),
+            force=force,
+        ),
+        max_workers=scan_parallelism,
+    )
+    return [record for record in records if record is not None], pdf_count
+
+
 def collect_ocr_scan_candidates(
     *,
     source_dir: str,
@@ -138,6 +187,80 @@ def ocr_task_record_from_candidate(
     if not force and os.path.exists(output_path):
         return None
     return candidate.image_path, output_path, candidate.text_path
+
+
+def ocr_full_item_from_candidate(
+    candidate: OcrScanCandidate,
+    dest_dir: str,
+    force: bool,
+) -> OcrFullItem | None:
+    ocr_path = os.path.join(dest_dir, f"{candidate.base}.ocr")
+    markdown_path = os.path.join(dest_dir, f"{candidate.base}.md")
+    json_path = os.path.join(dest_dir, f"{candidate.base}.json")
+    need_ocr = force or not os.path.exists(ocr_path)
+    need_markdown = force or not os.path.exists(markdown_path)
+    need_json = force or not os.path.exists(json_path)
+    if not (need_ocr or need_markdown or need_json):
+        return None
+    return OcrFullItem(
+        image_path=candidate.image_path,
+        base=candidate.base,
+        ocr_path=ocr_path,
+        markdown_path=markdown_path,
+        json_path=json_path,
+        text_path=candidate.text_path,
+        need_ocr=need_ocr,
+        need_markdown=need_markdown,
+        need_json=need_json,
+        image_dims=ocr_image_dims(candidate.image_path),
+    )
+
+
+def ocr_image_dims(image_path: str) -> dict[str, int] | None:
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        Image.MAX_IMAGE_PIXELS = None
+        with Image.open(image_path) as image:
+            return {"w": image.size[0], "h": image.size[1]}
+    except Exception:
+        return None
+
+
+def write_ocr_page_bundle(item: OcrFullItem) -> None:
+    payload = {
+        "image_path": item.image_path,
+        "ocr_path": item.ocr_path,
+        "markdown_path": item.markdown_path,
+        "text_path": item.text_path,
+        "ocr_text": read_optional_text(item.ocr_path),
+        "markdown_text": read_optional_text(item.markdown_path),
+        "raw_text": read_optional_text(item.text_path),
+        "image_dims": item.image_dims,
+    }
+    payload = {
+        key: value
+        for key, value in payload.items()
+        if value is not None
+    }
+    directory = os.path.dirname(item.json_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(item.json_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+
+
+def read_optional_text(path: str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return None
 
 
 def collect_ocr_scan_results(
