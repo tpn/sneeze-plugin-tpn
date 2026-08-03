@@ -69,11 +69,69 @@ inherit secrets, and run with ambient inference controls scrubbed. The benchmark
 harness has a separate, explicit approval gate for API-backed providers; see
 [`benchmarks/ocr/README.md`](benchmarks/ocr/README.md).
 
-## MinerU2.5-Pro Markdown Provider
+## Structured local OCR backends
+
+The backend registry keeps model revisions, environment tuples, adapter
+identity, and per-capability qualification status in one place. Listing the
+registry is lightweight and does not import Torch, Transformers, or vLLM:
+
+```bash
+sne ocr-backend-list
+sne ocr-backend-list --format json
+```
+
+Use the setup commands to create an isolated environment, fetch the immutable
+model revision, write a local provider specification, and validate the complete
+binding. This MinerU example keeps the model, provider specification, and
+diagnostic evidence in scratch space:
+
+```bash
+BACKEND_SCRATCH=$(mktemp -d /tmp/sneeze-tpn-ocr-backend.XXXXXX)
+MODEL_CACHE="$BACKEND_SCRATCH/hf-cache"
+MINERU_PY=/absolute/path/to/sneeze-ocr-mineru25/bin/python
+
+sne ocr-backend-create-env --backend mineru25 --dry-run
+sne ocr-backend-create-env --backend mineru25
+
+sne ocr-backend-fetch-model \
+  --backend mineru25 \
+  --cache-dir "$MODEL_CACHE" \
+  --dry-run
+sne ocr-backend-fetch-model \
+  --backend mineru25 \
+  --cache-dir "$MODEL_CACHE"
+
+sne ocr-backend-write-spec \
+  --backend mineru25 \
+  --output "$BACKEND_SCRATCH/provider-spec.json" \
+  --python-executable "$MINERU_PY" \
+  --cache-dir "$MODEL_CACHE"
+
+sne ocr-backend-doctor \
+  --provider-spec "$BACKEND_SCRATCH/provider-spec.json"
+sne ocr-backend-doctor \
+  --provider-spec "$BACKEND_SCRATCH/provider-spec.json" \
+  --load-model
+```
+
+The dry runs print the exact command plans. The fetch command uses the pinned
+revision rather than a mutable branch or tag. `ocr-backend-write-spec` refuses
+to replace an existing file. The doctor checks the model snapshot, adapter,
+offline settings, and runtime package tuple; `--load-model` adds an actual GPU
+initialization check. Keep the resulting specification and all benchmark or
+experimental OCR output in scratch space, never in either canonical paper
+corpus.
+
+`ocr-backend-write-spec` applies to provider-process backends such as MinerU.
+DeepSeek remains the in-process grounded-OCR backend. The registry reports its
+Markdown capability separately from its grounded-OCR capability, so a model is
+not treated as generally qualified because one capability passed.
+
+### MinerU2.5-Pro Markdown provider
 
 The shipped adapter at `sneeze.tpn.providers.mineru25` implements the native
 two-stage MinerU layout/recognition pipeline that qualified on the cuPhoton
-regression and stratified suites. It is pinned by default to:
+regression and stratified suites. The registry pins it to:
 
 ```text
 opendatalab/MinerU2.5-Pro-2605-1.2B
@@ -87,65 +145,6 @@ mineru-vl-utils 1.0.5, accelerate 1.14.0, huggingface-hub 0.36.2, and Pillow
 12.2.0. The model card and `mineru-vl-utils` declare Apache-2.0; weights are not
 vendored by this plugin.
 
-Download the exact revision into one explicit Hugging Face hub cache and use
-that same `HF_HUB_CACHE` in the provider specification. `HF_HOME` alone points
-at its `hub/` child and is not equivalent to a custom `cache_dir`:
-
-```bash
-HF_HUB_CACHE=/absolute/model-cache \
-  /absolute/mineru-env/bin/python -c \
-  'from huggingface_hub import snapshot_download; print(snapshot_download(repo_id="opendatalab/MinerU2.5-Pro-2605-1.2B", revision="bff20d4ae2bf202df9f45284b4d43681555a97ed", cache_dir="/absolute/model-cache"))'
-```
-
-Resolve the installed adapter path from the Sneeze environment:
-
-```bash
-python -c 'from sneeze.tpn.providers import mineru25; print(mineru25.__file__)'
-```
-
-Then create a scratch provider specification with absolute paths:
-
-```json
-{
-  "schema_version": 1,
-  "provider_id": "mineru2.5-pro-2605-transformers",
-  "argv": [
-    "/absolute/mineru-env/bin/python",
-    "/absolute/path/to/sneeze/tpn/providers/mineru25.py",
-    "--model-id", "opendatalab/MinerU2.5-Pro-2605-1.2B",
-    "--revision", "bff20d4ae2bf202df9f45284b4d43681555a97ed",
-    "--device", "cuda:0",
-    "--attention-backend", "sdpa"
-  ],
-  "egress": "none",
-  "model": {
-    "requested": "opendatalab/MinerU2.5-Pro-2605-1.2B",
-    "revision": "bff20d4ae2bf202df9f45284b4d43681555a97ed"
-  },
-  "lanes": {
-    "best": {
-      "prompt": "Use the official MinerU two-stage layout and recognition pipeline and convert its structured result to Markdown.",
-      "settings": {
-        "backend": "official-two-step-transformers",
-        "image_analysis": false,
-        "batch_size": 1
-      },
-      "include_raw_text": false
-    }
-  },
-  "timeout_seconds": 3600,
-  "secret_env_names": [],
-  "env": {
-    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-    "CUDA_VISIBLE_DEVICES": "0",
-    "HF_HUB_CACHE": "/absolute/model-cache",
-    "HF_HUB_OFFLINE": "1",
-    "TOKENIZERS_PARALLELISM": "false",
-    "TRANSFORMERS_OFFLINE": "1"
-  }
-}
-```
-
 The adapter records the original PNG hash/dimensions, all rendered stage
 prompts, native structured output, stage token/termination traces, complete
 pipeline and generation settings, exact model/config/tokenizer hashes, runtime
@@ -156,17 +155,22 @@ Complete constrained MinerU run for a single GPU:
 ```bash
 CUDA_VISIBLE_DEVICES=0 sne ocr-pdf-pages \
   --source-dir ./pages \
-  --dest-dir ./ocr \
+  --dest-dir "$BACKEND_SCRATCH/ocr" \
   --text-source-dir ./pages \
   --prompt-mode full \
   --batch-size 1 \
   --max-num-seqs 1 \
   --max-num-batched-tokens 8192 \
   --max-tokens 8192 \
-  --markdown-provider-spec /absolute/scratch/provider-spec.json \
+  --markdown-provider-spec "$BACKEND_SCRATCH/provider-spec.json" \
   --markdown-provider-lane best \
-  --markdown-provider-run-dir /absolute/scratch/provider-evidence
+  --markdown-provider-run-dir "$BACKEND_SCRATCH/provider-evidence"
 ```
+
+Hosted OpenAI and Anthropic profiles are benchmark-only. They cannot be used as
+the production Markdown provider above. Their offline planning, explicit
+approval, retention, credential, and benchmark workflow is documented in
+[`benchmarks/ocr/README.md`](benchmarks/ocr/README.md).
 
 ## Environment Bootstrap
 

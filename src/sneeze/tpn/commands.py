@@ -22,6 +22,7 @@ from sneeze.invariant import (
 from .ocr_vllm import (
     DEFAULT_MARKDOWN_WINDOW_SIZE,
     DEFAULT_OCR_MODEL,
+    DEFAULT_OCR_MODEL_REVISION,
     DEFAULT_OCR_WINDOW_SIZE,
 )
 
@@ -240,6 +241,16 @@ class OcrPdfPages(InvariantAwareCommand):
         _help = "DeepSeek OCR model name or local path. [default: %default]"
         _mandatory = False
         _default = DEFAULT_OCR_MODEL
+
+    model_revision = None
+    _model_revision = None
+
+    class ModelRevisionArg(StringInvariant):
+        _help = (
+            "Immutable Hugging Face model revision. [default: %default]"
+        )
+        _mandatory = False
+        _default = DEFAULT_OCR_MODEL_REVISION
 
     prompt = None
     _prompt = None
@@ -540,6 +551,11 @@ class OcrPdfPages(InvariantAwareCommand):
                 )
             processor = DeepSeekOcrOfflineProcessor(
                 model=_option_value(self, "model", DEFAULT_OCR_MODEL),
+                model_revision=_option_value(
+                    self,
+                    "model_revision",
+                    DEFAULT_OCR_MODEL_REVISION,
+                ),
                 output_format=output_format,
                 prompt=_option_value(self, "prompt"),
                 prompt_mode=(
@@ -1011,30 +1027,77 @@ class OcrBenchmark(InvariantAwareCommand):
     _lanes = None
 
     class LanesArg(StringInvariant):
-        _help = "Comma-separated provider lanes. [default: %default]"
+        _help = "Comma-separated lanes; defaults to the spec or plan."
         _mandatory = False
-        _default = "parity,best"
 
     repeats = None
     _repeats = None
 
     class RepeatsArg(PositiveIntegerInvariant):
-        _help = "Independent process repeats per lane. [default: %default]"
+        _help = "Repeats per lane; local default 5, external from plan."
         _mandatory = False
-        _default = 5
 
     allow_external = None
 
     class AllowExternalArg(BoolInvariant):
-        _help = "Permit a provider spec marked external. [default: %default]"
+        _help = (
+            "Permit a separately approved external plan. "
+            "[default: %default]"
+        )
         _mandatory = False
         _default = False
 
+    external_plan = None
+    _external_plan = None
+
+    class ExternalPlanArg(StringInvariant):
+        _help = "Hash-bound external upload-plan JSON path."
+        _mandatory = False
+
+    external_approval = None
+    _external_approval = None
+
+    class ExternalApprovalArg(StringInvariant):
+        _help = "Separate external upload-approval JSON path."
+        _mandatory = False
+
     def run(self):
+        import json
+
         from .ocr_benchmark import BenchmarkError, run_benchmark
 
-        lanes_value = _option_value(self, "lanes", "parity,best")
-        lanes = [lane.strip() for lane in lanes_value.split(",")]
+        external_plan = _option_value(self, "external_plan")
+        lanes_value = _option_value(self, "lanes")
+        repeats_value = _option_value(self, "repeats")
+        if external_plan and (
+            lanes_value is None or repeats_value is None
+        ):
+            try:
+                from .ocr_external import validate_external_upload_plan
+
+                with open(external_plan, encoding="utf-8") as handle:
+                    external_plan_record = validate_external_upload_plan(
+                        json.load(handle)
+                    )
+            except (OSError, ValueError) as exc:
+                raise CommandError(
+                    "could not read the external plan for lane/repeat "
+                    "defaults"
+                ) from exc
+            if lanes_value is None:
+                lanes_value = ",".join(
+                    lane["lane_id"]
+                    for lane in external_plan_record["lanes"]
+                )
+            if repeats_value is None:
+                repeats_value = external_plan_record["execution"][
+                    "repeats"
+                ]
+        lanes = (
+            [lane.strip() for lane in lanes_value.split(",")]
+            if lanes_value is not None
+            else None
+        )
         try:
             summary = run_benchmark(
                 manifest_path=_option_value(self, "manifest"),
@@ -1042,8 +1105,13 @@ class OcrBenchmark(InvariantAwareCommand):
                 provider_spec_path=_option_value(self, "provider_spec"),
                 dest_dir=_option_value(self, "dest_dir"),
                 lanes=lanes,
-                repeats=int(_option_value(self, "repeats", 5)),
+                repeats=int(repeats_value or 5),
                 allow_external=bool(self.allow_external),
+                external_plan_path=external_plan,
+                external_approval_path=_option_value(
+                    self,
+                    "external_approval",
+                ),
                 out=self._out,
             )
         except BenchmarkError as exc:
@@ -1056,6 +1124,689 @@ class OcrBenchmark(InvariantAwareCommand):
             raise CommandError(
                 "OCR benchmark failed; raw evidence and summary were "
                 "preserved"
+            )
+
+
+class OcrExternalList(InvariantAwareCommand):
+    """List dated hosted OCR policy profiles without reading credentials."""
+
+    format = None
+    _format = None
+
+    class FormatArg(StringInvariant):
+        _help = "Output format: text or json. [default: %default]"
+        _mandatory = False
+        _default = "text"
+
+    def run(self):
+        import json
+
+        from .ocr_external import (
+            get_external_provider_profile,
+            list_external_provider_profiles,
+        )
+
+        profiles = [
+            get_external_provider_profile(profile_id)
+            for profile_id in list_external_provider_profiles()
+        ]
+        output_format = _option_value(self, "format", "text").lower()
+        if output_format == "json":
+            self._out(json.dumps(profiles, indent=2, sort_keys=True))
+            return
+        if output_format != "text":
+            raise CommandError("--format must be text or json")
+        for profile in profiles:
+            self._out(
+                f"{profile['profile_id']}: "
+                f"{profile['model']['requested']}; "
+                f"retention={profile['retention']['policy_id']}; "
+                f"credential={profile['credential_env_name']}"
+            )
+
+
+class OcrExternalPlan(InvariantAwareCommand):
+    """Create a byte-free hosted OCR plan, spec, and request previews.
+
+    This command validates local input hashes but writes no source bytes,
+    reads no credential, and performs no network access. The resulting plan
+    is not permission to transmit data; `sne ocr-external-approve` must create
+    a separate approval record before the benchmark can launch.
+    """
+
+    profile = None
+    _profile = None
+
+    class ProfileArg(StringInvariant):
+        _help = "Dated hosted-provider profile ID."
+
+    manifest = None
+    _manifest = None
+
+    class ManifestArg(StringInvariant):
+        _help = "Hash-pinned benchmark manifest JSONL."
+
+    input_root = None
+    _input_root = None
+
+    class InputRootArg(DirectoryInvariant):
+        _help = "Read-only root containing benchmark page inputs."
+
+    dest_dir = None
+    _dest_dir = None
+
+    class DestDirArg(StringInvariant):
+        _help = "New or empty absolute scratch plan directory."
+
+    python_executable = None
+    _python_executable = None
+
+    class PythonExecutableArg(StringInvariant):
+        _help = "Absolute Python executable; defaults to the current one."
+        _mandatory = False
+
+    lane = None
+    _lane = None
+
+    class LaneArg(StringInvariant):
+        _help = "Single benchmark lane ID. [default: %default]"
+        _mandatory = False
+        _default = "parity"
+
+    prompt = None
+    _prompt = None
+
+    class PromptArg(StringInvariant):
+        _help = "Exact provider instruction. [default: common OCR prompt]"
+        _mandatory = False
+
+    prompt_mode = None
+    _prompt_mode = None
+
+    class PromptModeArg(StringInvariant):
+        _help = "Prompt-policy label. [default: %default]"
+        _mandatory = False
+        _default = "parity"
+
+    include_raw_text = None
+
+    class IncludeRawTextArg(BoolInvariant):
+        _help = "Include extracted raw text in this upload lane."
+        _mandatory = False
+        _default = False
+
+    repeats = None
+    _repeats = None
+
+    class RepeatsArg(PositiveIntegerInvariant):
+        _help = "Approved repeats per case. [default: %default]"
+        _mandatory = False
+        _default = 1
+
+    max_api_attempts = None
+    _max_api_attempts = None
+
+    class MaxApiAttemptsArg(PositiveIntegerInvariant):
+        _help = "Maximum API delivery attempts per case. [default: %default]"
+        _mandatory = False
+        _default = 1
+
+    max_input_tokens = None
+    _max_input_tokens = None
+
+    class MaxInputTokensArg(PositiveIntegerInvariant):
+        _help = (
+            "Post-response input-token scope limit; budget reserves the "
+            "full context. [default: %default]"
+        )
+        _mandatory = False
+        _default = 262144
+
+    max_output_tokens = None
+    _max_output_tokens = None
+
+    class MaxOutputTokensArg(PositiveIntegerInvariant):
+        _help = "Maximum generated tokens per request. [default: %default]"
+        _mandatory = False
+        _default = 8192
+
+    budget_usd = None
+    _budget_usd = None
+
+    class BudgetUsdArg(StringInvariant):
+        _help = "Maximum approved USD budget as an exact decimal string."
+
+    valid_hours = None
+    _valid_hours = None
+
+    class ValidHoursArg(PositiveIntegerInvariant):
+        _help = "Plan lifetime in hours. [default: %default]"
+        _mandatory = False
+        _default = 24
+
+    timeout_seconds = None
+    _timeout_seconds = None
+
+    class TimeoutSecondsArg(PositiveIntegerInvariant):
+        _help = "Per-provider-process timeout. [default: %default]"
+        _mandatory = False
+        _default = 120
+
+    def run(self):
+        import json
+        import sys
+
+        from .ocr_external_commands import (
+            DEFAULT_EXTERNAL_PROMPT,
+            ExternalCommandError,
+            create_external_plan_bundle,
+        )
+
+        try:
+            receipt = create_external_plan_bundle(
+                profile_id=_option_value(self, "profile"),
+                manifest_path=_option_value(self, "manifest"),
+                input_root=_option_value(
+                    self,
+                    "input_root",
+                    private_first=True,
+                ),
+                dest_dir=_option_value(self, "dest_dir"),
+                python_executable=_option_value(
+                    self,
+                    "python_executable",
+                    sys.executable,
+                ),
+                lane_id=_option_value(self, "lane", "parity"),
+                prompt=_option_value(
+                    self,
+                    "prompt",
+                    DEFAULT_EXTERNAL_PROMPT,
+                ),
+                prompt_mode=_option_value(
+                    self,
+                    "prompt_mode",
+                    "parity",
+                ),
+                include_raw_text=bool(self.include_raw_text),
+                repeats=int(_option_value(self, "repeats", 1)),
+                max_api_attempts_per_case=int(
+                    _option_value(self, "max_api_attempts", 1)
+                ),
+                max_input_tokens_per_case=int(
+                    _option_value(self, "max_input_tokens", 262144)
+                ),
+                max_output_tokens=int(
+                    _option_value(self, "max_output_tokens", 8192)
+                ),
+                budget_usd=_option_value(self, "budget_usd"),
+                valid_hours=int(_option_value(self, "valid_hours", 24)),
+                timeout_seconds=int(
+                    _option_value(self, "timeout_seconds", 120)
+                ),
+            )
+        except ExternalCommandError as exc:
+            raise CommandError(str(exc)) from exc
+        self._out(json.dumps(receipt, indent=2, sort_keys=True))
+
+
+class OcrExternalApprove(InvariantAwareCommand):
+    """Create a separate, expiring approval for one exact upload plan.
+
+    This is still an offline command: it neither reads credentials nor calls
+    a provider. Passing `--accept-retention` explicitly accepts the retention
+    policy embedded in the hash-bound plan.
+    """
+
+    plan = None
+    _plan = None
+
+    class PlanArg(StringInvariant):
+        _help = "External upload-plan JSON path."
+
+    output = None
+    _output = None
+
+    class OutputArg(StringInvariant):
+        _help = "New absolute approval-record JSON path."
+
+    approved_by = None
+    _approved_by = None
+
+    class ApprovedByArg(StringInvariant):
+        _help = "Approving principal identifier."
+
+    accept_retention = None
+
+    class AcceptRetentionArg(BoolInvariant):
+        _help = "Explicitly accept the plan's provider retention policy."
+        _mandatory = False
+        _default = False
+
+    valid_hours = None
+    _valid_hours = None
+
+    class ValidHoursArg(PositiveIntegerInvariant):
+        _help = (
+            "Approval lifetime, capped by plan expiry. "
+            "[default: %default]"
+        )
+        _mandatory = False
+        _default = 24
+
+    def run(self):
+        import json
+
+        from .ocr_external_commands import (
+            ExternalCommandError,
+            create_external_approval,
+        )
+
+        try:
+            receipt = create_external_approval(
+                plan_path=_option_value(self, "plan"),
+                output_path=_option_value(self, "output"),
+                approved_by=_option_value(self, "approved_by"),
+                accept_retention=bool(self.accept_retention),
+                valid_hours=int(_option_value(self, "valid_hours", 24)),
+            )
+        except ExternalCommandError as exc:
+            raise CommandError(str(exc)) from exc
+        self._out(json.dumps(receipt, indent=2, sort_keys=True))
+
+
+class OcrBackendList(InvariantAwareCommand):
+    """List pinned OCR backends and per-capability qualification state.
+
+    This command performs no network access and imports no model runtime.
+    Use `--format json` for a content-hashed registry receipt.
+    """
+
+    format = None
+    _format = None
+
+    class FormatArg(StringInvariant):
+        _help = "Output format: text or json. [default: %default]"
+        _mandatory = False
+        _default = "text"
+
+    def run(self):
+        from .ocr_backend_setup import make_receipt, receipt_text
+        from .ocr_backends import list_backends
+
+        output_format = _option_value(self, "format", "text")
+        output_format = output_format.strip().lower()
+        if output_format not in {"text", "json"}:
+            raise CommandError("--format must be text or json")
+        backends = [item.as_dict() for item in list_backends()]
+        if output_format == "json":
+            receipt = make_receipt(
+                "ocr_backend_registry",
+                {"backends": backends},
+            )
+            self._out(receipt_text(receipt))
+            return
+        for backend in backends:
+            capabilities = ", ".join(
+                f"{item['capability']}={item['status']}"
+                for item in backend["capabilities"]
+            )
+            model = backend["model"]
+            self._out(
+                f"{backend['backend_id']}: {capabilities}; "
+                f"{backend['execution_mode']}; "
+                f"{model['requested']}@{model['revision']}"
+            )
+
+
+class OcrBackendCreateEnv(InvariantAwareCommand):
+    """Create a dedicated environment for a pinned OCR backend.
+
+    The environment and package command plan is backend-specific. Use
+    `--dry-run` to inspect the exact plan without executing it.
+    """
+
+    _verbose_ = True
+
+    backend = None
+    _backend = None
+
+    class BackendArg(StringInvariant):
+        _help = "Built-in OCR backend ID or alias."
+
+    env_name = None
+    _env_name = None
+
+    class EnvNameArg(StringInvariant):
+        _help = "Environment name; defaults to the backend profile."
+        _mandatory = False
+
+    python = None
+    _python = None
+
+    class PythonArg(StringInvariant):
+        _help = "Python version; defaults to the backend profile."
+        _mandatory = False
+
+    manager = None
+    _manager = None
+
+    class ManagerArg(StringInvariant):
+        _help = "Environment manager executable; auto-detects mamba/conda."
+        _mandatory = False
+
+    torch_backend = None
+    _torch_backend = None
+
+    class TorchBackendArg(StringInvariant):
+        _help = "PyTorch wheel backend. [default: %default]"
+        _mandatory = False
+        _default = DEFAULT_TORCH_BACKEND
+
+    editable_root = None
+    _editable_root = None
+
+    class EditableRootArg(StringInvariant):
+        _help = "DeepSeek only: install this plugin checkout editable."
+        _mandatory = False
+
+    package_spec = None
+    _package_spec = None
+
+    class PackageSpecArg(StringInvariant):
+        _help = "DeepSeek only: plugin package spec to install."
+        _mandatory = False
+        _default = "sneeze-plugin-tpn[pdf,ocr]"
+
+    dry_run = None
+
+    class DryRunArg(BoolInvariant):
+        _help = "Print commands without executing them. [default: %default]"
+        _mandatory = False
+        _default = False
+
+    def run(self):
+        from .ocr_backend_setup import (
+            BackendSetupError,
+            build_environment_commands,
+            environment_plan_receipt,
+            receipt_text,
+            resolve_manager,
+        )
+        from .ocr_backends import BackendRegistryError, get_backend
+
+        try:
+            backend = get_backend(_option_value(self, "backend"))
+            manager = resolve_manager(
+                _option_value(self, "manager")
+            )
+            env_name = _option_value(
+                self,
+                "env_name",
+                backend.default_env_name,
+            )
+            python_version = _option_value(
+                self,
+                "python",
+                backend.default_python,
+            )
+            torch_backend = _option_value(
+                self,
+                "torch_backend",
+                DEFAULT_TORCH_BACKEND,
+            )
+            commands = build_environment_commands(
+                backend,
+                manager=manager,
+                env_name=env_name,
+                python_version=python_version,
+                torch_backend=torch_backend,
+                editable_root=_option_value(self, "editable_root"),
+                package_spec=_option_value(
+                    self,
+                    "package_spec",
+                    "sneeze-plugin-tpn[pdf,ocr]",
+                ),
+            )
+            _run_or_print(
+                commands,
+                dry_run=bool(self.dry_run),
+                out=self._out,
+            )
+            receipt = environment_plan_receipt(
+                backend,
+                manager=manager,
+                env_name=env_name,
+                python_version=python_version,
+                torch_backend=torch_backend,
+                commands=commands,
+                dry_run=bool(self.dry_run),
+            )
+        except (BackendRegistryError, BackendSetupError) as exc:
+            raise CommandError(str(exc)) from exc
+        self._out(receipt_text(receipt))
+
+
+class OcrBackendFetchModel(InvariantAwareCommand):
+    """Fetch the immutable model revision for a built-in OCR backend.
+
+    The command never follows a mutable branch or tag. It emits a JSON receipt
+    containing the exact revision, expected snapshot path, and command hash.
+    """
+
+    _verbose_ = True
+
+    backend = None
+    _backend = None
+
+    class BackendArg(StringInvariant):
+        _help = "Built-in OCR backend ID or alias."
+
+    cache_dir = None
+    _cache_dir = None
+
+    class CacheDirArg(StringInvariant):
+        _help = "Absolute Hugging Face hub cache directory."
+
+    env_name = None
+    _env_name = None
+
+    class EnvNameArg(StringInvariant):
+        _help = "Environment name; defaults to the backend profile."
+        _mandatory = False
+
+    manager = None
+    _manager = None
+
+    class ManagerArg(StringInvariant):
+        _help = "Environment manager executable; auto-detects mamba/conda."
+        _mandatory = False
+
+    dry_run = None
+
+    class DryRunArg(BoolInvariant):
+        _help = "Print the command without executing it. [default: %default]"
+        _mandatory = False
+        _default = False
+
+    def run(self):
+        from .ocr_backend_setup import (
+            BackendSetupError,
+            build_model_fetch_command,
+            model_fetch_receipt,
+            receipt_text,
+        )
+        from .ocr_backends import BackendRegistryError, get_backend
+
+        try:
+            backend = get_backend(_option_value(self, "backend"))
+            cache_dir = _option_value(self, "cache_dir")
+            env_name = _option_value(
+                self,
+                "env_name",
+                backend.default_env_name,
+            )
+            command = build_model_fetch_command(
+                backend,
+                manager=_option_value(self, "manager"),
+                env_name=env_name,
+                cache_dir=cache_dir,
+            )
+            _run_or_print(
+                [command],
+                dry_run=bool(self.dry_run),
+                out=self._out,
+            )
+            receipt = model_fetch_receipt(
+                backend,
+                cache_dir=cache_dir,
+                command=command,
+                dry_run=bool(self.dry_run),
+            )
+        except (BackendRegistryError, BackendSetupError) as exc:
+            raise CommandError(str(exc)) from exc
+        self._out(receipt_text(receipt))
+
+
+class OcrBackendWriteSpec(InvariantAwareCommand):
+    """Write a validated local provider spec for a process backend.
+
+    The output is created atomically and an existing path is never replaced.
+    Model identity and revision come only from the pinned backend registry.
+    """
+
+    backend = None
+    _backend = None
+
+    class BackendArg(StringInvariant):
+        _help = "Built-in provider-process OCR backend ID or alias."
+
+    output = None
+    _output = None
+
+    class OutputArg(StringInvariant):
+        _help = "New absolute output path for the provider spec JSON."
+
+    python_executable = None
+    _python_executable = None
+
+    class PythonExecutableArg(StringInvariant):
+        _help = "Absolute Python executable in the backend environment."
+
+    cache_dir = None
+    _cache_dir = None
+
+    class CacheDirArg(DirectoryInvariant):
+        _help = "Absolute Hugging Face hub cache containing the model."
+
+    device = None
+    _device = None
+
+    class DeviceArg(StringInvariant):
+        _help = "Provider device; defaults to the backend profile."
+        _mandatory = False
+
+    attention_backend = None
+    _attention_backend = None
+
+    class AttentionBackendArg(StringInvariant):
+        _help = "Attention backend; defaults to the backend profile."
+        _mandatory = False
+
+    cuda_visible_devices = None
+    _cuda_visible_devices = None
+
+    class CudaVisibleDevicesArg(StringInvariant):
+        _help = "CUDA_VISIBLE_DEVICES value. [default: %default]"
+        _mandatory = False
+        _default = "0"
+
+    timeout_seconds = None
+    _timeout_seconds = None
+
+    class TimeoutSecondsArg(PositiveIntegerInvariant):
+        _help = "Provider process timeout in seconds."
+        _mandatory = False
+
+    def run(self):
+        from .ocr_backend_setup import (
+            receipt_text,
+            write_provider_spec,
+        )
+        from .ocr_backends import get_backend
+
+        try:
+            backend = get_backend(_option_value(self, "backend"))
+            receipt = write_provider_spec(
+                backend,
+                output_path=_option_value(self, "output"),
+                python_executable=_option_value(
+                    self,
+                    "python_executable",
+                ),
+                cache_dir=_option_value(
+                    self,
+                    "cache_dir",
+                    private_first=True,
+                ),
+                device=_option_value(self, "device"),
+                attention_backend=_option_value(
+                    self,
+                    "attention_backend",
+                ),
+                cuda_visible_devices=_option_value(
+                    self,
+                    "cuda_visible_devices",
+                    "0",
+                ),
+                timeout_seconds=self._timeout_seconds,
+            )
+        except (OSError, ValueError) as exc:
+            raise CommandError(str(exc)) from exc
+        self._out(receipt_text(receipt))
+
+
+class OcrBackendDoctor(InvariantAwareCommand):
+    """Validate a built-in local provider spec and optionally load its model.
+
+    Checks cover the exact model pin, adapter, offline mode, cached snapshot,
+    and qualified runtime package tuple. Ambient secret values are scrubbed
+    from the package probe and are never included in the JSON receipt.
+    """
+
+    provider_spec = None
+    _provider_spec = None
+
+    class ProviderSpecArg(StringInvariant):
+        _help = "Path to a built-in local provider specification."
+
+    load_model = None
+
+    class LoadModelArg(BoolInvariant):
+        _help = (
+            "Initialize the qualified model/client on GPU. "
+            "[default: %default]"
+        )
+        _mandatory = False
+        _default = False
+
+    def run(self):
+        from .ocr_backend_setup import (
+            doctor_provider_spec,
+            receipt_text,
+        )
+
+        try:
+            receipt = doctor_provider_spec(
+                _option_value(self, "provider_spec"),
+                load_model=bool(self.load_model),
+            )
+        except (OSError, ValueError) as exc:
+            raise CommandError(str(exc)) from exc
+        self._out(receipt_text(receipt))
+        if not receipt["all_pass"]:
+            raise CommandError(
+                "OCR backend doctor failed; JSON findings were preserved"
             )
 
 
@@ -1181,8 +1932,9 @@ class DeepseekOcrDownloadModel(InvariantAwareCommand):
     _revision = None
 
     class RevisionArg(StringInvariant):
-        _help = "Optional model revision."
+        _help = "Immutable model revision. [default: %default]"
         _mandatory = False
+        _default = DEFAULT_OCR_MODEL_REVISION
 
     env_name = None
     _env_name = None
@@ -1209,7 +1961,11 @@ class DeepseekOcrDownloadModel(InvariantAwareCommand):
         command = build_model_download_command(
             model=self.model or self._model or DEFAULT_OCR_MODEL,
             local_dir=self._local_dir or self.local_dir,
-            revision=self._revision or self.revision,
+            revision=(
+                self._revision
+                or self.revision
+                or DEFAULT_OCR_MODEL_REVISION
+            ),
             env_name=self._env_name or self.env_name,
             manager=self._manager or self.manager,
         )
@@ -1494,6 +2250,16 @@ def _run_or_print(
     dry_run: bool,
     out,
 ) -> None:
+    commands = list(commands)
+    from .ocr_backend_setup import (
+        BackendSetupError,
+        assert_command_plan_safe,
+    )
+
+    try:
+        assert_command_plan_safe(commands)
+    except BackendSetupError as exc:
+        raise CommandError(str(exc)) from exc
     for command in commands:
         out(" ".join(_quote(arg) for arg in command))
         if dry_run:

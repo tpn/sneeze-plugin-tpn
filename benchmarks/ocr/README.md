@@ -182,9 +182,13 @@ Each response object must echo `attempt_id` and provide:
 - at least one raw provider response or supporting artifact beneath the
   supplied artifacts directory.
 
-A completed response with missing provenance is a failed attempt. Adapters
-must preserve the provider's raw response before normalization or evaluation.
-The completed response shape is:
+A completed response with missing provenance is a failed attempt. Local
+adapters should preserve the provider's raw response before normalization or
+evaluation. The hosted adapter deliberately does not retain raw response
+bodies. It records their SHA-256, allowlisted response metadata, the sanitized
+request shape, delivery and usage evidence, and normalized output instead. This
+keeps enough evidence to audit an attempt without retaining an extra copy of
+the provider payload. The completed response shape is:
 
 ```json
 {
@@ -289,6 +293,38 @@ verified evaluator bytes are written under `evaluator/`, preserving corpus
 relative stems, with an evaluator manifest of their hashes. The summary records
 a hash of that evaluator evidence.
 
+## Built-in local backends
+
+The structured setup commands derive model and adapter identity from the
+built-in registry. Do not hand-edit those pins into a provider specification:
+
+```bash
+LOCAL_SCRATCH=$(mktemp -d /tmp/sneeze-tpn-ocr-local.XXXXXX)
+MODEL_CACHE="$LOCAL_SCRATCH/hf-cache"
+MINERU_PY=/absolute/path/to/sneeze-ocr-mineru25/bin/python
+
+sne ocr-backend-list --format json
+sne ocr-backend-create-env --backend mineru25 --dry-run
+sne ocr-backend-create-env --backend mineru25
+sne ocr-backend-fetch-model \
+  --backend mineru25 \
+  --cache-dir "$MODEL_CACHE"
+sne ocr-backend-write-spec \
+  --backend mineru25 \
+  --output "$LOCAL_SCRATCH/provider-spec.json" \
+  --python-executable "$MINERU_PY" \
+  --cache-dir "$MODEL_CACHE"
+sne ocr-backend-doctor \
+  --provider-spec "$LOCAL_SCRATCH/provider-spec.json" \
+  --load-model
+```
+
+`ocr-backend-create-env` and `ocr-backend-fetch-model` both accept `--dry-run`.
+Run the doctor without `--load-model` first when only a static environment and
+snapshot check is appropriate. The registry reports qualification per
+capability. A new or benchmark-only capability must still pass this benchmark
+and the larger advance gates before production use.
+
 ## Running the smoke benchmark
 
 Create the provider specification in scratch space, then run both lanes five
@@ -346,42 +382,117 @@ then exits nonzero if any attempt, provenance check, or assertion failed.
 
 ## External providers
 
-An `external` provider specification requires both `--allow-external` and a
-structured authorization record in the provider specification:
+Hosted OpenAI and Anthropic execution is benchmark-only. It is not a production
+`ocr-pdf-pages` Markdown backend. Listing and planning are offline operations:
+they do not read credentials, transmit source bytes, or call a provider.
 
-```json
-{
-  "egress": "external",
-  "secret_env_names": ["OPENAI_API_KEY"],
-  "external_authorization": {
-    "approved_by": "approver identity",
-    "approved_at": "2026-08-03T00:00:00Z",
-    "scope": "named pages, provider, model, and transmitted artifacts",
-    "retention": "provider retention and training terms",
-    "budget_usd": 10.0
-  }
-}
+Start by inspecting the dated profiles and their model, pricing, request, and
+retention policies:
+
+```bash
+sne ocr-external-list
+sne ocr-external-list --format json
 ```
 
-The four text fields must be nonempty, and `budget_usd` must be a nonnegative
-number. The harness records this object and the external flag in `run.json` and
-the snapshotted provider specification. It does not validate that
-`approved_at` is a timestamp, independently verify the approver, or enforce the
-declared budget; those remain operator and adapter responsibilities.
+Create one exact, expiring upload plan in scratch space. The command validates
+the manifest-bound PNG hashes and dimensions, then writes a secret-free
+`provider-spec.json`, `upload-plan.json`, and byte-free
+`request-previews.jsonl`:
 
-Before the first upload, stop and obtain explicit approval for the provider,
-exact model, document inputs, retention/training terms, and budget. Approval to
-build or test the harness is not approval to transmit a paper page. Put the API
-credential's environment-variable name in `secret_env_names`; the value is
-passed to the provider but omitted from recorded environment evidence. An API
-adapter should report `runtime.attention_backend` as `provider_managed` unless
-the service exposes a more exact value.
+```bash
+HOSTED_SCRATCH=$(mktemp -d /tmp/sneeze-tpn-ocr-hosted.XXXXXX)
+PLUGIN_ROOT=/home/trentn/src/sneeze-plugin-tpn
+BENCH_MANIFEST="$PLUGIN_ROOT/benchmarks/ocr/cuphoton-regressions.jsonl"
 
-After approval, the command shape is the same with one additional flag:
-
-```text
---allow-external
+sne ocr-external-plan \
+  --profile openai-responses-gpt-5.6-sol \
+  --manifest "$BENCH_MANIFEST" \
+  --input-root /home/trentn/src/cuphoton-papers/papers \
+  --dest-dir "$HOSTED_SCRATCH/plan" \
+  --lane parity \
+  --prompt-mode parity \
+  --repeats 1 \
+  --max-api-attempts 1 \
+  --max-output-tokens 8192 \
+  --budget-usd 100.000000 \
+  --valid-hours 1
 ```
+
+`--max-input-tokens` is a post-response scope check because these image APIs do
+not enforce it before billing. The plan therefore prices every permitted API
+attempt against the model's full documented context window at the highest
+applicable input rate. Before each network call, the adapter writes a durable
+reservation keyed by the exact plan, case, lane, repeat, and API-attempt slot.
+Reservations remain counted after delivery. An unknown delivery state blocks
+the ledger and all remaining calls. The planning command refuses a budget below
+the plan-wide pessimistic maximum.
+
+Review the receipt, plan, and request previews. A plan is not permission to
+upload. Obtain approval for that exact provider profile, model, manifest,
+cases, prompt, lane, transmitted artifacts, repeats, API-attempt cap, budget,
+and retention policy. Record it separately:
+
+```bash
+sne ocr-external-approve \
+  --plan "$HOSTED_SCRATCH/plan/upload-plan.json" \
+  --output "$HOSTED_SCRATCH/plan/upload-approval.json" \
+  --approved-by operator@example.com \
+  --accept-retention \
+  --valid-hours 1
+```
+
+The approval is bound to the plan digest and expires no later than the plan.
+Changing the provider specification, executor, model profile, manifest, input
+hashes, prompt, lane, raw-text scope, repeats, or budget invalidates the
+binding. `--allow-external` alone is never sufficient.
+
+Provision the credential named by the profile, `OPENAI_API_KEY` or
+`ANTHROPIC_API_KEY`, through the process environment only. Never place a secret
+value in an argument, provider specification, plan, approval, request preview,
+or log. The harness passes only the named credential to the adapter, omits its
+value from recorded environment evidence, and treats any detected credential
+leak in responses or artifacts as a failed run.
+
+The generated provider specification starts its pinned Python executable with
+`-I -S -B`. The benchmark supplies only allowlisted locale values, a default
+`PATH`, fixed Python safety controls, and the named credential. Before reading
+that credential, the adapter verifies isolated no-site startup and attests the
+Python executable, adapter, planning helper, provider specification, plan, and
+approval. A changed executable or helper requires a new plan and approval.
+
+After the exact plan and separate approval exist, run the benchmark. Lanes and
+repeats default to the values in the plan:
+
+```bash
+sne ocr-benchmark \
+  --manifest "$BENCH_MANIFEST" \
+  --input-root /home/trentn/src/cuphoton-papers/papers \
+  --provider-spec "$HOSTED_SCRATCH/plan/provider-spec.json" \
+  --dest-dir "$HOSTED_SCRATCH/run" \
+  --allow-external \
+  --external-plan "$HOSTED_SCRATCH/plan/upload-plan.json" \
+  --external-approval "$HOSTED_SCRATCH/plan/upload-approval.json"
+```
+
+The default parity plan uploads the PNG only. External raw text is opt-in. If a
+best-capability experiment genuinely requires it, create and approve a new
+plan with `--lane best --prompt-mode best --include-raw-text`. The raw-text
+hashes and transmission scope then become part of the plan. The parity lane
+cannot include raw text.
+
+The dated policy profiles require explicit retention acknowledgement:
+
+- OpenAI uses `store: false`, but `store: false` is not Zero Data Retention.
+  The profile records the documented default abuse-monitoring retention of up
+  to 30 days.
+- Anthropic Claude Fable 5 has mandatory 30-day retention for API inputs and
+  outputs. Zero Data Retention is unavailable for this profile.
+
+Use `anthropic-messages-claude-fable-5` in `--profile` to plan the Anthropic
+arm. Re-run `ocr-external-list --format json` before planning so any dated
+policy change is visible. All plans, approvals, copied inputs, normalized
+outputs, ledgers, logs, and artifacts must remain in scratch space. Never point
+a hosted run destination at either canonical corpus.
 
 ## Advance gate
 

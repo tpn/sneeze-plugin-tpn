@@ -322,6 +322,9 @@ def test_ocr_pdf_pages_uses_processor(tmp_path, monkeypatch):
 
     command.run()
 
+    assert captured["kwargs"]["model_revision"] == (
+        "9f30c71f441d010e5429c532364a86705536c53a"
+    )
     assert captured["kwargs"]["max_tokens"] == 64
     assert captured["kwargs"]["temperature"] == 0.2
     assert captured["kwargs"]["window_size"] == 128

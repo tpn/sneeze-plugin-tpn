@@ -220,6 +220,7 @@ def _provider_record(provider_path: Path, *, egress: str = "none") -> dict:
             "parity": {
                 "prompt": "Transcribe this page literally into Markdown.",
                 "settings": {"temperature": 0.0},
+                "include_raw_text": False,
             },
             "best": {
                 "prompt": "Use the supplied text as transcription evidence.",
@@ -241,6 +242,107 @@ def _write_provider_spec(
     spec_path = tmp_path / "provider.json"
     _write_json(spec_path, _provider_record(provider_path, egress=egress))
     return spec_path, provider_path
+
+
+def _write_external_bundle(
+    tmp_path: Path,
+    manifest_path: Path,
+    input_root: Path,
+) -> tuple[Path, Path, Path]:
+    from sneeze.tpn.ocr_external_commands import (
+        create_external_approval,
+        create_external_plan_bundle,
+    )
+
+    receipt = create_external_plan_bundle(
+        profile_id="openai-responses-gpt-5.6-sol",
+        manifest_path=manifest_path,
+        input_root=input_root,
+        dest_dir=(tmp_path / "external-plan").resolve(),
+        python_executable=Path(sys.executable).resolve(),
+        lane_id="parity",
+        prompt="Transcribe this page literally into Markdown.",
+        prompt_mode="parity",
+        include_raw_text=False,
+        repeats=1,
+        max_api_attempts_per_case=1,
+        max_input_tokens_per_case=4096,
+        max_output_tokens=1024,
+        budget_usd="100.000000",
+        valid_hours=1,
+    )
+    plan_path = Path(receipt["upload_plan_path"])
+    approval_path = plan_path.with_name("upload-approval.json")
+    create_external_approval(
+        plan_path=plan_path,
+        output_path=approval_path,
+        approved_by="test-user",
+        accept_retention=True,
+        valid_hours=1,
+    )
+    return Path(receipt["provider_spec_path"]), plan_path, approval_path
+
+
+def _argument(argv: list[str], name: str) -> str:
+    return argv[argv.index(name) + 1]
+
+
+def _write_fake_external_success(argv: list[str]) -> None:
+    requests = _read_jsonl(Path(_argument(argv, "--requests-jsonl")))
+    responses_path = Path(_argument(argv, "--responses-jsonl"))
+    artifacts_dir = Path(_argument(argv, "--artifacts-dir"))
+    responses = []
+    for request in requests:
+        artifact_name = request["attempt_id"] + ".json"
+        artifact = artifacts_dir / artifact_name
+        artifact_bytes = b'{"synthetic":true}\n'
+        artifact.write_bytes(artifact_bytes)
+        responses.append(
+            {
+                "schema_version": 1,
+                "attempt_id": request["attempt_id"],
+                "status": "completed",
+                "output": {"format": "markdown", "text": EXACT_OUTPUT},
+                "effective_request": {
+                    "prompt": request["instruction"],
+                    "input_artifacts": [
+                        {
+                            **request["input"]["image"],
+                            "transform": "original",
+                        }
+                    ],
+                },
+                "model": {
+                    "requested": "gpt-5.6-sol",
+                    "revision": "provider_managed_model_id",
+                    "resolved_snapshot": "gpt-5.6-sol",
+                },
+                "runtime": {
+                    "python": sys.version.split()[0],
+                    "engine": "openai-responses",
+                    "engine_version": "v1",
+                    "packages": {},
+                    "attention_backend": "provider_managed",
+                },
+                "generation": {
+                    "params": {"max_output_tokens": 1024},
+                    "input_tokens": 10,
+                    "output_tokens": 8,
+                    "finish_reason": "stop",
+                    "stop_reason": None,
+                    "eos": True,
+                    "max_tokens": False,
+                },
+                "usage": {"wall_seconds": 0.01, "cost_usd": 0.001},
+                "artifacts": [
+                    {
+                        "relative_path": artifact_name,
+                        "sha256": _sha256(artifact_bytes),
+                    }
+                ],
+            }
+        )
+    _write_jsonl(responses_path, responses)
 
 
 def test_prepare_run_validates_and_copies_exact_inputs(tmp_path):
@@ -873,26 +975,217 @@ def test_run_benchmark_rejects_placeholder_provenance(
     assert gap in result["provenance"]["missing_or_invalid"]
 
 
-def test_external_provider_requires_explicit_authorization(tmp_path):
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "local_secret",
+        "external_noncredential_secret",
+        "external_implicit_raw_text",
+        "credential_option",
+        "credential_url",
+        "credential_header",
+        "proxy_override",
+        "external_unallowlisted_env",
+    ),
+)
+def test_provider_spec_rejects_unsafe_external_configuration(
+    tmp_path,
+    mutation,
+):
+    from sneeze.tpn.ocr_benchmark import load_provider_spec
+
+    sentinel = "synthetic-test-credential-sentinel"
+    provider_path = _write_fake_provider(tmp_path)
+    egress = "none" if mutation == "local_secret" else "external"
+    spec = _provider_record(provider_path, egress=egress)
+    if mutation == "local_secret":
+        spec["secret_env_names"] = ["TEST_API_TOKEN"]
+    elif mutation == "external_noncredential_secret":
+        spec["secret_env_names"] = ["BENCHMARK_VALUE"]
+    elif mutation == "external_implicit_raw_text":
+        del spec["lanes"]["best"]["include_raw_text"]
+    elif mutation == "credential_option":
+        spec["argv"].extend(["--api-key-file", sentinel])
+    elif mutation == "credential_url":
+        spec["argv"].append(
+            f"https://example.invalid/v1?access_token={sentinel}"
+        )
+    elif mutation == "credential_header":
+        spec["argv"].append(
+            f"--header=Authorization: Bearer {sentinel}"
+        )
+    elif mutation == "proxy_override":
+        spec["env"] = {
+            "HTTPS_PROXY": f"https://user:{sentinel}@example.invalid"
+        }
+    elif mutation == "external_unallowlisted_env":
+        spec["env"] = {"AWS_CONFIG_FILE": sentinel}
+    spec_path = tmp_path / "provider.json"
+    _write_json(spec_path, spec)
+
+    with pytest.raises(ValueError) as caught:
+        load_provider_spec(str(spec_path))
+
+    assert sentinel not in str(caught.value)
+
+
+def test_external_provider_receives_only_allowlisted_environment(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn.ocr_benchmark import (
+        _provider_environment,
+        _recorded_provider_environment,
+    )
+    from sneeze.tpn.ocr_external_setup import build_external_provider_spec
+
+    sentinel = "synthetic-test-credential-sentinel"
+    spec = build_external_provider_spec(
+        profile_id="openai-responses-gpt-5.6-sol",
+        python_executable=Path(sys.executable).resolve(),
+        lane_id="parity",
+        prompt="Transcribe this page literally into Markdown.",
+        prompt_mode="parity",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", sentinel)
+    monkeypatch.setenv("HOME", "/sensitive/home")
+    monkeypatch.setenv("HTTPS_PROXY", "https://sensitive-proxy.invalid")
+    monkeypatch.setenv("PYTHONPATH", "/sensitive/python")
+    monkeypatch.setenv("SSL_CERT_FILE", "/sensitive/custom-ca.pem")
+    monkeypatch.setenv(
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "/sensitive/cloud-config",
+    )
+    monkeypatch.setenv("RANDOM_BENCHMARK_VALUE", "sensitive-ambient")
+    monkeypatch.setenv("PATH", "/usr/bin:/sensitive/path")
+    environment = _provider_environment(spec)
+
+    assert environment["OPENAI_API_KEY"] == sentinel
+    assert environment["PATH"] == "/bin:/usr/bin"
+    assert environment["PYTHONNOUSERSITE"] == "1"
+    for name in (
+        "HOME",
+        "HTTPS_PROXY",
+        "PYTHONPATH",
+        "SSL_CERT_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "RANDOM_BENCHMARK_VALUE",
+    ):
+        assert name not in environment
+    recorded = _recorded_provider_environment(environment, spec)
+    assert recorded["PATH"] == "/bin:/usr/bin"
+    assert "OPENAI_API_KEY" not in recorded
+
+
+def test_external_provider_credential_leaks_are_redacted_and_fail(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn.ocr_benchmark import run_benchmark
+
+    sentinel = "synthetic-test-credential-sentinel"
+    encoded_sentinel = base64.urlsafe_b64encode(
+        sentinel.encode("utf-8")
+    ).decode("ascii")
+    manifest_path, input_root, _case = _write_manifest(tmp_path)
+    spec_path, plan_path, approval_path = _write_external_bundle(
+        tmp_path,
+        manifest_path,
+        input_root,
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", sentinel)
+    dest_dir = tmp_path / "benchmark-run"
+
+    def leak_provider(
+        argv,
+        *,
+        environment,
+        stdout_handle,
+        stderr_handle,
+        **_kwargs,
+    ):
+        credential = environment["OPENAI_API_KEY"]
+        encoded = base64.urlsafe_b64encode(
+            credential.encode("utf-8")
+        ).decode("ascii")
+        stdout_handle.write(credential.encode("utf-8"))
+        stderr_handle.write(encoded.encode("ascii"))
+        requests = _read_jsonl(Path(_argument(argv, "--requests-jsonl")))
+        responses_path = Path(_argument(argv, "--responses-jsonl"))
+        artifacts_dir = Path(_argument(argv, "--artifacts-dir"))
+        (artifacts_dir / f"{credential}.json").write_text(
+            encoded,
+            encoding="utf-8",
+        )
+        _write_jsonl(
+            responses_path,
+            [
+                {
+                    "schema_version": 1,
+                    "attempt_id": request["attempt_id"],
+                    "status": "completed",
+                    "output": {"format": "markdown", "text": credential},
+                    "credential_copy": encoded,
+                }
+                for request in requests
+            ],
+        )
+        return 0, None
+
+    monkeypatch.setattr(
+        "sneeze.tpn.ocr_benchmark._run_provider_process",
+        leak_provider,
+    )
+
+    summary = run_benchmark(
+        manifest_path=str(manifest_path),
+        input_root=str(input_root),
+        provider_spec_path=str(spec_path),
+        dest_dir=str(dest_dir),
+        lanes=("parity",),
+        repeats=1,
+        allow_external=True,
+        external_plan_path=plan_path,
+        external_approval_path=approval_path,
+        out=None,
+    )
+
+    assert summary["all_pass"] is False
+    result = _read_jsonl(dest_dir / "results.jsonl")[0]
+    assert result["passed"] is False
+    assert "credential leak detected" in result["error"]
+    assert sentinel not in result["error"]
+    subprocess_record = result["subprocess"]
+    assert subprocess_record["credential_leak_detected"] is True
+    assert subprocess_record["credential_scan_complete"] is True
+    assert all(
+        subprocess_record["credential_redactions"][surface] > 0
+        for surface in ("stdout", "stderr", "responses", "artifacts")
+    )
+    for path in dest_dir.rglob("*"):
+        assert sentinel not in path.name
+        if path == dest_dir / "evidence" / "harness" / "git-diff.patch":
+            continue
+        if path.is_file():
+            payload = path.read_bytes()
+            assert sentinel.encode("utf-8") not in payload
+            assert encoded_sentinel.encode("ascii") not in payload
+
+
+def test_external_provider_requires_bound_plan_and_separate_approval(
+    tmp_path,
+    monkeypatch,
+):
     from sneeze.tpn.ocr_benchmark import run_benchmark
 
     manifest_path, input_root, _case = _write_manifest(tmp_path)
-    spec_path, provider_path = _write_provider_spec(
+    spec_path, plan_path, approval_path = _write_external_bundle(
         tmp_path,
-        egress="external",
-    )
-    marker_path = tmp_path / "provider-started"
-    original = provider_path.read_text(encoding="utf-8")
-    provider_path.write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker_path)!r}).write_text('started')\n" + original,
-        encoding="utf-8",
+        manifest_path,
+        input_root,
     )
 
-    with pytest.raises(
-        (PermissionError, RuntimeError, ValueError),
-        match="external",
-    ):
+    with pytest.raises(ValueError, match="external"):
         run_benchmark(
             manifest_path=str(manifest_path),
             input_root=str(input_root),
@@ -901,12 +1194,12 @@ def test_external_provider_requires_explicit_authorization(tmp_path):
             lanes=("parity",),
             repeats=1,
             allow_external=False,
+            external_plan_path=plan_path,
+            external_approval_path=approval_path,
             out=None,
         )
 
-    assert not marker_path.exists()
-
-    with pytest.raises(ValueError, match="external_authorization"):
+    with pytest.raises(ValueError, match="external-plan"):
         run_benchmark(
             manifest_path=str(manifest_path),
             input_root=str(input_root),
@@ -917,17 +1210,23 @@ def test_external_provider_requires_explicit_authorization(tmp_path):
             allow_external=True,
             out=None,
         )
-    assert not marker_path.exists()
 
-    spec = json.loads(spec_path.read_text(encoding="utf-8"))
-    spec["external_authorization"] = {
-        "approved_by": "test-user",
-        "approved_at": "2026-08-03T00:00:00Z",
-        "scope": "synthetic one-pixel fixture",
-        "retention": "test-only",
-        "budget_usd": 0.0,
-    }
-    _write_json(spec_path, spec)
+    captured = {}
+
+    def fake_provider(argv, *, environment, **_kwargs):
+        captured["argv"] = argv
+        captured["environment"] = environment
+        _write_fake_external_success(argv)
+        return 0, None
+
+    monkeypatch.setattr(
+        "sneeze.tpn.ocr_benchmark._run_provider_process",
+        fake_provider,
+    )
+    monkeypatch.setenv(
+        "OPENAI_API_KEY",
+        "synthetic-test-credential-sentinel",
+    )
     summary = run_benchmark(
         manifest_path=str(manifest_path),
         input_root=str(input_root),
@@ -936,10 +1235,26 @@ def test_external_provider_requires_explicit_authorization(tmp_path):
         lanes=("parity",),
         repeats=1,
         allow_external=True,
+        external_plan_path=plan_path,
+        external_approval_path=approval_path,
         out=None,
     )
     assert summary["all_pass"] is True
-    assert marker_path.read_text() == "started"
+    for argument in (
+        "--external-provider-spec",
+        "--external-plan",
+        "--external-approval",
+        "--external-budget-ledger",
+    ):
+        assert argument in captured["argv"]
+    assert captured["environment"]["OPENAI_API_KEY"] == (
+        "synthetic-test-credential-sentinel"
+    )
+    run_record = json.loads(
+        (tmp_path / "benchmark-run-authorized" / "run.json").read_text()
+    )
+    assert run_record["provider"]["external_execution"]["plan_sha256"]
+    assert "external_authorization" not in run_record["provider"]
 
 
 def test_evaluate_assertions_catches_exact_regressions():

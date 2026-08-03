@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import importlib
 import importlib.metadata
 import json
 import os
@@ -12,7 +14,9 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.parse
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,10 +29,20 @@ from .ocr_vllm import (
 )
 
 SCHEMA_VERSION = 1
-_PROTOCOL_ARGUMENTS = (
+_BASE_PROTOCOL_ARGUMENTS = (
     "--requests-jsonl",
     "--responses-jsonl",
     "--artifacts-dir",
+)
+_EXTERNAL_PROTOCOL_ARGUMENTS = (
+    "--external-provider-spec",
+    "--external-plan",
+    "--external-approval",
+    "--external-budget-ledger",
+)
+_PROTOCOL_ARGUMENTS = (
+    *_BASE_PROTOCOL_ARGUMENTS,
+    *_EXTERNAL_PROTOCOL_ARGUMENTS,
 )
 PROTECTED_CORPUS_ROOTS = (
     Path("/home/trentn/src/cuphoton-papers/papers"),
@@ -36,6 +50,25 @@ PROTECTED_CORPUS_ROOTS = (
 )
 _SECRET_ENV_RE = re.compile(
     r"(?:AUTH|COOKIE|CREDENTIAL|KEY|PASS(?:WORD)?|SECRET|TOKEN)",
+    re.IGNORECASE,
+)
+_CREDENTIAL_ENV_RE = re.compile(
+    r"(?:^|_)(?:API_KEY|AUTH(?:ORIZATION)?|BEARER|COOKIE|"
+    r"CREDENTIALS?|KEY|PASS(?:WORD)?|SECRET|TOKEN)(?:_|$)",
+    re.IGNORECASE,
+)
+_CREDENTIAL_ARG_RE = re.compile(
+    r"(?:^|_)(?:API_KEY|ACCESS_TOKEN|AUTH(?:ORIZATION)?|BEARER|"
+    r"COOKIE|CREDENTIALS?|KEY|PASS(?:WORD)?|SECRET|TOKEN)(?:_|$)",
+    re.IGNORECASE,
+)
+_CREDENTIAL_HEADER_RE = re.compile(
+    r"(?:^|[=\s])(?:authorization|proxy-authorization|cookie|x-api-key)"
+    r"\s*[:=]|(?:^|[=\s])bearer\s+\S+",
+    re.IGNORECASE,
+)
+_PROXY_ENV_RE = re.compile(
+    r"^(?:ALL|FTP|HTTP|HTTPS|NO)_PROXY$",
     re.IGNORECASE,
 )
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -46,6 +79,50 @@ _INFERENCE_ENV_RE = re.compile(
 )
 _REPRO_ENV_RE = re.compile(
     rf"(?:{_INFERENCE_ENV_RE.pattern}|LD_LIBRARY_PATH$|PATH$|PYTHONPATH$)"
+)
+_EXTERNAL_AMBIENT_ENV_ALLOWLIST = frozenset(
+    {
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+    }
+)
+_EXTERNAL_SPEC_ENV_ALLOWLIST = (
+    _EXTERNAL_AMBIENT_ENV_ALLOWLIST | {"PYTHONHASHSEED"}
+)
+_EXTERNAL_FORCED_ENV = {
+    "PATH": os.defpath,
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONUNBUFFERED": "1",
+}
+_CREDENTIAL_REDACTION = "[REDACTED_CREDENTIAL]"
+_PROVIDER_SPEC_KEYS = frozenset(
+    {
+        "schema_version",
+        "provider_id",
+        "argv",
+        "cwd",
+        "egress",
+        "model",
+        "lanes",
+        "timeout_seconds",
+        "secret_env_names",
+        "env",
+    }
+)
+_SECRET_VALUE_RES = (
+    re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bBearer\s+\S+", re.IGNORECASE),
+    re.compile(r"-----BEGIN [A-Z ]+ PRIVATE KEY-----"),
+    re.compile(r"https?://[^/@\s:]+:[^/@\s]+@", re.IGNORECASE),
+    re.compile(
+        r"(?:api[_-]?key|authorization|password|secret|token)="
+        r"[^&\s]+",
+        re.IGNORECASE,
+    ),
 )
 _ALLOWED_METRICS = frozenset(
     {
@@ -199,6 +276,64 @@ def _safe_component(value: Any, label: str) -> str:
     return component
 
 
+def _looks_credential_related(name: str) -> bool:
+    return bool(_CREDENTIAL_ENV_RE.search(name.replace("-", "_")))
+
+
+def _argv_contains_credentials(argv: list[str]) -> bool:
+    for argument in argv[1:]:
+        if argument.startswith("-"):
+            option = argument.split("=", 1)[0]
+            normalized = option.lstrip("-").replace("-", "_")
+            if _CREDENTIAL_ARG_RE.search(normalized):
+                return True
+        if _CREDENTIAL_HEADER_RE.search(argument):
+            return True
+        if "://" not in argument:
+            continue
+        try:
+            parsed = urllib.parse.urlsplit(argument)
+        except ValueError:
+            return True
+        if parsed.username is not None or parsed.password is not None:
+            return True
+        for encoded_fields in (parsed.query, parsed.fragment):
+            for name, value in urllib.parse.parse_qsl(
+                encoded_fields,
+                keep_blank_values=True,
+            ):
+                if value and _looks_credential_related(name):
+                    return True
+    return False
+
+
+def _reject_embedded_secret_material(
+    value: Any,
+    label: str,
+) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if _looks_credential_related(str(key)):
+                raise BenchmarkError(
+                    f"{label} contains a credential-like field"
+                )
+            _reject_embedded_secret_material(item, f"{label}.{key}")
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _reject_embedded_secret_material(
+                item,
+                f"{label}[{index}]",
+            )
+        return
+    if isinstance(value, str) and any(
+        pattern.search(value) for pattern in _SECRET_VALUE_RES
+    ):
+        raise BenchmarkError(
+            f"{label} contains a credential-like value"
+        )
+
+
 def _validate_sha256(value: Any, label: str) -> str:
     digest = _require_string(value, label)
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
@@ -327,6 +462,16 @@ def load_provider_spec(
         raise BenchmarkError(
             "Provider spec has an unsupported schema_version"
         )
+    egress = spec.get("egress", "none")
+    allowed_keys = set(_PROVIDER_SPEC_KEYS)
+    if egress == "external":
+        allowed_keys.add("external_policy")
+    unexpected_keys = set(spec) - allowed_keys
+    if unexpected_keys:
+        raise BenchmarkError(
+            "provider spec has unexpected fields; refusing to persist "
+            "unvalidated data"
+        )
     _require_string(spec.get("provider_id"), "provider_id")
     argv = spec.get("argv")
     if (
@@ -337,6 +482,10 @@ def load_provider_spec(
         raise BenchmarkError("provider argv must be a nonempty string list")
     if any("\x00" in item for item in argv):
         raise BenchmarkError("provider argv cannot contain a NUL byte")
+    if _argv_contains_credentials(argv):
+        raise BenchmarkError(
+            "provider argv cannot contain credential-bearing options or URLs"
+        )
     executable = Path(argv[0]).expanduser()
     if not executable.is_absolute():
         raise BenchmarkError("provider argv[0] must be an absolute path")
@@ -362,14 +511,18 @@ def load_provider_spec(
                 "provider cwd must be an existing absolute path"
             )
         spec["cwd"] = str(cwd.resolve())
-    egress = spec.get("egress", "none")
     if egress not in {"none", "external"}:
         raise BenchmarkError("provider egress must be none or external")
     model = spec.get("model")
     if not isinstance(model, dict):
         raise BenchmarkError("provider model must be an object")
+    if set(model) != {"requested", "revision"}:
+        raise BenchmarkError(
+            "provider model must contain exactly requested and revision"
+        )
     _require_string(model.get("requested"), "model.requested")
     _require_string(model.get("revision"), "model.revision")
+    _reject_embedded_secret_material(model, "model")
     lane_specs = spec.get("lanes")
     if not isinstance(lane_specs, dict) or not lane_specs:
         raise BenchmarkError("provider lanes must be a nonempty object")
@@ -377,16 +530,40 @@ def load_provider_spec(
         _safe_component(lane, "lane name")
         if not isinstance(lane_spec, dict):
             raise BenchmarkError(f"provider lane {lane} must be an object")
+        if not set(lane_spec) <= {
+            "prompt",
+            "settings",
+            "include_raw_text",
+        }:
+            raise BenchmarkError(
+                f"provider lane {lane} has unexpected fields"
+            )
         _require_string(lane_spec.get("prompt"), f"lanes.{lane}.prompt")
         if not isinstance(lane_spec.get("settings", {}), dict):
             raise BenchmarkError(f"lanes.{lane}.settings must be an object")
-        include_raw = lane_spec.get("include_raw_text", lane == "best")
+        if egress == "external" and "include_raw_text" not in lane_spec:
+            raise BenchmarkError(
+                "external provider lanes must explicitly set "
+                "include_raw_text"
+            )
+        include_raw = lane_spec.get(
+            "include_raw_text",
+            lane == "best" if egress == "none" else False,
+        )
         if not isinstance(include_raw, bool):
             raise BenchmarkError(
                 f"lanes.{lane}.include_raw_text must be boolean"
             )
         if lane == "parity" and include_raw:
             raise BenchmarkError("the parity lane cannot include raw text")
+        _reject_embedded_secret_material(
+            lane_spec["prompt"],
+            f"lanes.{lane}.prompt",
+        )
+        _reject_embedded_secret_material(
+            lane_spec.get("settings", {}),
+            f"lanes.{lane}.settings",
+        )
     timeout = spec.get("timeout_seconds", 1800)
     if not isinstance(timeout, int) or timeout <= 0:
         raise BenchmarkError("timeout_seconds must be a positive integer")
@@ -397,6 +574,18 @@ def load_provider_spec(
     ):
         raise BenchmarkError(
             "secret_env_names must contain valid environment names"
+        )
+    if len(secrets) != len(set(secrets)):
+        raise BenchmarkError("secret_env_names must be unique")
+    if egress == "none" and secrets:
+        raise BenchmarkError(
+            "providers without external egress cannot receive secrets"
+        )
+    if egress == "external" and any(
+        not _looks_credential_related(name) for name in secrets
+    ):
+        raise BenchmarkError(
+            "external secret_env_names must be credential-related"
         )
     overrides = spec.get("env", {})
     if not isinstance(overrides, dict) or not all(
@@ -418,6 +607,26 @@ def load_provider_spec(
             "provider env cannot contain secret-looking values; use "
             "secret_env_names"
         )
+    if any(_PROXY_ENV_RE.fullmatch(key) for key in overrides):
+        raise BenchmarkError("provider env cannot override proxy settings")
+    if egress == "external" and any(
+        key not in _EXTERNAL_SPEC_ENV_ALLOWLIST for key in overrides
+    ):
+        raise BenchmarkError(
+            "external provider env contains a non-allowlisted setting"
+        )
+    if egress == "external":
+        try:
+            from .providers.external_api import (
+                ExternalAdapterError,
+                validate_external_provider_spec_record,
+            )
+
+            spec = validate_external_provider_spec_record(spec)
+        except ExternalAdapterError as exc:
+            raise BenchmarkError(
+                "external provider spec is not a valid built-in profile"
+            ) from exc
     return spec
 
 
@@ -748,7 +957,11 @@ def _build_request(
     }
     prompt = lane_spec["prompt"]
     raw_text = None
-    if lane_spec.get("include_raw_text", lane == "best"):
+    include_raw_text = lane_spec.get(
+        "include_raw_text",
+        lane == "best" if spec.get("egress", "none") == "none" else False,
+    )
+    if include_raw_text:
         raw_text = {
             "path": str(item["copied_paths"]["raw_text"].resolve()),
             "sha256": case["input"]["raw_text_sha256"],
@@ -778,6 +991,22 @@ def _build_request(
 def _provider_environment(spec: dict[str, Any]) -> dict[str, str]:
     allowed_secrets = set(spec.get("secret_env_names", []))
     explicit = spec.get("env", {})
+    if spec.get("egress", "none") == "external":
+        environment = {
+            key: os.environ[key]
+            for key in _EXTERNAL_AMBIENT_ENV_ALLOWLIST
+            if key in os.environ
+        }
+        environment.update(explicit)
+        environment.update(_EXTERNAL_FORCED_ENV)
+        environment.update(
+            {
+                key: os.environ[key]
+                for key in allowed_secrets
+                if key in os.environ
+            }
+        )
+        return environment
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -803,6 +1032,212 @@ def _recorded_provider_environment(
     }
     recorded.update(spec.get("env", {}))
     return dict(sorted(recorded.items()))
+
+
+def _credential_variants(values: tuple[str, ...]) -> tuple[str, ...]:
+    variants = set()
+    for value in values:
+        if not value:
+            continue
+        encoded = value.encode("utf-8")
+        standard_base64 = base64.b64encode(encoded).decode("ascii")
+        urlsafe_base64 = base64.urlsafe_b64encode(encoded).decode("ascii")
+        variants.add(value)
+        variants.add(json.dumps(value, ensure_ascii=False)[1:-1])
+        variants.add(urllib.parse.quote(value, safe=""))
+        variants.add(standard_base64)
+        variants.add(standard_base64.rstrip("="))
+        variants.add(urlsafe_base64)
+        variants.add(urlsafe_base64.rstrip("="))
+    return tuple(sorted(variants, key=len, reverse=True))
+
+
+def _credential_replacements(
+    values: tuple[str, ...],
+) -> tuple[tuple[bytes, bytes], ...]:
+    marker = _CREDENTIAL_REDACTION.encode("utf-8")
+    return tuple(
+        (variant.encode("utf-8"), marker)
+        for variant in _credential_variants(values)
+        if variant
+    )
+
+
+def _redact_credential_bytes(
+    payload: bytes,
+    replacements: tuple[tuple[bytes, bytes], ...],
+) -> tuple[bytes, int]:
+    redactions = 0
+    for needle, marker in replacements:
+        occurrences = payload.count(needle)
+        if occurrences:
+            payload = payload.replace(needle, marker)
+            redactions += occurrences
+    return payload, redactions
+
+
+def _redact_credential_text(
+    value: str,
+    credential_values: tuple[str, ...],
+) -> tuple[str, int]:
+    redactions = 0
+    for needle in _credential_variants(credential_values):
+        occurrences = value.count(needle)
+        if occurrences:
+            value = value.replace(needle, _CREDENTIAL_REDACTION)
+            redactions += occurrences
+    return value, redactions
+
+
+def _redact_credential_file(
+    path: Path,
+    replacements: tuple[tuple[bytes, bytes], ...],
+) -> tuple[int, bool]:
+    if path.is_symlink():
+        path.unlink(missing_ok=True)
+        return 0, False
+    if not path.is_file():
+        return 0, True
+    try:
+        payload = path.read_bytes()
+        redacted, count = _redact_credential_bytes(payload, replacements)
+        if count:
+            path.write_bytes(redacted)
+    except OSError:
+        return 0, False
+    return count, True
+
+
+def _unused_sanitized_path(path: Path) -> Path:
+    candidate = path
+    index = 1
+    while os.path.lexists(candidate):
+        candidate = path.with_name(f"{path.name}.redacted-{index}")
+        index += 1
+    return candidate
+
+
+def _redact_artifact_tree(
+    artifacts_dir: Path,
+    credential_values: tuple[str, ...],
+    replacements: tuple[tuple[bytes, bytes], ...],
+) -> tuple[int, bool]:
+    redactions = 0
+    scan_complete = True
+    for root, dirnames, filenames in os.walk(
+        artifacts_dir,
+        topdown=False,
+        followlinks=False,
+    ):
+        root_path = Path(root)
+        for name in filenames:
+            path = root_path / name
+            count, complete = _redact_credential_file(path, replacements)
+            redactions += count
+            scan_complete = scan_complete and complete
+            if not os.path.lexists(path):
+                continue
+            sanitized_name, count = _redact_credential_text(
+                name,
+                credential_values,
+            )
+            redactions += count
+            if sanitized_name != name:
+                destination = _unused_sanitized_path(
+                    path.with_name(sanitized_name)
+                )
+                try:
+                    path.rename(destination)
+                except OSError:
+                    scan_complete = False
+        for name in dirnames:
+            path = root_path / name
+            if path.is_symlink():
+                try:
+                    path.unlink()
+                except OSError:
+                    scan_complete = False
+                else:
+                    scan_complete = False
+                continue
+            sanitized_name, count = _redact_credential_text(
+                name,
+                credential_values,
+            )
+            redactions += count
+            if sanitized_name != name:
+                destination = _unused_sanitized_path(
+                    path.with_name(sanitized_name)
+                )
+                try:
+                    path.rename(destination)
+                except OSError:
+                    scan_complete = False
+    return redactions, scan_complete
+
+
+def _provider_credential_values(
+    spec: dict[str, Any],
+    environment: dict[str, str],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                environment[name]
+                for name in spec.get("secret_env_names", [])
+                if environment.get(name)
+            },
+            key=len,
+            reverse=True,
+        )
+    )
+
+
+def _persist_sanitized_capture(
+    capture,
+    path: Path,
+    replacements: tuple[tuple[bytes, bytes], ...],
+) -> tuple[int, bool]:
+    try:
+        capture.seek(0)
+        payload = capture.read()
+        redacted, count = _redact_credential_bytes(payload, replacements)
+        path.write_bytes(redacted)
+    except OSError:
+        path.write_bytes(b"")
+        return 0, False
+    return count, True
+
+
+def _sanitize_provider_evidence(
+    *,
+    credential_values: tuple[str, ...],
+    replacements: tuple[tuple[bytes, bytes], ...],
+    log_redactions: dict[str, int],
+    log_scan_complete: bool,
+    responses_path: Path,
+    artifacts_dir: Path,
+) -> dict[str, Any]:
+    surfaces = dict(log_redactions)
+    scan_complete = log_scan_complete
+    count, complete = _redact_credential_file(
+        responses_path,
+        replacements,
+    )
+    surfaces["responses"] = count
+    scan_complete = scan_complete and complete
+    artifact_count, complete = _redact_artifact_tree(
+        artifacts_dir,
+        credential_values,
+        replacements,
+    )
+    surfaces["artifacts"] = artifact_count
+    scan_complete = scan_complete and complete
+    return {
+        "credential_leak_detected": any(surfaces.values()),
+        "credential_redactions": dict(sorted(surfaces.items())),
+        "credential_scan_complete": scan_complete,
+    }
 
 
 def _process_group_exists(process_group: int) -> bool:
@@ -1401,6 +1836,26 @@ def _require_unchanged_argv_files(
         )
 
 
+def _require_unchanged_external_executor(
+    records: list[dict[str, Any]],
+) -> None:
+    for record in records:
+        source = Path(record["source_path"])
+        try:
+            size_bytes = source.stat().st_size
+        except OSError as exc:
+            raise BenchmarkError(
+                "external executor source disappeared before spawn"
+            ) from exc
+        if (
+            size_bytes != record["size_bytes"]
+            or file_sha256(str(source)) != record["sha256"]
+        ):
+            raise BenchmarkError(
+                "external executor source drift detected before spawn"
+            )
+
+
 def _snapshot_file(
     source: Path,
     evidence_root: Path,
@@ -1506,6 +1961,170 @@ def _package_version(name: str) -> str | None:
         return None
 
 
+def _external_gate(
+    *,
+    spec: dict[str, Any],
+    manifest: list[dict[str, Any]],
+    manifest_source_bytes: bytes,
+    plan_path: str | os.PathLike[str] | None,
+    approval_path: str | os.PathLike[str] | None,
+    selected_lanes: list[str],
+    repeats: int,
+) -> dict[str, Any]:
+    if plan_path is None or approval_path is None:
+        raise BenchmarkError(
+            "external providers require both --external-plan and "
+            "--external-approval"
+        )
+    try:
+        from .ocr_external import (
+            ExternalApprovalError,
+            ExternalPlanError,
+            build_external_execution_binding,
+            validate_external_upload_approval,
+            validate_external_upload_plan,
+        )
+        from .ocr_external_setup import (
+            ExternalSetupError,
+            external_executor_bundle_identity,
+            external_provider_spec_sha256,
+            validate_external_provider_spec,
+        )
+
+        plan_source = _resolve_source_path(plan_path, "external plan")
+        approval_source = _resolve_source_path(
+            approval_path,
+            "external approval",
+        )
+        plan_source_bytes = _read_bytes(plan_source)
+        approval_source_bytes = _read_bytes(approval_source)
+        plan = validate_external_upload_plan(
+            _decode_json(plan_source_bytes, plan_source)
+        )
+        now = datetime.now(UTC).replace(microsecond=0).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        approval = validate_external_upload_approval(
+            plan,
+            _decode_json(approval_source_bytes, approval_source),
+            now=now,
+        )
+        normalized_spec = validate_external_provider_spec(spec)
+        spec_hash = external_provider_spec_sha256(normalized_spec)
+        bundle = external_executor_bundle_identity(
+            normalized_spec["argv"][0]
+        )
+        if plan["executor"]["provider_spec_sha256"] != spec_hash:
+            raise BenchmarkError(
+                "external plan is bound to a different provider spec"
+            )
+        if (
+            plan["executor"]["adapter_bundle_sha256"]
+            != bundle["bundle_sha256"]
+        ):
+            raise BenchmarkError(
+                "external executor or Python identity differs from plan"
+            )
+        if (
+            normalized_spec["external_policy"][
+                "executor_bundle_sha256"
+            ]
+            != bundle["bundle_sha256"]
+        ):
+            raise BenchmarkError(
+                "external provider spec executor identity is stale"
+            )
+        if plan["manifest_sha256"] != hashlib.sha256(
+            manifest_source_bytes
+        ).hexdigest():
+            raise BenchmarkError(
+                "external plan is bound to a different manifest file"
+            )
+        plan_lanes = [lane["lane_id"] for lane in plan["lanes"]]
+        if plan_lanes != selected_lanes:
+            raise BenchmarkError(
+                "external plan lanes do not exactly match the benchmark"
+            )
+        if plan["execution"]["repeats"] != repeats:
+            raise BenchmarkError(
+                "external plan repeats do not exactly match the benchmark"
+            )
+        expected_lanes = []
+        for lane_id in selected_lanes:
+            lane = normalized_spec["lanes"][lane_id]
+            expected_lanes.append(
+                {
+                    "lane_id": lane_id,
+                    "prompt": lane["prompt"],
+                    "prompt_sha256": hashlib.sha256(
+                        lane["prompt"].encode("utf-8")
+                    ).hexdigest(),
+                    "prompt_mode": lane["settings"]["prompt_mode"],
+                    "include_raw_text": lane["include_raw_text"],
+                }
+            )
+        if plan["lanes"] != expected_lanes:
+            raise BenchmarkError(
+                "external plan prompt or data scope differs from spec"
+            )
+        include_raw_text = any(
+            lane["include_raw_text"] for lane in plan["lanes"]
+        )
+        expected_cases = []
+        for case in manifest:
+            expected = {
+                "case_id": case["case_id"],
+                "image_sha256": case["input"]["image_sha256"],
+                "dimensions": case["input"]["dimensions"],
+                "media_type": "image/png",
+            }
+            if include_raw_text:
+                expected["raw_text_sha256"] = case["input"][
+                    "raw_text_sha256"
+                ]
+            expected_cases.append(expected)
+        if plan["cases"] != expected_cases:
+            raise BenchmarkError(
+                "external plan cases do not exactly match the manifest"
+            )
+        if plan["provider_profile"]["profile_id"] != spec["provider_id"]:
+            raise BenchmarkError(
+                "external plan profile differs from provider spec"
+            )
+        binding = build_external_execution_binding(
+            plan,
+            approval,
+            now=now,
+        )
+    except BenchmarkError:
+        raise
+    except (
+        ExternalApprovalError,
+        ExternalPlanError,
+        ExternalSetupError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise BenchmarkError(
+            "external plan or approval validation failed"
+        ) from exc
+    return {
+        "plan_source": plan_source,
+        "plan_source_bytes": plan_source_bytes,
+        "plan_file_sha256": hashlib.sha256(plan_source_bytes).hexdigest(),
+        "approval_source": approval_source,
+        "approval_source_bytes": approval_source_bytes,
+        "approval_file_sha256": hashlib.sha256(
+            approval_source_bytes
+        ).hexdigest(),
+        "plan": plan,
+        "approval": approval,
+        "binding": binding,
+        "executor_bundle": bundle,
+    }
+
+
 def run_benchmark(
     *,
     manifest_path: str | os.PathLike[str],
@@ -1515,6 +2134,8 @@ def run_benchmark(
     lanes: list[str] | tuple[str, ...] | None = None,
     repeats: int = 5,
     allow_external: bool = False,
+    external_plan_path: str | os.PathLike[str] | None = None,
+    external_approval_path: str | os.PathLike[str] | None = None,
     out=None,
 ) -> dict[str, Any]:
     if not isinstance(repeats, int) or repeats <= 0:
@@ -1534,31 +2155,6 @@ def run_benchmark(
         provider_spec_source,
         _source_bytes=provider_spec_source_bytes,
     )
-    if spec.get("egress", "none") == "external" and not allow_external:
-        raise BenchmarkError(
-            "External provider refused without explicit --allow-external"
-        )
-    if spec.get("egress", "none") == "external":
-        authorization = spec.get("external_authorization")
-        required_authorization = (
-            "approved_by",
-            "approved_at",
-            "scope",
-            "retention",
-        )
-        if not isinstance(authorization, dict) or any(
-            not isinstance(authorization.get(key), str)
-            or not authorization[key]
-            for key in required_authorization
-        ):
-            raise BenchmarkError(
-                "External provider requires structured external_authorization"
-            )
-        budget = authorization.get("budget_usd")
-        if not _is_nonnegative_number(budget):
-            raise BenchmarkError(
-                "external_authorization.budget_usd must be nonnegative"
-            )
     selected_lanes = list(lanes or spec["lanes"])
     if not selected_lanes or len(set(selected_lanes)) != len(selected_lanes):
         raise BenchmarkError("lanes must be unique and nonempty")
@@ -1568,17 +2164,36 @@ def run_benchmark(
             "Provider does not define lanes: "
             f"{', '.join(sorted(unknown_lanes))}"
         )
+    external = spec.get("egress", "none") == "external"
+    if external and not allow_external:
+        raise BenchmarkError(
+            "External provider refused without explicit --allow-external"
+        )
+    if not external and (
+        external_plan_path is not None
+        or external_approval_path is not None
+    ):
+        raise BenchmarkError(
+            "external plan and approval arguments require an external "
+            "provider spec"
+        )
+    external_execution = None
+    if external:
+        external_execution = _external_gate(
+            spec=spec,
+            manifest=manifest,
+            manifest_source_bytes=manifest_source_bytes,
+            plan_path=external_plan_path,
+            approval_path=external_approval_path,
+            selected_lanes=selected_lanes,
+            repeats=repeats,
+        )
     dest_path = Path(dest_dir).expanduser()
     prepared = prepare_run(manifest, input_root, dest_path)
     manifest_hash = _sha256_json(manifest)
     spec_hash = _sha256_json(spec)
     manifest_file_hash = hashlib.sha256(manifest_source_bytes).hexdigest()
     spec_file_hash = hashlib.sha256(provider_spec_source_bytes).hexdigest()
-    provider_environment = _provider_environment(spec)
-    recorded_environment = _recorded_provider_environment(
-        provider_environment,
-        spec,
-    )
     repo_root = Path(__file__).resolve().parents[3]
     evidence = _snapshot_run_evidence(
         dest_path,
@@ -1588,6 +2203,97 @@ def run_benchmark(
         repo_root,
         manifest_source_bytes=manifest_source_bytes,
         provider_spec_source_bytes=provider_spec_source_bytes,
+    )
+    external_protocol_paths = None
+    external_identity = None
+    if external_execution is not None:
+        evidence_root = dest_path / "evidence"
+        evidence["external_plan"] = _snapshot_file(
+            external_execution["plan_source"],
+            evidence_root,
+            Path("external/upload-plan.json"),
+            source_bytes=external_execution["plan_source_bytes"],
+        )
+        evidence["external_approval"] = _snapshot_file(
+            external_execution["approval_source"],
+            evidence_root,
+            Path("external/upload-approval.json"),
+            source_bytes=external_execution["approval_source_bytes"],
+        )
+        external_protocol_paths = {
+            "provider_spec": (
+                evidence_root / evidence["provider_spec"]["evidence_path"]
+            ).resolve(),
+            "plan": (
+                evidence_root / evidence["external_plan"]["evidence_path"]
+            ).resolve(),
+            "approval": (
+                evidence_root
+                / evidence["external_approval"]["evidence_path"]
+            ).resolve(),
+            "budget_ledger": (
+                dest_path / "external-budget-ledger.json"
+            ).resolve(),
+        }
+        external_execution = _external_gate(
+            spec=spec,
+            manifest=manifest,
+            manifest_source_bytes=manifest_source_bytes,
+            plan_path=external_protocol_paths["plan"],
+            approval_path=external_protocol_paths["approval"],
+            selected_lanes=selected_lanes,
+            repeats=repeats,
+        )
+        executor_sources = []
+        for record in external_execution["executor_bundle"]["files"]:
+            module = importlib.import_module(record["module"])
+            source = Path(module.__file__).resolve(strict=True)
+            if (
+                source.stat().st_size != record["size_bytes"]
+                or file_sha256(str(source)) != record["sha256"]
+            ):
+                raise BenchmarkError(
+                    "external executor source changed during snapshot"
+                )
+            snapshot = _snapshot_file(
+                source,
+                evidence_root,
+                Path("external/executor")
+                / (record["module"].replace(".", "-") + ".py"),
+            )
+            executor_sources.append({**record, **snapshot})
+        evidence["external_executor"] = {
+            "bundle_sha256": external_execution["executor_bundle"][
+                "bundle_sha256"
+            ],
+            "python_executable": external_execution[
+                "executor_bundle"
+            ]["python_executable"],
+            "files": executor_sources,
+        }
+        external_identity = {
+            "plan_sha256": external_execution["plan"]["plan_sha256"],
+            "approval_sha256": external_execution["approval"][
+                "approval_sha256"
+            ],
+            "provider_profile_sha256": external_execution["plan"][
+                "provider_profile_sha256"
+            ],
+            "executor_bundle_sha256": external_execution[
+                "executor_bundle"
+            ]["bundle_sha256"],
+            "plan_file_sha256": external_execution["plan_file_sha256"],
+            "approval_file_sha256": external_execution[
+                "approval_file_sha256"
+            ],
+        }
+    # This is the first credential read. The external gate immediately above
+    # rehashes the approved interpreter and executor before values enter the
+    # child environment mapping.
+    provider_environment = _provider_environment(spec)
+    recorded_environment = _recorded_provider_environment(
+        provider_environment,
+        spec,
     )
     experiment_hash = _sha256_json(
         {
@@ -1607,6 +2313,7 @@ def run_benchmark(
                 record["sha256"] for record in evidence["harness_files"]
             ],
             "git_diff_sha256": evidence["git_diff"]["sha256"],
+            "external_identity": external_identity,
         }
     )
     run_record = {
@@ -1636,6 +2343,7 @@ def run_benchmark(
             "lanes": selected_lanes,
             "repeats": repeats,
             "allow_external": allow_external,
+            "external_identity": external_identity,
             "experiment_sha256": experiment_hash,
         },
         "provider": {
@@ -1644,7 +2352,11 @@ def run_benchmark(
             "argv_files": evidence["argv_files"],
             "cwd": spec.get("cwd"),
             "egress": spec.get("egress", "none"),
-            "external_authorization": spec.get("external_authorization"),
+            "external_execution": (
+                external_execution["binding"]
+                if external_execution is not None
+                else None
+            ),
             "environment": recorded_environment,
             "environment_sha256": _sha256_json(recorded_environment),
             "lanes": {
@@ -1663,6 +2375,10 @@ def run_benchmark(
                 _require_unchanged_argv_files(
                     evidence["argv_files"], spec
                 )
+                if external_execution is not None:
+                    _require_unchanged_external_executor(
+                        evidence["external_executor"]["files"]
+                    )
             except BenchmarkError as exc:
                 _write_json(
                     dest_path / "provider-drift.json",
@@ -1687,7 +2403,11 @@ def run_benchmark(
                     item,
                     spec,
                     spec_hash,
-                    manifest_hash,
+                    (
+                        external_execution["plan"]["manifest_sha256"]
+                        if external_execution is not None
+                        else manifest_hash
+                    ),
                     lane,
                     repeat,
                     experiment_hash,
@@ -1706,25 +2426,76 @@ def run_benchmark(
                 "--artifacts-dir",
                 str(artifacts_dir.resolve()),
             ]
+            if external_protocol_paths is not None:
+                argv.extend(
+                    [
+                        "--external-provider-spec",
+                        str(external_protocol_paths["provider_spec"]),
+                        "--external-plan",
+                        str(external_protocol_paths["plan"]),
+                        "--external-approval",
+                        str(external_protocol_paths["approval"]),
+                        "--external-budget-ledger",
+                        str(external_protocol_paths["budget_ledger"]),
+                    ]
+                )
             started = time.monotonic()
             returncode = -1
             execution_error = None
+            stdout_path = attempt_dir / "stdout.log"
+            stderr_path = attempt_dir / "stderr.log"
+            credential_values = _provider_credential_values(
+                spec,
+                provider_environment,
+            )
+            replacements = _credential_replacements(credential_values)
+            log_redactions: dict[str, int] = {}
+            log_scan_complete = True
             with (
-                open(attempt_dir / "stdout.log", "wb") as stdout_handle,
-                open(attempt_dir / "stderr.log", "wb") as stderr_handle,
+                tempfile.TemporaryFile() as stdout_capture,
+                tempfile.TemporaryFile() as stderr_capture,
             ):
                 returncode, execution_error = _run_provider_process(
                     argv,
                     cwd=spec.get("cwd"),
                     environment=provider_environment,
-                    stdout_handle=stdout_handle,
-                    stderr_handle=stderr_handle,
+                    stdout_handle=stdout_capture,
+                    stderr_handle=stderr_capture,
                     timeout_seconds=spec.get("timeout_seconds", 1800),
                 )
+                for label, capture, path in (
+                    ("stdout", stdout_capture, stdout_path),
+                    ("stderr", stderr_capture, stderr_path),
+                ):
+                    count, complete = _persist_sanitized_capture(
+                        capture,
+                        path,
+                        replacements,
+                    )
+                    log_redactions[label] = count
+                    log_scan_complete = log_scan_complete and complete
+            if execution_error:
+                execution_error, count = _redact_credential_text(
+                    execution_error,
+                    credential_values,
+                )
+                log_redactions["execution_error"] = count
+            sanitization = _sanitize_provider_evidence(
+                credential_values=credential_values,
+                replacements=replacements,
+                log_redactions=log_redactions,
+                log_scan_complete=log_scan_complete,
+                responses_path=responses_path,
+                artifacts_dir=artifacts_dir,
+            )
             try:
                 _require_unchanged_argv_files(
                     evidence["argv_files"], spec
                 )
+                if external_execution is not None:
+                    _require_unchanged_external_executor(
+                        evidence["external_executor"]["files"]
+                    )
             except BenchmarkError as exc:
                 _write_json(
                     dest_path / "provider-drift.json",
@@ -1741,21 +2512,32 @@ def run_benchmark(
                 "returncode": returncode,
                 "wall_seconds": round(time.monotonic() - started, 6),
                 "error": execution_error,
-                "stdout_sha256": file_sha256(str(attempt_dir / "stdout.log")),
-                "stderr_sha256": file_sha256(str(attempt_dir / "stderr.log")),
+                "stdout_sha256": file_sha256(str(stdout_path)),
+                "stderr_sha256": file_sha256(str(stderr_path)),
+                **sanitization,
             }
             responses: list[dict[str, Any]] = []
-            parse_error = execution_error
+            parse_errors = [execution_error] if execution_error else []
+            if sanitization["credential_leak_detected"]:
+                parse_errors.append(
+                    "provider credential leak detected; persisted evidence "
+                    "was redacted"
+                )
+            if not sanitization["credential_scan_complete"]:
+                parse_errors.append(
+                    "provider evidence credential scan was incomplete"
+                )
             if responses_path.exists():
                 try:
                     responses = _read_jsonl(responses_path)
                 except BenchmarkError as exc:
-                    parse_error = str(exc)
+                    parse_errors.append(str(exc))
             else:
                 responses_path.touch()
-                parse_error = (
-                    parse_error or "provider did not create responses JSONL"
+                parse_errors.append(
+                    "provider did not create responses JSONL"
                 )
+            parse_error = "; ".join(parse_errors) or None
             subprocess_record["requests_jsonl_sha256"] = file_sha256(
                 str(requests_path)
             )

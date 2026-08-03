@@ -19,6 +19,7 @@ from enum import Enum
 from functools import partial
 
 DEFAULT_OCR_MODEL = "deepseek-ai/DeepSeek-OCR"
+DEFAULT_OCR_MODEL_REVISION = "9f30c71f441d010e5429c532364a86705536c53a"
 DEFAULT_OCR_WINDOW_SIZE = 50
 DEFAULT_MARKDOWN_WINDOW_SIZE = 128
 
@@ -745,7 +746,10 @@ def _poppler_version() -> str | None:
     return match.group(1) if match else None
 
 
-def resolve_model_metadata(model: str) -> dict:
+def resolve_model_metadata(
+    model: str,
+    revision: str | None = None,
+) -> dict:
     resolved_path = None
     if os.path.exists(model):
         resolved_path = os.path.realpath(model)
@@ -755,6 +759,7 @@ def resolve_model_metadata(model: str) -> dict:
 
             resolved_path = snapshot_download(
                 repo_id=model,
+                revision=revision,
                 local_files_only=True,
             )
         except Exception:
@@ -767,7 +772,7 @@ def resolve_model_metadata(model: str) -> dict:
             snapshot = match.group(1)
     return {
         "requested": model,
-        "revision": None,
+        "revision": revision,
         "resolved_path": resolved_path,
         "snapshot": snapshot,
     }
@@ -802,6 +807,7 @@ def engine_metadata(
     llm,
     *,
     model: str,
+    model_revision: str | None,
     requested_attention_backend: str | None,
     requested_mm_encoder_attn_backend: str | None,
 ) -> dict:
@@ -826,7 +832,7 @@ def engine_metadata(
     except Exception:
         configured_backend = None
     return {
-        "model": resolve_model_metadata(model),
+        "model": resolve_model_metadata(model, model_revision),
         "runtime": {
             "python": platform.python_version(),
             "torch": getattr(torch, "__version__", None),
@@ -1068,6 +1074,7 @@ class DeepSeekOcrOfflineProcessor:
         self,
         *,
         model: str,
+        model_revision: str | None = DEFAULT_OCR_MODEL_REVISION,
         output_format: str,
         prompt: str | None = None,
         prompt_mode: str | None = None,
@@ -1094,6 +1101,7 @@ class DeepSeekOcrOfflineProcessor:
         verbose: Callable[[str], None] | None = None,
     ) -> None:
         self.model = model
+        self.model_revision = model_revision
         self.output_format = output_format
         self.prompt = prompt
         self.prompt_mode = prompt_mode
@@ -1214,6 +1222,7 @@ class DeepSeekOcrOfflineProcessor:
             "logits_processors": [NGramPerReqLogitsProcessor],
             "trust_remote_code": True,
         }
+        self._maybe_add(llm_kwargs, "revision", self.model_revision)
         self._maybe_add(
             llm_kwargs,
             "enable_chunked_prefill",
@@ -1276,6 +1285,7 @@ class DeepSeekOcrOfflineProcessor:
         self._engine_metadata = engine_metadata(
             llm,
             model=self.model,
+            model_revision=self.model_revision,
             requested_attention_backend=self.attention_backend,
             requested_mm_encoder_attn_backend=(
                 self.mm_encoder_attn_backend

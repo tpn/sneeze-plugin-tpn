@@ -53,13 +53,22 @@ print(f"request_count={len(requests)}", flush=True)
 
 if mode == "timeout":
     marker = artifacts / "grandchild-ticks.txt"
+    ready = artifacts / "grandchild-ready.txt"
     child_code = (
         "import pathlib,signal,time; "
         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "pathlib.Path(" + repr(str(ready)) + ").write_text('ready'); "
         "p=pathlib.Path(" + repr(str(marker)) + "); "
         "[(p.open('a').write('x'), time.sleep(0.02)) for _ in range(3000)]"
     )
-    subprocess.Popen([sys.executable, "-c", child_code])
+    child = subprocess.Popen([sys.executable, "-c", child_code])
+    deadline = time.monotonic() + 0.8
+    while not ready.is_file() and time.monotonic() < deadline:
+        if child.poll() is not None:
+            raise RuntimeError("timeout grandchild exited before ready")
+        time.sleep(0.01)
+    if not ready.is_file():
+        raise RuntimeError("timeout grandchild did not become ready")
     time.sleep(60)
 
 responses = []
@@ -560,7 +569,7 @@ def test_timeout_terminates_the_provider_process_group(tmp_path):
         lane="best",
         run_dir=run_dir,
         pages=[_write_page(tmp_path, "page-01")],
-        timeout_seconds=0.3,
+        timeout_seconds=1.0,
         terminate_grace_seconds=0.2,
     )
 
