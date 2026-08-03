@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import gc
+import hashlib
 import os
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -411,6 +414,33 @@ class OcrPdfPages(InvariantAwareCommand):
         _mandatory = False
         _default = False
 
+    markdown_provider_spec = None
+    _markdown_provider_spec = None
+
+    class MarkdownProviderSpecArg(StringInvariant):
+        _help = (
+            "Local Markdown provider specification for full mode. "
+            "DeepSeek still produces grounded OCR."
+        )
+        _mandatory = False
+
+    markdown_provider_lane = None
+    _markdown_provider_lane = None
+
+    class MarkdownProviderLaneArg(StringInvariant):
+        _help = "Provider lane for full-mode Markdown. [default: %default]"
+        _mandatory = False
+        _default = "best"
+
+    markdown_provider_run_dir = None
+    _markdown_provider_run_dir = None
+
+    class MarkdownProviderRunDirArg(StringInvariant):
+        _help = (
+            "New or empty absolute scratch directory for provider evidence."
+        )
+        _mandatory = False
+
     def run(self):
         from .ocr_vllm import (
             DeepSeekOcrOfflineProcessor,
@@ -444,6 +474,11 @@ class OcrPdfPages(InvariantAwareCommand):
                 "--prompt-mode full writes .ocr, .md, and .json and "
                 "requires --output-format md"
             )
+        markdown_provider = self._prepare_markdown_provider(
+            prompt_mode=prompt_mode,
+            source_dir=source_dir,
+            dest_dir=dest_dir,
+        )
         output_ext = "ocr" if output_format == "ocr" else output_format
         text_source_dir = _option_value(
             self,
@@ -540,13 +575,96 @@ class OcrPdfPages(InvariantAwareCommand):
                 verbose=self._verbose,
             )
             if prompt_mode == "full":
-                self._run_full_mode(processor, items)
+                self._run_full_mode(
+                    processor,
+                    items,
+                    markdown_provider=markdown_provider,
+                )
             else:
                 processor.run(tasks)
         except RuntimeError as exc:
             raise CommandError(str(exc)) from exc
 
-    def _run_full_mode(self, processor, items) -> None:
+    def _prepare_markdown_provider(
+        self,
+        *,
+        prompt_mode: str,
+        source_dir: str,
+        dest_dir: str,
+    ) -> dict | None:
+        spec_path = _option_value(self, "markdown_provider_spec")
+        run_dir = _option_value(self, "markdown_provider_run_dir")
+        if not spec_path:
+            if run_dir:
+                raise CommandError(
+                    "--markdown-provider-run-dir requires "
+                    "--markdown-provider-spec"
+                )
+            return None
+        if prompt_mode != "full":
+            raise CommandError(
+                "--markdown-provider-spec is valid only with "
+                "--prompt-mode full"
+            )
+        if not run_dir:
+            raise CommandError(
+                "--markdown-provider-spec requires "
+                "--markdown-provider-run-dir"
+            )
+        from .ocr_benchmark import PROTECTED_CORPUS_ROOTS
+        from .ocr_provider import (
+            ProviderError,
+            load_local_provider_spec,
+            validate_provider_run_dir,
+        )
+
+        lane = _option_value(self, "markdown_provider_lane", "best")
+        if not os.path.isabs(run_dir):
+            raise CommandError(
+                "Markdown provider evidence directory must be absolute"
+            )
+        candidate_dir = os.path.realpath(run_dir)
+        for label, root in (
+            ("source", source_dir),
+            ("destination", dest_dir),
+        ):
+            if _paths_overlap(candidate_dir, os.path.abspath(root)):
+                raise CommandError(
+                    "Markdown provider evidence directory must be "
+                    f"separate from the OCR {label} directory"
+                )
+        for protected_root in PROTECTED_CORPUS_ROOTS:
+            if _paths_overlap(candidate_dir, str(protected_root)):
+                raise CommandError(
+                    "Markdown provider evidence directory must be "
+                    "separate from protected canonical corpora"
+                )
+        try:
+            resolved_spec_path = (
+                Path(spec_path).expanduser().resolve(strict=True)
+            )
+            spec = load_local_provider_spec(resolved_spec_path)
+            if lane not in spec["lanes"]:
+                raise ProviderError(
+                    f"provider does not define lane: {lane}"
+                )
+            evidence_dir = validate_provider_run_dir(run_dir)
+        except (OSError, ProviderError) as exc:
+            raise CommandError(str(exc)) from exc
+        return {
+            "spec_path": str(resolved_spec_path),
+            "spec": spec,
+            "lane": lane,
+            "run_dir": str(evidence_dir),
+        }
+
+    def _run_full_mode(
+        self,
+        processor,
+        items,
+        *,
+        markdown_provider: dict | None = None,
+    ) -> None:
         from .ocr_vllm import (
             OcrPageTask,
             sampling_params_with_minimum_window,
@@ -576,7 +694,7 @@ class OcrPdfPages(InvariantAwareCommand):
         sampling_params = None
         try:
             processor.init_progressbar(total=total_actions)
-            if ocr_tasks or markdown_tasks:
+            if ocr_tasks or (markdown_tasks and markdown_provider is None):
                 llm, sampling_params = processor.prepare_engine()
             if ocr_tasks:
                 processor.output_format = "ocr"
@@ -588,7 +706,19 @@ class OcrPdfPages(InvariantAwareCommand):
                     llm=llm,
                     sampling_params=sampling_params,
                 )
-            if markdown_tasks:
+            provider_failures = []
+            if markdown_tasks and markdown_provider is not None:
+                if llm is not None:
+                    processor.shutdown_engine(llm)
+                    llm = None
+                    sampling_params = None
+                    _release_cuda_memory()
+                provider_failures = self._run_markdown_provider(
+                    processor,
+                    items,
+                    markdown_provider,
+                )
+            elif markdown_tasks:
                 markdown_sampling_params = (
                     sampling_params_with_minimum_window(
                         sampling_params,
@@ -609,7 +739,16 @@ class OcrPdfPages(InvariantAwareCommand):
                 "generation_metadata",
                 {},
             )
-            validation_failures = []
+            page_failures: dict[str, list[str]] = {}
+            batch_failures = []
+            provider_run_dir = (
+                markdown_provider["run_dir"] if markdown_provider else None
+            )
+            for path, flags in provider_failures:
+                if path == provider_run_dir:
+                    batch_failures.extend(flags)
+                    continue
+                page_failures.setdefault(path, []).extend(flags)
             for item in items:
                 generation_metadata = {
                     key: all_metadata[path]
@@ -644,25 +783,280 @@ class OcrPdfPages(InvariantAwareCommand):
                 elif quality.get("status") == "fail":
                     flags.extend(quality.get("flags", []))
                 if flags:
-                    validation_failures.append(
-                        (item.markdown_path, list(dict.fromkeys(flags)))
-                    )
+                    page_failures.setdefault(
+                        item.markdown_path, []
+                    ).extend(flags)
                 processor.update_progressbar(1)
-            if validation_failures:
-                details = "; ".join(
-                    f"{path} ({', '.join(flags)})"
-                    for path, flags in validation_failures
-                )
+            page_failures = {
+                path: list(dict.fromkeys(flags))
+                for path, flags in page_failures.items()
+            }
+            batch_failures = list(dict.fromkeys(batch_failures))
+            if page_failures or batch_failures:
+                details = []
+                if page_failures:
+                    details.append(
+                        f"{len(page_failures)} page(s): "
+                        + "; ".join(
+                            f"{path} ({', '.join(flags)})"
+                            for path, flags in page_failures.items()
+                        )
+                    )
+                if batch_failures:
+                    details.append(
+                        "provider batch (" + ", ".join(batch_failures) + ")"
+                    )
                 raise RuntimeError(
-                    "OCR page validation failed for "
-                    f"{len(validation_failures)} page(s). Outputs and "
-                    "request "
+                    "OCR page validation failed. Outputs and request "
                     "metadata were preserved for diagnosis; rerun with "
-                    f"--force after correcting the settings. {details}"
+                    "--force after correcting the settings. "
+                    + "; ".join(details)
                 )
         finally:
             processor.close_progressbar()
             processor.shutdown_engine(llm)
+
+    def _run_markdown_provider(
+        self,
+        processor,
+        items,
+        provider: dict,
+    ) -> list[tuple[str, list[str]]]:
+        from .ocr_provider import ProviderError, run_local_provider_batch
+        from .ocr_vllm import (
+            analyze_markdown_quality,
+            file_sha256,
+            read_optional_text,
+        )
+
+        lane_spec = provider["spec"]["lanes"][provider["lane"]]
+        item_by_id = {}
+        pages = []
+        for item in items:
+            if not item.need_markdown:
+                continue
+            identity = f"{item.base}\0{item.image_sha256}".encode()
+            page_id = hashlib.sha256(identity).hexdigest()
+            item_by_id[page_id] = item
+            pages.append(
+                {
+                    "page_id": page_id,
+                    "image_path": os.path.abspath(item.image_path),
+                    "image_sha256": item.image_sha256,
+                    "image_dims": item.image_dims,
+                    "instruction": lane_spec["prompt"],
+                    "settings": lane_spec.get("settings", {}),
+                }
+            )
+        try:
+            batch = run_local_provider_batch(
+                spec_path=provider["spec_path"],
+                lane=provider["lane"],
+                run_dir=provider["run_dir"],
+                pages=pages,
+                out=self._out,
+            )
+        except (OSError, ProviderError) as exc:
+            message = f"provider launch failed: {exc}"
+            for item in item_by_id.values():
+                processor.generation_metadata[item.markdown_path] = {
+                    "status": "error",
+                    "backend": "local_provider",
+                    "error": [message],
+                    "evidence": {"run_dir": provider["run_dir"]},
+                    "promotion": {
+                        "promoted": False,
+                        "candidate_sha256": None,
+                        "persisted_output_sha256": file_sha256(
+                            item.markdown_path
+                        ),
+                    },
+                }
+                processor.update_progressbar(1)
+            return [
+                (item.markdown_path, [message])
+                for item in item_by_id.values()
+            ]
+
+        failures = []
+        returned_ids = set()
+        for result in batch["results"]:
+            page_id = result.get("page_id")
+            item = item_by_id.get(page_id)
+            if item is None:
+                continue
+            returned_ids.add(page_id)
+            metadata = dict(result.get("normalized_metadata") or {})
+            output_text = result.get("output_text")
+            persisted_before = file_sha256(item.markdown_path)
+            flags = list(result.get("errors") or [])
+            if not result.get("valid"):
+                flags.append("provider_response_invalid")
+            if not isinstance(output_text, str) or not output_text.strip():
+                flags.append("provider_markdown_empty")
+                output_text = (
+                    output_text if isinstance(output_text, str) else ""
+                )
+            termination = metadata.get("termination") or {}
+            if termination.get("max_tokens") is True:
+                flags.append("provider_max_tokens_termination")
+            quality = analyze_markdown_quality(
+                output_text,
+                ocr_text=read_optional_text(item.ocr_path),
+                raw_text=read_optional_text(item.text_path),
+            )
+            if quality.get("status") != "pass":
+                flags.extend(
+                    quality.get("flags")
+                    or ["provider_markdown_quality_unavailable"]
+                )
+            flags = list(dict.fromkeys(flags))
+            candidate_sha256 = hashlib.sha256(
+                output_text.encode("utf-8")
+            ).hexdigest()
+            promoted = False
+            if not flags:
+                try:
+                    _atomic_write_text(item.markdown_path, output_text)
+                    promoted = True
+                except OSError as exc:
+                    flags.append(
+                        "provider_markdown_promotion_failed: " + str(exc)
+                    )
+            metadata["validation"] = {
+                "status": "fail" if flags else "pass",
+                "flags": flags,
+                "markdown_quality": quality,
+            }
+            metadata["promotion"] = {
+                "promoted": promoted,
+                "candidate_sha256": candidate_sha256,
+                "persisted_output_sha256_before": persisted_before,
+                "persisted_output_sha256": file_sha256(
+                    item.markdown_path
+                ),
+            }
+            if flags:
+                metadata["status"] = "error"
+                failures.append((item.markdown_path, flags))
+            processor.generation_metadata[item.markdown_path] = metadata
+            processor.update_progressbar(1)
+
+        for page_id, item in item_by_id.items():
+            if page_id in returned_ids:
+                continue
+            flags = ["provider_result_missing"]
+            processor.generation_metadata[item.markdown_path] = {
+                "status": "error",
+                "backend": "local_provider",
+                "error": flags,
+                "evidence": {"run_dir": provider["run_dir"]},
+                "promotion": {
+                    "promoted": False,
+                    "candidate_sha256": None,
+                    "persisted_output_sha256": file_sha256(
+                        item.markdown_path
+                    ),
+                },
+            }
+            failures.append((item.markdown_path, flags))
+            processor.update_progressbar(1)
+        if batch.get("protocol_errors"):
+            failures.append(
+                (
+                    provider["run_dir"],
+                    [
+                        "provider_batch_protocol_error: " + error
+                        for error in batch["protocol_errors"]
+                    ],
+                )
+            )
+        return failures
+
+
+class OcrBenchmark(InvariantAwareCommand):
+    """Benchmark an isolated OCR provider on a hash-pinned page suite.
+
+    Provider processes receive scratch copies of page inputs through a JSONL
+    file protocol. External providers require explicit --allow-external.
+    """
+
+    _verbose_ = True
+
+    manifest = None
+    _manifest = None
+
+    class ManifestArg(StringInvariant):
+        _help = "Path to the hash-pinned benchmark manifest JSONL."
+
+    input_root = None
+    _input_root = None
+
+    class InputRootArg(DirectoryInvariant):
+        _help = "Read-only root containing benchmark source artifacts."
+
+    provider_spec = None
+    _provider_spec = None
+
+    class ProviderSpecArg(StringInvariant):
+        _help = "Path to a provider specification JSON file."
+
+    dest_dir = None
+    _dest_dir = None
+
+    class DestDirArg(StringInvariant):
+        _help = "New or empty scratch destination for all benchmark evidence."
+
+    lanes = None
+    _lanes = None
+
+    class LanesArg(StringInvariant):
+        _help = "Comma-separated provider lanes. [default: %default]"
+        _mandatory = False
+        _default = "parity,best"
+
+    repeats = None
+    _repeats = None
+
+    class RepeatsArg(PositiveIntegerInvariant):
+        _help = "Independent process repeats per lane. [default: %default]"
+        _mandatory = False
+        _default = 5
+
+    allow_external = None
+
+    class AllowExternalArg(BoolInvariant):
+        _help = "Permit a provider spec marked external. [default: %default]"
+        _mandatory = False
+        _default = False
+
+    def run(self):
+        from .ocr_benchmark import BenchmarkError, run_benchmark
+
+        lanes_value = _option_value(self, "lanes", "parity,best")
+        lanes = [lane.strip() for lane in lanes_value.split(",")]
+        try:
+            summary = run_benchmark(
+                manifest_path=_option_value(self, "manifest"),
+                input_root=_option_value(self, "input_root"),
+                provider_spec_path=_option_value(self, "provider_spec"),
+                dest_dir=_option_value(self, "dest_dir"),
+                lanes=lanes,
+                repeats=int(_option_value(self, "repeats", 5)),
+                allow_external=bool(self.allow_external),
+                out=self._out,
+            )
+        except BenchmarkError as exc:
+            raise CommandError(str(exc)) from exc
+        self._out(
+            f"Benchmark completed: {summary['passed_attempt_count']}/"
+            f"{summary['attempt_count']} attempts passed."
+        )
+        if not summary["all_pass"]:
+            raise CommandError(
+                "OCR benchmark failed; raw evidence and summary were "
+                "preserved"
+            )
 
 
 class DeepseekOcrCreateEnv(InvariantAwareCommand):
@@ -1026,6 +1420,62 @@ def _maybe_float(value, default=None):
         return float(value)
     except (TypeError, ValueError) as exc:
         raise CommandError(f"Expected a float, got {value!r}") from exc
+
+
+def _paths_overlap(left: str, right: str) -> bool:
+    left = os.path.realpath(left)
+    right = os.path.realpath(right)
+    try:
+        common = os.path.commonpath((left, right))
+    except ValueError:
+        return False
+    return common in {left, right}
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    try:
+        target_mode = os.stat(path).st_mode & 0o7777
+    except FileNotFoundError:
+        current_umask = os.umask(0)
+        os.umask(current_umask)
+        target_mode = 0o666 & ~current_umask
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=directory,
+            prefix=f".{os.path.basename(path)}.",
+            suffix=".candidate",
+            delete=False,
+        ) as handle:
+            temporary_path = handle.name
+            os.chmod(temporary_path, target_mode)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+
+
+def _release_cuda_memory() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except (ImportError, RuntimeError):
+        pass
 
 
 def _resolve_manager(value: str | None) -> str:

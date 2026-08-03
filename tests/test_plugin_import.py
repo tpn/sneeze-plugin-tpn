@@ -1,5 +1,8 @@
 import base64
+import hashlib
 import json
+import os
+import sys
 from io import StringIO
 from types import SimpleNamespace
 
@@ -426,6 +429,339 @@ def test_ocr_pdf_pages_full_mode_writes_bundle(tmp_path, monkeypatch):
     assert payload["image_dims"] == {"w": 1, "h": 1}
 
 
+def test_full_mode_local_provider_releases_engine_before_markdown(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.ocr_provider as ocr_provider
+    from sneeze.tpn.commands import OcrPdfPages
+    from sneeze.tpn.ocr_vllm import OcrFullItem
+
+    image_path = tmp_path / "page.png"
+    image_path.write_bytes(VALID_PNG_BYTES)
+    text_path = tmp_path / "page.txt"
+    text_path.write_text("Table 8 rows Table 9 rows", encoding="utf-8")
+    item = OcrFullItem(
+        image_path=str(image_path),
+        base="paper/page",
+        ocr_path=str(tmp_path / "page.ocr"),
+        markdown_path=str(tmp_path / "page.md"),
+        json_path=str(tmp_path / "page.json"),
+        text_path=str(text_path),
+        need_ocr=True,
+        need_markdown=True,
+        need_json=True,
+        image_dims={"w": 1, "h": 1},
+        image_sha256=(
+            "5c9b6e9f825b1ad005cbea8e70758bb8171d43bb66425b430254b9a0ef972d56"
+        ),
+    )
+    events = []
+
+    class FakeProcessor:
+        def __init__(self):
+            self.generation_metadata = {}
+
+        def init_progressbar(self, total=None):
+            events.append(("progress", total))
+
+        def close_progressbar(self):
+            events.append(("close", None))
+
+        def update_progressbar(self, amount=1):
+            events.append(("update", amount))
+
+        def prepare_engine(self):
+            events.append(("prepare", None))
+            return object(), object()
+
+        def shutdown_engine(self, llm):
+            if llm is not None:
+                events.append(("shutdown", None))
+
+        def run(self, tasks, *, llm, sampling_params):
+            tasks = list(tasks)
+            events.append(("grounded", len(tasks)))
+            assert all(task.output_path.endswith(".ocr") for task in tasks)
+            for task in tasks:
+                with open(task.output_path, "w", encoding="utf-8") as handle:
+                    handle.write("Table 8 rows Table 9 rows")
+                self.generation_metadata[task.output_path] = {
+                    "status": "completed"
+                }
+
+    def fake_provider_batch(**kwargs):
+        events.append(("provider", len(kwargs["pages"])))
+        page = kwargs["pages"][0]
+        return {
+            "ok": True,
+            "protocol_errors": [],
+            "results": [
+                {
+                    "page_id": page["page_id"],
+                    "valid": True,
+                    "errors": [],
+                    "output_text": "Table 8\nrows\n\nTable 9\nrows\n",
+                    "normalized_metadata": {
+                        "status": "completed",
+                        "backend": "local_provider",
+                        "termination": {
+                            "eos": True,
+                            "length": False,
+                            "max_tokens": False,
+                        },
+                    },
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        ocr_provider,
+        "run_local_provider_batch",
+        fake_provider_batch,
+    )
+    provider = {
+        "spec_path": str(tmp_path / "provider.json"),
+        "spec": {
+            "lanes": {
+                "best": {
+                    "prompt": "native two-stage",
+                    "settings": {
+                        "backend": "official-two-step-transformers"
+                    },
+                }
+            }
+        },
+        "lane": "best",
+        "run_dir": str(tmp_path / "evidence"),
+    }
+    command = OcrPdfPages(None, StringIO(), None)
+    command._run_full_mode(
+        FakeProcessor(),
+        [item],
+        markdown_provider=provider,
+    )
+
+    labels = [event[0] for event in events]
+    assert labels.index("shutdown") < labels.index("provider")
+    assert labels.count("grounded") == 1
+    assert (tmp_path / "page.md").read_text() == (
+        "Table 8\nrows\n\nTable 9\nrows\n"
+    )
+    payload = json.loads((tmp_path / "page.json").read_text())
+    assert payload["generation_metadata"]["markdown"]["backend"] == (
+        "local_provider"
+    )
+    promotion = payload["generation_metadata"]["markdown"]["promotion"]
+    assert promotion["promoted"] is True
+    assert promotion["candidate_sha256"] == promotion[
+        "persisted_output_sha256"
+    ]
+    assert payload["markdown_quality"]["status"] == "pass"
+
+
+def test_full_mode_local_provider_rejects_candidate_atomically(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.ocr_provider as ocr_provider
+    from sneeze.tpn.commands import OcrPdfPages
+    from sneeze.tpn.ocr_vllm import OcrFullItem
+
+    image_path = tmp_path / "page.png"
+    image_path.write_bytes(VALID_PNG_BYTES)
+    ocr_path = tmp_path / "page.ocr"
+    ocr_path.write_text("real page prose", encoding="utf-8")
+    markdown_path = tmp_path / "page.md"
+    markdown_path.write_text(
+        "previous validated markdown\n",
+        encoding="utf-8",
+    )
+    item = OcrFullItem(
+        image_path=str(image_path),
+        base="paper/page",
+        ocr_path=str(ocr_path),
+        markdown_path=str(markdown_path),
+        json_path=str(tmp_path / "page.json"),
+        text_path=None,
+        need_ocr=False,
+        need_markdown=True,
+        need_json=True,
+        image_dims={"w": 1, "h": 1},
+        image_sha256=(
+            "5c9b6e9f825b1ad005cbea8e70758bb8171d43bb66425b430254b9a0ef972d56"
+        ),
+    )
+
+    class FakeProcessor:
+        def __init__(self):
+            self.generation_metadata = {}
+
+        def init_progressbar(self, total=None):
+            pass
+
+        def close_progressbar(self):
+            pass
+
+        def update_progressbar(self, amount=1):
+            pass
+
+        def prepare_engine(self):
+            raise AssertionError("provider-only Markdown must not start vLLM")
+
+        def shutdown_engine(self, llm):
+            pass
+
+    def fake_provider_batch(**kwargs):
+        page = kwargs["pages"][0]
+        axis = " ".join(str(value) for value in range(20, 2226, 2))
+        return {
+            "ok": True,
+            "protocol_errors": [],
+            "results": [
+                {
+                    "page_id": page["page_id"],
+                    "valid": True,
+                    "errors": [],
+                    "output_text": axis,
+                    "normalized_metadata": {
+                        "status": "completed",
+                        "backend": "local_provider",
+                        "termination": {
+                            "eos": True,
+                            "length": False,
+                            "max_tokens": False,
+                        },
+                    },
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        ocr_provider,
+        "run_local_provider_batch",
+        fake_provider_batch,
+    )
+    provider = {
+        "spec_path": str(tmp_path / "provider.json"),
+        "spec": {
+            "lanes": {
+                "best": {
+                    "prompt": "native two-stage",
+                    "settings": {
+                        "backend": "official-two-step-transformers"
+                    },
+                }
+            }
+        },
+        "lane": "best",
+        "run_dir": str(tmp_path / "evidence"),
+    }
+    command = OcrPdfPages(None, StringIO(), None)
+    with pytest.raises(
+        RuntimeError, match="runaway_monotonic_integer_axis"
+    ) as exc_info:
+        command._run_full_mode(
+            FakeProcessor(),
+            [item],
+            markdown_provider=provider,
+        )
+
+    assert markdown_path.read_text() == "previous validated markdown\n"
+    payload = json.loads((tmp_path / "page.json").read_text())
+    markdown_metadata = payload["generation_metadata"]["markdown"]
+    assert markdown_metadata["status"] == "error"
+    assert markdown_metadata["validation"]["flags"] == [
+        "runaway_monotonic_integer_axis"
+    ]
+    promotion = markdown_metadata["promotion"]
+    assert promotion["promoted"] is False
+    assert promotion["candidate_sha256"] != promotion[
+        "persisted_output_sha256"
+    ]
+    assert promotion["persisted_output_sha256"] == hashlib.sha256(
+        b"previous validated markdown\n"
+    ).hexdigest()
+    assert "1 page(s)" in str(exc_info.value)
+    assert str(markdown_path) in str(exc_info.value)
+    assert str(exc_info.value).count(str(markdown_path)) == 1
+
+
+def test_markdown_provider_preparation_resolves_spec_and_protects_corpora(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.command import CommandError
+
+    from sneeze.tpn.commands import OcrPdfPages
+
+    home = tmp_path / "home"
+    home.mkdir()
+    spec_path = home / "provider.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "provider_id": "fake-local-provider",
+                "argv": [sys.executable],
+                "egress": "none",
+                "model": {
+                    "requested": "example/model",
+                    "revision": "a" * 40,
+                },
+                "lanes": {
+                    "best": {
+                        "prompt": "native pipeline",
+                        "settings": {},
+                    }
+                },
+                "secret_env_names": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    command = OcrPdfPages(None, StringIO(), None)
+    command.markdown_provider_spec = "~/provider.json"
+    command.markdown_provider_lane = "best"
+    command.markdown_provider_run_dir = str(tmp_path / "evidence")
+
+    provider = command._prepare_markdown_provider(
+        prompt_mode="full",
+        source_dir=str(tmp_path / "source"),
+        dest_dir=str(tmp_path / "dest"),
+    )
+    assert provider["spec_path"] == str(spec_path.resolve())
+
+    command.markdown_provider_run_dir = (
+        "/home/trentn/src/cuphoton-papers/papers/"
+        ".provider-evidence-must-not-be-created"
+    )
+    with pytest.raises(CommandError, match="protected canonical corpora"):
+        command._prepare_markdown_provider(
+            prompt_mode="full",
+            source_dir=str(tmp_path / "source"),
+            dest_dir=str(tmp_path / "dest"),
+        )
+
+
+def test_atomic_write_text_preserves_or_applies_normal_file_mode(tmp_path):
+    from sneeze.tpn.commands import _atomic_write_text
+
+    output_path = tmp_path / "page.md"
+    previous_umask = os.umask(0o027)
+    try:
+        _atomic_write_text(str(output_path), "first\n")
+    finally:
+        os.umask(previous_umask)
+    assert output_path.stat().st_mode & 0o777 == 0o640
+
+    output_path.chmod(0o604)
+    _atomic_write_text(str(output_path), "second\n")
+    assert output_path.read_text(encoding="utf-8") == "second\n"
+    assert output_path.stat().st_mode & 0o777 == 0o604
+
+
 def test_ocr_pdf_pages_full_rejects_html_output(tmp_path):
     from sneeze.command import CommandError
 
@@ -492,6 +828,18 @@ def test_command_docstrings_explain_workflow_prerequisites():
     assert "sne ocr-pdf-pages" in DeepseekOcrDownloadModel.__doc__
 
 
+def test_markdown_provider_options_belong_only_to_ocr_command():
+    from sneeze.tpn.commands import OcrPdfPages, PdfToPages
+
+    for argument in (
+        "MarkdownProviderSpecArg",
+        "MarkdownProviderLaneArg",
+        "MarkdownProviderRunDirArg",
+    ):
+        assert hasattr(OcrPdfPages, argument)
+        assert not hasattr(PdfToPages, argument)
+
+
 def test_documented_commands_are_visible_to_sneeze_cli():
     from sneeze import cli as sneeze_cli
 
@@ -506,6 +854,7 @@ def test_documented_commands_are_visible_to_sneeze_cli():
         "pdf-to-pages",
         "pdfs-to-pages",
         "ocr-pdf-pages",
+        "ocr-benchmark",
         "deepseek-ocr-create-env",
         "deepseek-ocr-download-model",
     ):
