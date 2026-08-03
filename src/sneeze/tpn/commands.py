@@ -16,7 +16,11 @@ from sneeze.invariant import (
     StringInvariant,
 )
 
-from .ocr_vllm import DEFAULT_OCR_MODEL
+from .ocr_vllm import (
+    DEFAULT_MARKDOWN_WINDOW_SIZE,
+    DEFAULT_OCR_MODEL,
+    DEFAULT_OCR_WINDOW_SIZE,
+)
 
 DEFAULT_OCR_ENV_NAME = "sneeze-ocr-vllm"
 DEFAULT_TORCH_BACKEND = "cu130"
@@ -390,9 +394,12 @@ class OcrPdfPages(InvariantAwareCommand):
     _window_size = None
 
     class WindowSizeArg(PositiveIntegerInvariant):
-        _help = "DeepSeek OCR window size. [default: %default]"
+        _help = (
+            "DeepSeek OCR window size. Ungrounded Markdown uses at least "
+            f"{DEFAULT_MARKDOWN_WINDOW_SIZE}. [default: %default]"
+        )
         _mandatory = False
-        _default = 50
+        _default = DEFAULT_OCR_WINDOW_SIZE
 
     force = None
 
@@ -490,6 +497,12 @@ class OcrPdfPages(InvariantAwareCommand):
         self._out(f"Found {work_count} page(s) across {pdf_count} PDF(s).")
         self._out(f"Writing OCR output to {dest_dir}.")
         try:
+            window_size = self._window_size or DEFAULT_OCR_WINDOW_SIZE
+            if prompt_mode == "markdown":
+                window_size = max(
+                    window_size,
+                    DEFAULT_MARKDOWN_WINDOW_SIZE,
+                )
             processor = DeepSeekOcrOfflineProcessor(
                 model=_option_value(self, "model", DEFAULT_OCR_MODEL),
                 output_format=output_format,
@@ -522,7 +535,7 @@ class OcrPdfPages(InvariantAwareCommand):
                 ),
                 max_tokens=self._max_tokens or 8192,
                 ngram_size=self._ngram_size or 10,
-                window_size=self._window_size or 50,
+                window_size=window_size,
                 out=self._out,
                 verbose=self._verbose,
             )
@@ -534,7 +547,11 @@ class OcrPdfPages(InvariantAwareCommand):
             raise CommandError(str(exc)) from exc
 
     def _run_full_mode(self, processor, items) -> None:
-        from .ocr_vllm import OcrPageTask, write_ocr_page_bundle
+        from .ocr_vllm import (
+            OcrPageTask,
+            sampling_params_with_minimum_window,
+            write_ocr_page_bundle,
+        )
 
         ocr_tasks = [
             OcrPageTask(
@@ -572,6 +589,12 @@ class OcrPdfPages(InvariantAwareCommand):
                     sampling_params=sampling_params,
                 )
             if markdown_tasks:
+                markdown_sampling_params = (
+                    sampling_params_with_minimum_window(
+                        sampling_params,
+                        DEFAULT_MARKDOWN_WINDOW_SIZE,
+                    )
+                )
                 processor.output_format = "md"
                 processor.prompt_mode = "markdown"
                 processor.use_grounding = False
@@ -579,11 +602,64 @@ class OcrPdfPages(InvariantAwareCommand):
                 processor.run(
                     markdown_tasks,
                     llm=llm,
-                    sampling_params=sampling_params,
+                    sampling_params=markdown_sampling_params,
                 )
+            all_metadata = getattr(
+                processor,
+                "generation_metadata",
+                {},
+            )
+            validation_failures = []
             for item in items:
-                write_ocr_page_bundle(item)
+                generation_metadata = {
+                    key: all_metadata[path]
+                    for key, path in (
+                        ("ocr", item.ocr_path),
+                        ("markdown", item.markdown_path),
+                    )
+                    if path in all_metadata
+                }
+                payload = write_ocr_page_bundle(
+                    item,
+                    generation_metadata=generation_metadata,
+                )
+                quality = payload.get("markdown_quality", {})
+                flags = []
+                for label, path, required in (
+                    ("grounded_ocr", item.ocr_path, item.need_ocr),
+                    ("markdown", item.markdown_path, item.need_markdown),
+                ):
+                    if not required:
+                        continue
+                    metadata = all_metadata.get(path)
+                    if not metadata or metadata.get("status") != "completed":
+                        flags.append(f"{label}_generation_failed")
+                    if not os.path.isfile(path):
+                        flags.append(f"{label}_output_missing")
+                if item.need_markdown and quality.get("status") != "pass":
+                    flags.extend(
+                        quality.get("flags")
+                        or ["markdown_quality_unavailable"]
+                    )
+                elif quality.get("status") == "fail":
+                    flags.extend(quality.get("flags", []))
+                if flags:
+                    validation_failures.append(
+                        (item.markdown_path, list(dict.fromkeys(flags)))
+                    )
                 processor.update_progressbar(1)
+            if validation_failures:
+                details = "; ".join(
+                    f"{path} ({', '.join(flags)})"
+                    for path, flags in validation_failures
+                )
+                raise RuntimeError(
+                    "OCR page validation failed for "
+                    f"{len(validation_failures)} page(s). Outputs and "
+                    "request "
+                    "metadata were preserved for diagnosis; rerun with "
+                    f"--force after correcting the settings. {details}"
+                )
         finally:
             processor.close_progressbar()
             processor.shutdown_engine(llm)

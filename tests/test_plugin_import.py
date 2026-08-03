@@ -202,6 +202,89 @@ def test_ocr_full_collection_skips_only_complete_bundles(tmp_path):
     assert items[0].need_json is True
 
 
+def test_ocr_full_collection_rechecks_persisted_quality_failure(tmp_path):
+    from sneeze.tpn.ocr_vllm import collect_ocr_full_items
+
+    source_dir = tmp_path / "pages"
+    dest_dir = tmp_path / "ocr"
+    source_dir.mkdir()
+    dest_dir.mkdir()
+    (source_dir / "page-1.png").write_bytes(VALID_PNG_BYTES)
+    (dest_dir / "page-1.ocr").write_text("ocr", encoding="utf-8")
+    (dest_dir / "page-1.md").write_text("markdown", encoding="utf-8")
+    (dest_dir / "page-1.json").write_text(
+        json.dumps({"markdown_quality": {"status": "fail"}}),
+        encoding="utf-8",
+    )
+
+    items, _pdf_count = collect_ocr_full_items(
+        source_dir=str(source_dir),
+        dest_dir=str(dest_dir),
+        text_source_dir=None,
+        force=False,
+        scan_parallelism=1,
+    )
+
+    assert len(items) == 1
+    assert items[0].need_ocr is False
+    assert items[0].need_markdown is False
+    assert items[0].need_json is True
+
+
+def test_bundle_recheck_preserves_existing_generation_metadata(tmp_path):
+    from sneeze.tpn.ocr_vllm import OcrFullItem, write_ocr_page_bundle
+
+    image_path = tmp_path / "page.png"
+    image_path.write_bytes(VALID_PNG_BYTES)
+    ocr_path = tmp_path / "page.ocr"
+    markdown_path = tmp_path / "page.md"
+    json_path = tmp_path / "page.json"
+    ocr_path.write_text("grounded evidence", encoding="utf-8")
+    markdown_path.write_text("markdown", encoding="utf-8")
+    json_path.write_text(
+        json.dumps(
+            {
+                "generation_metadata": {
+                    "markdown": {"request_id": "preserved"}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    item = OcrFullItem(
+        image_path=str(image_path),
+        base="page",
+        ocr_path=str(ocr_path),
+        markdown_path=str(markdown_path),
+        json_path=str(json_path),
+        text_path=None,
+        need_json=True,
+    )
+
+    payload = write_ocr_page_bundle(
+        item,
+        generation_metadata={"ocr": {"request_id": "new"}},
+    )
+
+    assert payload["generation_metadata"] == {
+        "markdown": {"request_id": "preserved"},
+        "ocr": {"request_id": "new"},
+    }
+
+
+def test_bundle_metadata_readers_ignore_non_object_json(tmp_path):
+    from sneeze.tpn.ocr_vllm import (
+        persisted_markdown_quality_status,
+        read_existing_generation_metadata,
+    )
+
+    json_path = tmp_path / "page.json"
+    json_path.write_text("[]", encoding="utf-8")
+
+    assert persisted_markdown_quality_status(str(json_path)) is None
+    assert read_existing_generation_metadata(str(json_path)) is None
+
+
 def test_ocr_pdf_pages_uses_processor(tmp_path, monkeypatch):
     import sneeze.tpn.ocr_vllm as ocr_vllm
     from sneeze.tpn.commands import OcrPdfPages
@@ -238,6 +321,7 @@ def test_ocr_pdf_pages_uses_processor(tmp_path, monkeypatch):
 
     assert captured["kwargs"]["max_tokens"] == 64
     assert captured["kwargs"]["temperature"] == 0.2
+    assert captured["kwargs"]["window_size"] == 128
     assert len(captured["tasks"]) == 1
     assert captured["tasks"][0].output_path == str(dest_dir / "page-1.md")
 
@@ -260,6 +344,7 @@ def test_ocr_pdf_pages_full_mode_writes_bundle(tmp_path, monkeypatch):
             self.prompt_mode = kwargs["prompt_mode"]
             self.use_grounding = kwargs["use_grounding"]
             self.keep_grounding = kwargs["keep_grounding"]
+            self.generation_metadata = {}
 
         def init_progressbar(self, total=None):
             captured["total"] = total
@@ -272,7 +357,9 @@ def test_ocr_pdf_pages_full_mode_writes_bundle(tmp_path, monkeypatch):
 
         def prepare_engine(self):
             captured["prepared"] = True
-            return object(), object()
+            return object(), SimpleNamespace(
+                extra_args={"ngram_size": 10, "window_size": 50}
+            )
 
         def shutdown_engine(self, llm):
             captured["shutdown"] = llm is not None
@@ -287,11 +374,19 @@ def test_ocr_pdf_pages_full_mode_writes_bundle(tmp_path, monkeypatch):
                     "outputs": [task.output_path for task in tasks],
                     "llm": llm is not None,
                     "sampling_params": sampling_params is not None,
+                    "window_size": sampling_params.extra_args["window_size"],
                 }
             )
             for task in tasks:
-                with open(task.output_path, "w", encoding="utf-8") as handle:
+                with open(
+                    task.output_path,
+                    "w",
+                    encoding="utf-8",
+                ) as handle:
                     handle.write(f"{self.prompt_mode} output\n")
+                self.generation_metadata[task.output_path] = {
+                    "status": "completed"
+                }
             self.update_progressbar(len(tasks))
 
     monkeypatch.setattr(
@@ -322,6 +417,8 @@ def test_ocr_pdf_pages_full_mode_writes_bundle(tmp_path, monkeypatch):
     assert captured["runs"][1]["keep_grounding"] is False
     assert captured["runs"][0]["llm"] is True
     assert captured["runs"][1]["sampling_params"] is True
+    assert captured["kwargs"]["window_size"] == 50
+    assert [run["window_size"] for run in captured["runs"]] == [50, 128]
     payload = json.loads((dest_dir / "page-1.json").read_text())
     assert payload["ocr_text"] == "plain_ocr output\n"
     assert payload["markdown_text"] == "markdown output\n"
@@ -413,3 +510,191 @@ def test_documented_commands_are_visible_to_sneeze_cli():
         "deepseek-ocr-download-model",
     ):
         assert command_name in cli._commands_by_name
+
+
+def test_markdown_quality_detects_three_calibrated_failure_classes():
+    from sneeze.tpn.ocr_vllm import analyze_markdown_quality
+
+    axis = " ".join(str(value) for value in range(20, 2226, 2))
+    quality = analyze_markdown_quality(
+        axis,
+        ocr_text="real page prose",
+        raw_text="real page prose",
+    )
+    assert quality["flags"] == ["runaway_monotonic_integer_axis"]
+
+    invented = " ".join(f"invented{index}" for index in range(50))
+    quality = analyze_markdown_quality(
+        "\n\n".join([invented] * 4),
+        ocr_text="grounded evidence from the page",
+        raw_text="grounded evidence from the page",
+    )
+    assert quality["flags"] == ["unsupported_long_span_repetition"]
+
+    raw = "Table 8\n" + " ".join(f"row{index}" for index in range(80))
+    raw += "\nTable 9\nmore table evidence"
+    quality = analyze_markdown_quality(
+        "| 1 | 2 |\n| 3 | 4 |",
+        ocr_text=raw,
+        raw_text=raw,
+    )
+    assert quality["flags"] == ["premature_table_truncation"]
+
+
+def test_markdown_quality_accepts_supported_repetition():
+    from sneeze.tpn.ocr_vllm import analyze_markdown_quality
+
+    caption = " ".join(f"caption{index}" for index in range(50))
+    quality = analyze_markdown_quality(
+        "\n\n".join([caption] * 4),
+        ocr_text=caption,
+        raw_text=caption,
+    )
+    assert quality["status"] == "pass"
+    assert quality["flags"] == []
+
+
+def test_generation_metadata_keeps_vllm_completion_details(tmp_path):
+    from sneeze.tpn.ocr_vllm import (
+        DeepSeekOcrOfflineProcessor,
+        OcrPageTask,
+    )
+
+    image_path = tmp_path / "page.png"
+    image_path.write_bytes(VALID_PNG_BYTES)
+    processor = DeepSeekOcrOfflineProcessor(
+        model="deepseek-ai/DeepSeek-OCR",
+        output_format="md",
+        prompt_mode="markdown",
+    )
+    processor._engine_metadata = {
+        "model": {"snapshot": "snapshot-sha"},
+        "runtime": {"attention_backend_selected": "FLASH_ATTN"},
+    }
+    completion = SimpleNamespace(
+        text="short output",
+        token_ids=[10, 11, 12],
+        finish_reason="length",
+        stop_reason=None,
+    )
+    request_output = SimpleNamespace(
+        request_id="request-1",
+        prompt_token_ids=[1, 2],
+    )
+    sampling_params = SimpleNamespace(
+        temperature=0.0,
+        max_tokens=3,
+        extra_args={"ngram_size": 10, "window_size": 50},
+    )
+
+    metadata = processor._generation_metadata(
+        task=OcrPageTask(
+            image_path=str(image_path),
+            output_path=str(tmp_path / "page.md"),
+        ),
+        prompt="<image>\nConvert the document to markdown.",
+        request_output=request_output,
+        completion=completion,
+        sampling_params=sampling_params,
+    )
+
+    assert metadata["image"]["dimensions"] == {"w": 1, "h": 1}
+    assert metadata["prompt_mode"] == "markdown"
+    assert metadata["generated_token_count"] == 3
+    assert metadata["finish_reason"] == "length"
+    assert metadata["status"] == "completed"
+    assert metadata["termination"] == {
+        "eos": False,
+        "length": True,
+        "max_tokens": True,
+    }
+    assert metadata["runtime"]["attention_backend_selected"] == "FLASH_ATTN"
+    assert metadata["logits_processor_extra_args"] == {
+        "ngram_size": 10,
+        "window_size": 50,
+    }
+
+    completion.token_ids = [10, 11]
+    metadata = processor._generation_metadata(
+        task=OcrPageTask(
+            image_path=str(image_path),
+            output_path=str(tmp_path / "page.md"),
+        ),
+        prompt="<image>\nConvert the document to markdown.",
+        request_output=request_output,
+        completion=completion,
+        sampling_params=sampling_params,
+    )
+    assert metadata["termination"] == {
+        "eos": False,
+        "length": True,
+        "max_tokens": False,
+    }
+
+
+def test_full_mode_preserves_and_rejects_flagged_markdown(tmp_path):
+    from sneeze.tpn.commands import OcrPdfPages
+    from sneeze.tpn.ocr_vllm import OcrFullItem
+
+    image_path = tmp_path / "page.png"
+    image_path.write_bytes(VALID_PNG_BYTES)
+    item = OcrFullItem(
+        image_path=str(image_path),
+        base="page",
+        ocr_path=str(tmp_path / "page.ocr"),
+        markdown_path=str(tmp_path / "page.md"),
+        json_path=str(tmp_path / "page.json"),
+        text_path=str(tmp_path / "page.txt"),
+        need_ocr=True,
+        need_markdown=True,
+        need_json=True,
+        image_dims={"w": 1, "h": 1},
+    )
+    (tmp_path / "page.txt").write_text("real prose", encoding="utf-8")
+
+    class FakeProcessor:
+        generation_metadata = {}
+
+        def init_progressbar(self, total=None):
+            pass
+
+        def prepare_engine(self):
+            return object(), SimpleNamespace(
+                extra_args={"ngram_size": 10, "window_size": 50}
+            )
+
+        def run(self, tasks, *, llm, sampling_params):
+            for task in tasks:
+                if task.output_path.endswith(".ocr"):
+                    text = "real prose"
+                else:
+                    text = " ".join(
+                        str(value) for value in range(20, 2226, 2)
+                    )
+                with open(task.output_path, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+
+        def update_progressbar(self, amount=1):
+            pass
+
+        def close_progressbar(self):
+            pass
+
+        def shutdown_engine(self, llm):
+            pass
+
+    command = OcrPdfPages(None, StringIO(), None)
+    with pytest.raises(
+        RuntimeError,
+        match="page validation failed",
+    ) as exc_info:
+        command._run_full_mode(FakeProcessor(), [item])
+
+    assert "grounded_ocr_generation_failed" in str(exc_info.value)
+    assert "markdown_generation_failed" in str(exc_info.value)
+
+    payload = json.loads((tmp_path / "page.json").read_text())
+    assert payload["markdown_quality"]["status"] == "fail"
+    assert payload["markdown_quality"]["flags"] == [
+        "runaway_monotonic_integer_axis"
+    ]
