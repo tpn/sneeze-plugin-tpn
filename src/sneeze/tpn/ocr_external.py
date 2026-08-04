@@ -72,7 +72,7 @@ _PROVIDER_PROFILES: dict[str, dict[str, Any]] = {
         "schema_version": EXTERNAL_SCHEMA_VERSION,
         "kind": "external_provider_policy_profile",
         "profile_id": "openai-responses-gpt-5.6-sol",
-        "profile_date": "2026-08-03",
+        "profile_date": "2026-08-04",
         "provider": "openai",
         "endpoint": {
             "scheme": "https",
@@ -89,6 +89,7 @@ _PROVIDER_PROFILES: dict[str, dict[str, Any]] = {
         },
         "limits": {
             "context_tokens": 1_050_000,
+            "max_input_tokens": 922_000,
             "max_output_tokens": 128_000,
             "default_experiment_output_tokens": 8_192,
         },
@@ -100,11 +101,13 @@ _PROVIDER_PROFILES: dict[str, dict[str, Any]] = {
             "service_tier": "default",
             "truncation": "disabled",
             "reasoning_effort": "none",
+            "prompt_cache_options": {"mode": "explicit"},
+            "prompt_cache_breakpoint_count": 0,
             "tools": "disabled",
         },
         "retention": {
-            "policy_id": "openai-api-default-2026-08-03",
-            "verified_at": "2026-08-03",
+            "policy_id": "openai-api-default-2026-08-04",
+            "verified_at": "2026-08-04",
             "default_abuse_monitoring_max_days": 30,
             "zero_data_retention_assumed": False,
             "store_false_is_zero_data_retention": False,
@@ -116,7 +119,7 @@ _PROVIDER_PROFILES: dict[str, dict[str, Any]] = {
         "pricing": {
             "currency": "USD",
             "unit": "million_tokens",
-            "verified_at": "2026-08-03",
+            "verified_at": "2026-08-04",
             "short_context_at_or_below_tokens": 272_000,
             "short_context": {
                 "input": "5.00",
@@ -143,6 +146,10 @@ _PROVIDER_PROFILES: dict[str, dict[str, Any]] = {
             ),
             (
                 "https://developers.openai.com/api/docs/guides/"
+                "prompt-caching"
+            ),
+            (
+                "https://developers.openai.com/api/docs/guides/"
                 "your-data#data-retention-controls-for-abuse-monitoring"
             ),
             "https://developers.openai.com/api/docs/pricing",
@@ -152,7 +159,7 @@ _PROVIDER_PROFILES: dict[str, dict[str, Any]] = {
         "schema_version": EXTERNAL_SCHEMA_VERSION,
         "kind": "external_provider_policy_profile",
         "profile_id": "anthropic-messages-claude-fable-5",
-        "profile_date": "2026-08-03",
+        "profile_date": "2026-08-04",
         "provider": "anthropic",
         "endpoint": {
             "scheme": "https",
@@ -177,14 +184,20 @@ _PROVIDER_PROFILES: dict[str, dict[str, Any]] = {
         },
         "request_policy": {
             "image_transport": "inline_base64",
+            "image_order": "image_then_text",
+            "provider_image_processing": {
+                "max_edge_pixels": 2_576,
+                "max_visual_tokens": 4_784,
+                "oversize_behavior": "provider_downscale",
+            },
             "thinking_type": "adaptive",
             "thinking_display": "omitted",
             "effort": "low",
             "tools": "disabled",
         },
         "retention": {
-            "policy_id": "anthropic-fable-5-mandatory-30d-2026-08-03",
-            "verified_at": "2026-08-03",
+            "policy_id": "anthropic-fable-5-mandatory-30d-2026-08-04",
+            "verified_at": "2026-08-04",
             "mandatory_days": 30,
             "zero_data_retention_available": False,
             "required_acknowledgement": (
@@ -194,7 +207,7 @@ _PROVIDER_PROFILES: dict[str, dict[str, Any]] = {
         "pricing": {
             "currency": "USD",
             "unit": "million_tokens",
-            "verified_at": "2026-08-03",
+            "verified_at": "2026-08-04",
             "input": "10.00",
             "output": "50.00",
             "source": (
@@ -223,6 +236,7 @@ _PROVIDER_PROFILES: dict[str, dict[str, Any]] = {
                 "https://platform.claude.com/docs/en/build-with-claude/"
                 "vision"
             ),
+            "https://platform.claude.com/docs/en/api/messages",
         ],
     },
 }
@@ -705,6 +719,16 @@ def build_external_upload_plan(
     max_input_tokens_per_case = _require_positive_int(
         max_input_tokens_per_case, "max_input_tokens_per_case"
     )
+    max_input_tokens = profile_with_hash["limits"].get(
+        "max_input_tokens"
+    )
+    if (
+        max_input_tokens is not None
+        and max_input_tokens_per_case > max_input_tokens
+    ):
+        raise ExternalPlanError(
+            "max_input_tokens_per_case exceeds the provider profile limit"
+        )
     if (
         max_input_tokens_per_case + max_output_tokens
         > profile_with_hash["limits"]["context_tokens"]
@@ -869,6 +893,12 @@ def validate_external_upload_plan(
         execution.get("max_input_tokens_per_case"),
         "execution.max_input_tokens_per_case",
     )
+    max_input_tokens = expected_profile["limits"].get("max_input_tokens")
+    if max_input_tokens is not None and input_limit > max_input_tokens:
+        raise ExternalPlanError(
+            "execution.max_input_tokens_per_case exceeds provider profile "
+            "limit"
+        )
     if input_limit + output_limit > expected_profile["limits"][
         "context_tokens"
     ]:
@@ -1168,6 +1198,7 @@ def _render_openai_body(
         "max_output_tokens": max_output_tokens,
         "background": False,
         "reasoning": {"effort": "none"},
+        "prompt_cache_options": {"mode": "explicit"},
         "service_tier": "default",
         "store": False,
         "truncation": "disabled",
@@ -1190,7 +1221,6 @@ def _render_anthropic_body(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": instruction},
                     {
                         "type": "image",
                         "source": {
@@ -1199,6 +1229,7 @@ def _render_anthropic_body(
                             "data": image_placeholder,
                         },
                     },
+                    {"type": "text", "text": instruction},
                 ],
             }
         ],

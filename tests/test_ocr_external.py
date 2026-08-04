@@ -105,18 +105,28 @@ def test_provider_profiles_pin_hosts_models_retention_and_dated_prices():
         "api": "responses",
     }
     assert openai["credential_env_name"] == "OPENAI_API_KEY"
+    assert openai["profile_date"] == "2026-08-04"
     assert openai["model"] == {
         "requested": "gpt-5.6-sol",
         "revision_semantics": "provider_managed_model_id",
         "fallback": "disabled",
     }
+    assert openai["limits"]["max_input_tokens"] == 922_000
+    assert openai["request_policy"]["prompt_cache_options"] == {
+        "mode": "explicit"
+    }
+    assert openai["request_policy"]["prompt_cache_breakpoint_count"] == 0
     assert openai["retention"]["default_abuse_monitoring_max_days"] == 30
     assert openai["retention"]["store_false_is_zero_data_retention"] \
         is False
-    assert openai["pricing"]["verified_at"] == "2026-08-03"
+    assert openai["pricing"]["verified_at"] == "2026-08-04"
     assert openai["pricing"]["short_context"]["output"] == "30.00"
     assert openai["pricing"]["source"].startswith(
         "https://developers.openai.com/"
+    )
+    assert (
+        "https://developers.openai.com/api/docs/guides/prompt-caching"
+        in openai["sources"]
     )
     assert len(openai["profile_sha256"]) == 64
 
@@ -134,17 +144,24 @@ def test_provider_profiles_pin_hosts_models_retention_and_dated_prices():
         "anthropic-version": "2023-06-01"
     }
     assert anthropic["credential_env_name"] == "ANTHROPIC_API_KEY"
+    assert anthropic["profile_date"] == "2026-08-04"
     assert anthropic["model"]["requested"] == "claude-fable-5"
     assert anthropic["model"]["revision_semantics"] == (
         "provider_documented_fixed_snapshot_model_id"
     )
+    assert anthropic["request_policy"]["image_order"] == "image_then_text"
+    assert anthropic["request_policy"]["provider_image_processing"] == {
+        "max_edge_pixels": 2_576,
+        "max_visual_tokens": 4_784,
+        "oversize_behavior": "provider_downscale",
+    }
     assert anthropic["retention"]["mandatory_days"] == 30
     assert anthropic["retention"]["zero_data_retention_available"] \
         is False
     assert anthropic["pricing"] == {
         "currency": "USD",
         "unit": "million_tokens",
-        "verified_at": "2026-08-03",
+        "verified_at": "2026-08-04",
         "input": "10.00",
         "output": "50.00",
         "source": (
@@ -152,6 +169,10 @@ def test_provider_profiles_pin_hosts_models_retention_and_dated_prices():
             "models/overview"
         ),
     }
+    assert (
+        "https://platform.claude.com/docs/en/api/messages"
+        in anthropic["sources"]
+    )
 
     openai["endpoint"]["host"] = "example.invalid"
     fresh = get_external_provider_profile(
@@ -264,6 +285,12 @@ def test_upload_plan_requires_explicit_safe_data_scope():
     with pytest.raises(ExternalPlanError, match="pessimistic"):
         build_external_upload_plan(**insufficient_budget)
 
+    assert _plan(max_input_tokens_per_case=922_000)["execution"][
+        "max_input_tokens_per_case"
+    ] == 922_000
+    with pytest.raises(ExternalPlanError, match="profile limit"):
+        _plan(max_input_tokens_per_case=922_001)
+
 
 def test_openai_cost_estimate_switches_above_long_context_boundary():
     short_plan = _plan(max_input_tokens_per_case=272_000)
@@ -303,6 +330,12 @@ def test_upload_plan_validation_rejects_mutation_and_stale_profile():
     mutated = copy.deepcopy(plan)
     mutated["executor"]["adapter_bundle_sha256"] = "f" * 64
     with pytest.raises(ExternalPlanError, match="plan_sha256"):
+        validate_external_upload_plan(mutated)
+
+    at_input_limit = _plan(max_input_tokens_per_case=922_000)
+    mutated = copy.deepcopy(at_input_limit)
+    mutated["execution"]["max_input_tokens_per_case"] = 922_001
+    with pytest.raises(ExternalPlanError, match="profile limit"):
         validate_external_upload_plan(mutated)
 
     mutated = copy.deepcopy(plan)
@@ -420,6 +453,7 @@ def test_openai_sanitized_request_is_exact_bounded_and_non_executable():
     assert body["max_output_tokens"] == 6144
     assert body["background"] is False
     assert body["reasoning"] == {"effort": "none"}
+    assert body["prompt_cache_options"] == {"mode": "explicit"}
     assert body["service_tier"] == "default"
     assert body["store"] is False
     assert body["truncation"] == "disabled"
@@ -439,6 +473,7 @@ def test_openai_sanitized_request_is_exact_bounded_and_non_executable():
     assert "headers" not in serialized.lower()
     assert "proxy" not in serialized.lower()
     assert "synthetic-secret-token" not in serialized
+    assert "prompt_cache_breakpoint" not in json.dumps(body)
 
 
 def test_anthropic_sanitized_request_has_fable_policy_and_no_fallback():
@@ -474,7 +509,7 @@ def test_anthropic_sanitized_request_has_fable_policy_and_no_fallback():
     assert body["output_config"] == {"effort": "low"}
     assert "fallback" not in body
     assert "tools" not in body
-    image = body["messages"][0]["content"][1]
+    image = body["messages"][0]["content"][0]
     assert image == {
         "type": "image",
         "source": {
@@ -483,7 +518,7 @@ def test_anthropic_sanitized_request_has_fable_policy_and_no_fallback():
             "data": f"<IMAGE_BASE64_OMITTED sha256={IMAGE_SHA256}>",
         },
     }
-    prompt = body["messages"][0]["content"][0]["text"]
+    prompt = body["messages"][0]["content"][1]["text"]
     assert prompt.endswith(
         f"<RAW_TEXT_UTF8_OMITTED sha256={RAW_TEXT_SHA256}>"
     )

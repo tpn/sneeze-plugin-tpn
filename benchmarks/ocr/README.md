@@ -484,9 +484,18 @@ The dated policy profiles require explicit retention acknowledgement:
 
 - OpenAI uses `store: false`, but `store: false` is not Zero Data Retention.
   The profile records the documented default abuse-monitoring retention of up
-  to 30 days.
+  to 30 days. GPT-5.6 implicit prompt caching is disabled with explicit mode
+  and no cache breakpoints, so this benchmark performs no prompt-cache reads
+  or writes.
 - Anthropic Claude Fable 5 has mandatory 30-day retention for API inputs and
   outputs. Zero Data Retention is unavailable for this profile.
+
+The Anthropic request places the image before the text, following its current
+vision guidance. Fable 5 still performs provider-side downscaling when a page
+exceeds 2,576 pixels on an edge or 4,784 visual tokens. The canonical
+three-page PNGs exceed those limits, so compare that arm as provider-native
+high-resolution OCR, not as original-pixel inference. OpenAI uses
+`detail: "original"` for the same source PNG bytes.
 
 Use `anthropic-messages-claude-fable-5` in `--profile` to plan the Anthropic
 arm. Re-run `ocr-external-list --format json` before planning so any dated

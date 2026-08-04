@@ -412,6 +412,7 @@ def test_openai_fake_transport_end_to_end_is_sanitized_and_plan_bound(
         assert image["image_url"].startswith("data:image/png;base64,")
         assert "OMITTED" not in image["image_url"]
         assert body["background"] is False
+        assert body["prompt_cache_options"] == {"mode": "explicit"}
         response = {
             "id": "resp_synthetic_1",
             "model": "gpt-5.6-sol",
@@ -447,8 +448,8 @@ def test_openai_fake_transport_end_to_end_is_sanitized_and_plan_bound(
                 "input_tokens": 100,
                 "output_tokens": 4,
                 "input_tokens_details": {
-                    "cached_tokens": 20,
-                    "cache_write_tokens": 30,
+                    "cached_tokens": 0,
+                    "cache_write_tokens": 0,
                 },
             },
             "untrusted": SYNTHETIC_CREDENTIAL,
@@ -526,10 +527,10 @@ def test_openai_fake_transport_end_to_end_is_sanitized_and_plan_bound(
         ],
     }
     cost = response["usage"]["cost"]
-    assert cost["cached_input_tokens"] == 20
-    assert cost["cache_write_input_tokens"] == 30
+    assert cost["cached_input_tokens"] == 0
+    assert cost["cache_write_input_tokens"] == 0
     assert cost["rates_per_million_tokens"]["cache_write"] == "6.25"
-    assert cost["computed_usd"] == "0.000568"
+    assert cost["computed_usd"] == "0.000620"
     ledger = json.loads(fixture["ledger_path"].read_text())
     reservation = next(iter(ledger["reservations"].values()))
     assert reservation["slot"] == {
@@ -573,6 +574,75 @@ def test_openai_rejects_cache_usage_larger_than_total_input(
 
     with pytest.raises(ExternalAdapterError, match="exceeds input_tokens"):
         _openai_response(response)
+
+
+def test_openai_cache_accounting_remains_generic():
+    from sneeze.tpn.ocr_external import get_external_provider_profile
+    from sneeze.tpn.providers.external_api import (
+        _computed_cost,
+        _openai_response,
+    )
+
+    response = {
+        "id": "resp_synthetic_cached_usage",
+        "model": "gpt-5.6-sol",
+        "status": "completed",
+        "output": [],
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 4,
+            "input_tokens_details": {
+                "cached_tokens": 20,
+                "cache_write_tokens": 30,
+            },
+        },
+    }
+    profile = get_external_provider_profile(
+        "openai-responses-gpt-5.6-sol"
+    )
+    profile.pop("profile_sha256")
+    parsed = _openai_response(response)
+    cost = _computed_cost(parsed, profile)
+
+    assert parsed["cached_input_tokens"] == 20
+    assert parsed["cache_write_input_tokens"] == 30
+    assert cost["computed_usd"] == "0.000568"
+
+
+@pytest.mark.parametrize(
+    ("cached_tokens", "cache_write_tokens"), [(1, 0), (0, 1)]
+)
+def test_openai_cache_disabled_profile_fails_closed_on_returned_usage(
+    cached_tokens,
+    cache_write_tokens,
+):
+    from sneeze.tpn.ocr_external import get_external_provider_profile
+    from sneeze.tpn.providers.external_api import (
+        ExternalAdapterError,
+        _parse_provider_response,
+    )
+
+    response = {
+        "id": "resp_synthetic_unexpected_cache_usage",
+        "model": "gpt-5.6-sol",
+        "status": "completed",
+        "output": [],
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 4,
+            "input_tokens_details": {
+                "cached_tokens": cached_tokens,
+                "cache_write_tokens": cache_write_tokens,
+            },
+        },
+    }
+    profile = get_external_provider_profile(
+        "openai-responses-gpt-5.6-sol"
+    )
+    profile.pop("profile_sha256")
+
+    with pytest.raises(ExternalAdapterError, match="caching was disabled"):
+        _parse_provider_response(response, profile)
 
 
 @pytest.mark.parametrize(
@@ -645,10 +715,14 @@ def test_anthropic_raw_text_provenance_is_exact_but_artifact_is_redacted(
         include_raw_text=True,
     )
     transmitted_prompt = f"{PROMPT}\n\n{RAW_TEXT}"
+    thinking_signature = "synthetic-omitted-thinking-signature"
 
     def transport(*, profile, credential, body, timeout_seconds):
         assert profile["endpoint"]["host"] == "api.anthropic.com"
-        assert body["messages"][0]["content"][0]["text"] == (
+        content = body["messages"][0]["content"]
+        assert content[0]["type"] == "image"
+        assert content[1]["type"] == "text"
+        assert content[1]["text"] == (
             transmitted_prompt
         )
         assert body["thinking"] == {
@@ -660,10 +734,23 @@ def test_anthropic_raw_text_provenance_is_exact_but_artifact_is_redacted(
             "type": "message",
             "role": "assistant",
             "model": "claude-fable-5",
-            "content": [{"type": "text", "text": "# Fable\n"}],
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "",
+                    "signature": thinking_signature,
+                },
+                {"type": "text", "text": "# Fable\n"},
+            ],
             "stop_reason": "end_turn",
             "stop_sequence": None,
-            "usage": {"input_tokens": 120, "output_tokens": 5},
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": None,
+                "cache_read_input_tokens": None,
+                "output_tokens_details": {"thinking_tokens": 3},
+            },
         }
         return TransportResult(200, {}, json.dumps(response).encode(), 0.2)
 
@@ -677,12 +764,28 @@ def test_anthropic_raw_text_provenance_is_exact_but_artifact_is_redacted(
     ).hexdigest()
     assert transmitted["includes_raw_text"] is True
     assert transmitted["raw_text_sha256"] == RAW_TEXT_SHA256
+    assert response["generation"]["output_tokens_details"] == {
+        "thinking_tokens": 3
+    }
     sanitized = json.dumps(
         response["effective_request"]["sanitized_body"], sort_keys=True
     )
     assert "RAW_TEXT_UTF8_OMITTED" in sanitized
     artifact = next(fixture["artifacts_dir"].iterdir()).read_text()
     assert RAW_TEXT not in artifact
+    assert thinking_signature not in artifact
+    assert thinking_signature not in fixture["responses_path"].read_text()
+    artifact_record = json.loads(artifact)
+    provider_response = artifact_record["attempts"][0][
+        "provider_response"
+    ]
+    assert provider_response["usage"]["output_tokens_details"] == {
+        "thinking_tokens": 3
+    }
+    assert provider_response["thinking_hash_sources"] == ["signature"]
+    assert provider_response["thinking_sha256"] == [
+        hashlib.sha256(thinking_signature.encode()).hexdigest()
+    ]
 
 
 def test_invalid_scope_refuses_before_credential_or_transport(tmp_path):

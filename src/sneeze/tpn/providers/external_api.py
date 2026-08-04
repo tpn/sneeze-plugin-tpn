@@ -649,12 +649,34 @@ def _materialize_body(
         raise ExternalAdapterError(
             "request placeholder materialization failed"
         )
-    if plan["provider_profile"]["provider"] == "openai":
-        transmitted_prompt = materialized["input"][0]["content"][0]["text"]
+    provider = plan["provider_profile"]["provider"]
+    if provider == "openai":
+        messages = materialized.get("input")
+        prompt_type = "input_text"
     else:
-        transmitted_prompt = materialized["messages"][0]["content"][0][
-            "text"
-        ]
+        messages = materialized.get("messages")
+        prompt_type = "text"
+    if (
+        not isinstance(messages, list)
+        or len(messages) != 1
+        or not isinstance(messages[0], dict)
+    ):
+        raise ExternalAdapterError("request message content is invalid")
+    content = messages[0].get("content")
+    if not isinstance(content, list):
+        raise ExternalAdapterError("request prompt content is invalid")
+    prompt_blocks = [
+        block
+        for block in content
+        if isinstance(block, dict) and block.get("type") == prompt_type
+    ]
+    if len(prompt_blocks) != 1 or not isinstance(
+        prompt_blocks[0].get("text"), str
+    ):
+        raise ExternalAdapterError(
+            "request must contain exactly one typed prompt block"
+        )
+    transmitted_prompt = prompt_blocks[0]["text"]
     prompt_bytes = transmitted_prompt.encode("utf-8")
     provenance = {
         "sanitized_body": sanitized_body,
@@ -668,7 +690,7 @@ def _materialize_body(
             "raw_text_sha256": item["case"].get("raw_text_sha256"),
         },
         "content_shape": {
-            "provider": plan["provider_profile"]["provider"],
+            "provider": provider,
             "image_media_type": "image/png",
             "image_encoding": "base64",
             "image_sha256": item["case"]["image_sha256"],
@@ -1060,14 +1082,35 @@ def _anthropic_response(value: dict[str, Any]) -> dict[str, Any]:
         "cache_creation_input_tokens",
         "cache_read_input_tokens",
     ):
-        if cache_key in usage and _nonnegative_int(
-            usage[cache_key], f"Anthropic {cache_key}"
-        ) != 0:
+        cache_value = usage.get(cache_key)
+        cache_tokens = (
+            0
+            if cache_value is None
+            else _nonnegative_int(cache_value, f"Anthropic {cache_key}")
+        )
+        if cache_tokens != 0:
             raise ExternalAdapterError(
                 "unpriced Anthropic cache usage returned"
             )
+    output_details = usage.get("output_tokens_details")
+    thinking_tokens = 0
+    if output_details is not None:
+        if not isinstance(output_details, dict):
+            raise ExternalAdapterError(
+                "Anthropic output_tokens_details must be an object"
+            )
+        raw_thinking_tokens = output_details.get("thinking_tokens")
+        if raw_thinking_tokens is not None:
+            thinking_tokens = _nonnegative_int(
+                raw_thinking_tokens, "Anthropic thinking_tokens"
+            )
+    if thinking_tokens > output_tokens:
+        raise ExternalAdapterError(
+            "Anthropic thinking_tokens exceeds output_tokens"
+        )
     texts = []
     ignored_thinking_hashes = []
+    ignored_thinking_hash_sources = []
     content = value.get("content")
     if not isinstance(content, list):
         raise ExternalAdapterError("Anthropic content is invalid")
@@ -1077,15 +1120,41 @@ def _anthropic_response(value: dict[str, Any]) -> dict[str, Any]:
         block_type = block.get("type")
         if block_type == "text" and isinstance(block.get("text"), str):
             texts.append(block["text"])
-        elif block_type in {"thinking", "redacted_thinking"}:
-            material = block.get("thinking", block.get("data", ""))
-            if not isinstance(material, str):
+        elif block_type == "thinking":
+            thinking = block.get("thinking")
+            signature = block.get("signature")
+            if thinking is not None and not isinstance(thinking, str):
                 raise ExternalAdapterError(
                     "Anthropic thinking block is invalid"
+                )
+            if signature is not None and not isinstance(signature, str):
+                raise ExternalAdapterError(
+                    "Anthropic thinking signature is invalid"
+                )
+            if signature:
+                material = signature
+                hash_source = "signature"
+            elif thinking:
+                material = thinking
+                hash_source = "thinking"
+            else:
+                raise ExternalAdapterError(
+                    "Anthropic thinking block has no hashable provenance"
                 )
             ignored_thinking_hashes.append(
                 hashlib.sha256(material.encode()).hexdigest()
             )
+            ignored_thinking_hash_sources.append(hash_source)
+        elif block_type == "redacted_thinking":
+            material = block.get("data")
+            if not isinstance(material, str) or not material:
+                raise ExternalAdapterError(
+                    "Anthropic redacted thinking block is invalid"
+                )
+            ignored_thinking_hashes.append(
+                hashlib.sha256(material.encode()).hexdigest()
+            )
+            ignored_thinking_hash_sources.append("redacted_data")
         else:
             raise ExternalAdapterError(
                 "Anthropic content type is not allowed"
@@ -1111,6 +1180,7 @@ def _anthropic_response(value: dict[str, Any]) -> dict[str, Any]:
         "text": "".join(texts),
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "output_tokens_details": {"thinking_tokens": thinking_tokens},
         "cached_input_tokens": 0,
         "cache_write_input_tokens": 0,
         "finish_reason": finish_reason,
@@ -1122,6 +1192,7 @@ def _anthropic_response(value: dict[str, Any]) -> dict[str, Any]:
             "source": "provider_stop_reason",
             "thinking_block_count": len(ignored_thinking_hashes),
             "thinking_sha256": ignored_thinking_hashes,
+            "thinking_hash_sources": ignored_thinking_hash_sources,
         },
         "whitelist": {
             "id": response_id,
@@ -1135,6 +1206,9 @@ def _anthropic_response(value: dict[str, Any]) -> dict[str, Any]:
             "usage": {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "output_tokens_details": {
+                    "thinking_tokens": thinking_tokens
+                },
             },
             "refusal": {
                 "detected": refused,
@@ -1142,6 +1216,7 @@ def _anthropic_response(value: dict[str, Any]) -> dict[str, Any]:
             },
             "thinking_block_count": len(ignored_thinking_hashes),
             "thinking_sha256": ignored_thinking_hashes,
+            "thinking_hash_sources": ignored_thinking_hash_sources,
         },
     }
 
@@ -1158,6 +1233,19 @@ def _parse_provider_response(
     returned = parsed["provider_model"]
     if returned != requested:
         raise ExternalAdapterError("provider returned an unapproved model")
+    cache_policy = profile["request_policy"]
+    if (
+        profile["provider"] == "openai"
+        and cache_policy.get("prompt_cache_options") == {"mode": "explicit"}
+        and cache_policy.get("prompt_cache_breakpoint_count") == 0
+        and (
+            parsed["cached_input_tokens"] != 0
+            or parsed["cache_write_input_tokens"] != 0
+        )
+    ):
+        raise ExternalAdapterError(
+            "OpenAI returned cache usage while prompt caching was disabled"
+        )
     return parsed
 
 
@@ -1623,6 +1711,15 @@ def _completed_response(
             },
             "input_tokens": parsed["input_tokens"],
             "output_tokens": parsed["output_tokens"],
+            **(
+                {
+                    "output_tokens_details": parsed[
+                        "output_tokens_details"
+                    ]
+                }
+                if "output_tokens_details" in parsed
+                else {}
+            ),
             "finish_reason": parsed["finish_reason"],
             "stop_reason": parsed["stop_reason"],
             "eos": parsed["eos"],
