@@ -144,6 +144,141 @@ def test_pdf_to_pages_uses_public_cli_dest_dir(tmp_path, monkeypatch):
     assert captured["dest"] == str(dest_dir)
 
 
+def test_pdf_to_pages_forwards_shared_renderer_options(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.commands as commands
+    from sneeze.tpn.commands import PdfToPages
+
+    source_dir = tmp_path / "source"
+    dest_dir = tmp_path / "pages"
+    source_dir.mkdir()
+    captured = {}
+
+    def fake_run_pdf_to_pages(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(
+        commands,
+        "_run_pdf_to_pages",
+        fake_run_pdf_to_pages,
+    )
+    command = PdfToPages(None, StringIO(), None)
+    command._source_dir = str(source_dir)
+    command.dest_dir = str(dest_dir)
+    command.recursive = True
+    command._parallelism = 3
+    command._limit = 2
+    command._dpi = 300
+    command.force = True
+    command.no_text = True
+
+    command.run()
+
+    assert captured == {
+        "source_dir": str(source_dir),
+        "dest_dir": str(dest_dir),
+        "recursive": True,
+        "parallelism": 3,
+        "limit": 2,
+        "dpi": 300,
+        "force": True,
+        "no_text": True,
+        "record_encrypted_sentinels": True,
+        "out": command._out,
+    }
+
+
+def test_combined_renderer_does_not_write_source_encrypted_sentinel(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn import pdf_pages
+    from sneeze.tpn.commands import _run_pdf_to_pages
+
+    source_dir = tmp_path / "source"
+    dest_dir = tmp_path / "pages"
+    source_dir.mkdir()
+    readable_pdf = source_dir / "readable.pdf"
+    encrypted_pdf = source_dir / "encrypted.pdf"
+    readable_pdf.write_bytes(b"readable")
+    encrypted_pdf.write_bytes(b"encrypted")
+    page_dir = dest_dir / "readable"
+    image_path = page_dir / "page-1.png"
+    prepared = pdf_pages.PdfPagesTask(
+        source_path=str(readable_pdf),
+        dest_dir=str(page_dir),
+        text_dest_dir=str(page_dir),
+        page_count=1,
+    )
+    skipped = pdf_pages.PdfPreparationError(
+        source_path=str(encrypted_pdf),
+        error="synthetic encrypted PDF",
+        kind="encrypted",
+        sentinel_path=f"{encrypted_pdf}.encrypted",
+    )
+    page_task = pdf_pages.PdfPageTask(
+        source_path=str(readable_pdf),
+        dest_dir=str(page_dir),
+        page_num=1,
+        page_count=1,
+        image_output_path=str(image_path),
+        render_image=True,
+    )
+    sentinel_writer_called = False
+
+    monkeypatch.setattr(
+        pdf_pages,
+        "build_pdf_pages_tasks",
+        lambda *_args, **_kwargs: [prepared],
+    )
+    monkeypatch.setattr(
+        pdf_pages,
+        "prepare_pdf_pages_tasks",
+        lambda *_args, **_kwargs: ([prepared], [skipped]),
+    )
+    monkeypatch.setattr(
+        pdf_pages,
+        "build_pdf_page_tasks",
+        lambda *_args, **_kwargs: [page_task],
+    )
+
+    def fake_run_tasks(tasks, _fn, **_kwargs):
+        assert tasks == [page_task]
+        page_dir.mkdir(parents=True)
+        image_path.write_bytes(VALID_PNG_BYTES)
+
+    def fake_write_sentinels(_skipped):
+        nonlocal sentinel_writer_called
+        sentinel_writer_called = True
+        return []
+
+    monkeypatch.setattr(pdf_pages, "run_tasks_in_threads", fake_run_tasks)
+    monkeypatch.setattr(
+        pdf_pages,
+        "write_encrypted_sentinels",
+        fake_write_sentinels,
+    )
+
+    result = _run_pdf_to_pages(
+        source_dir=str(source_dir),
+        dest_dir=str(dest_dir),
+        recursive=False,
+        parallelism=1,
+        limit=None,
+        dpi=400,
+        force=False,
+        no_text=False,
+        record_encrypted_sentinels=False,
+        out=lambda _message: None,
+    )
+
+    assert result.image_paths == (str(image_path),)
+    assert sentinel_writer_called is False
+    assert not (source_dir / "encrypted.pdf.encrypted").exists()
+
+
 def test_ocr_task_collection_skips_existing_outputs(tmp_path):
     from sneeze.tpn.ocr_vllm import collect_ocr_tasks
 
@@ -168,6 +303,59 @@ def test_ocr_task_collection_skips_existing_outputs(tmp_path):
     assert len(tasks) == 1
     assert tasks[0].image_path == str(source_dir / "page-2.png")
     assert tasks[0].output_path == str(dest_dir / "page-2.md")
+
+
+def test_ocr_task_collection_refreshes_rendered_image_output(tmp_path):
+    from sneeze.tpn.ocr_vllm import collect_ocr_tasks
+
+    source_dir = tmp_path / "pages"
+    dest_dir = tmp_path / "ocr"
+    source_dir.mkdir()
+    dest_dir.mkdir()
+    image_path = source_dir / "page-1.png"
+    image_path.write_bytes(VALID_PNG_BYTES)
+    (dest_dir / "page-1.md").write_text("stale", encoding="utf-8")
+
+    tasks, _pdf_count = collect_ocr_tasks(
+        source_dir=str(source_dir),
+        dest_dir=str(dest_dir),
+        text_source_dir=None,
+        output_ext="md",
+        force=False,
+        refresh_image_paths=(str(image_path),),
+        scan_parallelism=1,
+    )
+
+    assert [task.image_path for task in tasks] == [str(image_path)]
+
+
+def test_ocr_task_collection_refreshes_output_newer_image_after_retry(
+    tmp_path,
+):
+    from sneeze.tpn.ocr_vllm import collect_ocr_tasks
+
+    source_dir = tmp_path / "pages"
+    dest_dir = tmp_path / "ocr"
+    source_dir.mkdir()
+    dest_dir.mkdir()
+    image_path = source_dir / "page-1.png"
+    output_path = dest_dir / "page-1.md"
+    output_path.write_text("stale", encoding="utf-8")
+    image_path.write_bytes(VALID_PNG_BYTES)
+    os.utime(output_path, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(image_path, ns=(2_000_000_000, 2_000_000_000))
+
+    tasks, _pdf_count = collect_ocr_tasks(
+        source_dir=str(source_dir),
+        dest_dir=str(dest_dir),
+        text_source_dir=None,
+        output_ext="md",
+        force=False,
+        verify_input_freshness=True,
+        scan_parallelism=1,
+    )
+
+    assert [task.image_path for task in tasks] == [str(image_path)]
 
 
 def test_ocr_full_collection_skips_only_complete_bundles(tmp_path):
@@ -202,6 +390,150 @@ def test_ocr_full_collection_skips_only_complete_bundles(tmp_path):
     assert items[0].json_path == str(dest_dir / "page-2.json")
     assert items[0].need_ocr is False
     assert items[0].need_markdown is True
+    assert items[0].need_json is True
+
+
+def test_ocr_full_collection_refreshes_rendered_image_bundle(tmp_path):
+    from sneeze.tpn.ocr_vllm import collect_ocr_full_items
+
+    source_dir = tmp_path / "pages"
+    dest_dir = tmp_path / "ocr"
+    source_dir.mkdir()
+    dest_dir.mkdir()
+    image_path = source_dir / "page-1.png"
+    image_path.write_bytes(VALID_PNG_BYTES)
+    for suffix in ("ocr", "md", "json"):
+        (dest_dir / f"page-1.{suffix}").write_text(
+            "stale",
+            encoding="utf-8",
+        )
+
+    items, _pdf_count = collect_ocr_full_items(
+        source_dir=str(source_dir),
+        dest_dir=str(dest_dir),
+        text_source_dir=None,
+        force=False,
+        refresh_image_paths=(str(image_path),),
+        scan_parallelism=1,
+    )
+
+    assert len(items) == 1
+    assert items[0].need_ocr is True
+    assert items[0].need_markdown is True
+    assert items[0].need_json is True
+
+
+def test_ocr_full_collection_refreshes_only_metadata_for_rendered_text(
+    tmp_path,
+):
+    from sneeze.tpn.ocr_vllm import collect_ocr_full_items
+
+    source_dir = tmp_path / "pages"
+    dest_dir = tmp_path / "ocr"
+    source_dir.mkdir()
+    dest_dir.mkdir()
+    image_path = source_dir / "page-1.png"
+    image_path.write_bytes(VALID_PNG_BYTES)
+    for suffix in ("ocr", "md", "json"):
+        (dest_dir / f"page-1.{suffix}").write_text(
+            "existing",
+            encoding="utf-8",
+        )
+
+    items, _pdf_count = collect_ocr_full_items(
+        source_dir=str(source_dir),
+        dest_dir=str(dest_dir),
+        text_source_dir=None,
+        force=False,
+        refresh_metadata_image_paths=(str(image_path),),
+        scan_parallelism=1,
+    )
+
+    assert len(items) == 1
+    assert items[0].need_ocr is False
+    assert items[0].need_markdown is False
+    assert items[0].need_json is True
+
+
+def test_ocr_full_collection_uses_input_freshness_after_retry(tmp_path):
+    from sneeze.tpn.ocr_vllm import collect_ocr_full_items
+
+    source_dir = tmp_path / "pages"
+    dest_dir = tmp_path / "ocr"
+    source_dir.mkdir()
+    dest_dir.mkdir()
+    image_path = source_dir / "page-1.png"
+    text_path = source_dir / "page-1.txt"
+    image_path.write_bytes(VALID_PNG_BYTES)
+    text_path.write_text("new raw text", encoding="utf-8")
+    output_paths = []
+    for suffix in ("ocr", "md", "json"):
+        output_path = dest_dir / f"page-1.{suffix}"
+        output_path.write_text("stale", encoding="utf-8")
+        os.utime(output_path, ns=(1_000_000_000, 1_000_000_000))
+        output_paths.append(output_path)
+    os.utime(image_path, ns=(2_000_000_000, 2_000_000_000))
+    os.utime(text_path, ns=(3_000_000_000, 3_000_000_000))
+
+    items, _pdf_count = collect_ocr_full_items(
+        source_dir=str(source_dir),
+        dest_dir=str(dest_dir),
+        text_source_dir=str(source_dir),
+        force=False,
+        verify_input_freshness=True,
+        scan_parallelism=1,
+    )
+
+    assert len(items) == 1
+    assert items[0].need_ocr is True
+    assert items[0].need_markdown is True
+    assert items[0].need_json is True
+
+    for output_path in output_paths:
+        os.utime(output_path, ns=(4_000_000_000, 4_000_000_000))
+    os.utime(text_path, ns=(5_000_000_000, 5_000_000_000))
+    items, _pdf_count = collect_ocr_full_items(
+        source_dir=str(source_dir),
+        dest_dir=str(dest_dir),
+        text_source_dir=str(source_dir),
+        force=False,
+        verify_input_freshness=True,
+        scan_parallelism=1,
+    )
+
+    assert len(items) == 1
+    assert items[0].need_ocr is False
+    assert items[0].need_markdown is False
+    assert items[0].need_json is True
+
+
+def test_ocr_full_freshness_rebuilds_only_missing_bundle_member(tmp_path):
+    from sneeze.tpn.ocr_vllm import collect_ocr_full_items
+
+    source_dir = tmp_path / "pages"
+    dest_dir = tmp_path / "ocr"
+    source_dir.mkdir()
+    dest_dir.mkdir()
+    image_path = source_dir / "page-1.png"
+    image_path.write_bytes(VALID_PNG_BYTES)
+    os.utime(image_path, ns=(1_000_000_000, 1_000_000_000))
+    for suffix in ("ocr", "md"):
+        output_path = dest_dir / f"page-1.{suffix}"
+        output_path.write_text("existing", encoding="utf-8")
+        os.utime(output_path, ns=(2_000_000_000, 2_000_000_000))
+
+    items, _pdf_count = collect_ocr_full_items(
+        source_dir=str(source_dir),
+        dest_dir=str(dest_dir),
+        text_source_dir=None,
+        force=False,
+        verify_input_freshness=True,
+        scan_parallelism=1,
+    )
+
+    assert len(items) == 1
+    assert items[0].need_ocr is False
+    assert items[0].need_markdown is False
     assert items[0].need_json is True
 
 
@@ -330,6 +662,388 @@ def test_ocr_pdf_pages_uses_processor(tmp_path, monkeypatch):
     assert captured["kwargs"]["window_size"] == 128
     assert len(captured["tasks"]) == 1
     assert captured["tasks"][0].output_path == str(dest_dir / "page-1.md")
+
+
+def test_ocr_pdf_pages_can_render_then_ocr_one_destination(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.commands as commands
+    import sneeze.tpn.ocr_vllm as ocr_vllm
+    from sneeze.tpn.commands import OcrPdfPages
+
+    pdf_root = tmp_path / "pdfs"
+    dest_dir = tmp_path / "pages"
+    pdf_root.mkdir()
+    (pdf_root / "paper.pdf").write_bytes(b"synthetic")
+    stale_dir = dest_dir / "removed-paper"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "page-01.png").write_bytes(VALID_PNG_BYTES)
+    captured = {"events": []}
+
+    def fake_render(**kwargs):
+        captured["events"].append("render")
+        captured["render"] = kwargs
+        page_dir = dest_dir / "paper"
+        page_dir.mkdir(parents=True)
+        (page_dir / "page-01.png").write_bytes(VALID_PNG_BYTES)
+        (page_dir / "page-01.txt").write_text(
+            "extracted text",
+            encoding="utf-8",
+        )
+        image_path = str(page_dir / "page-01.png")
+        return commands.PdfPagesRunResult(
+            image_paths=(image_path,),
+            rendered_image_paths=frozenset({image_path}),
+            rendered_text_image_paths=frozenset({image_path}),
+        )
+
+    class FakeProcessor:
+        def __init__(self, **kwargs):
+            captured["events"].append("processor")
+
+        def run(self, tasks):
+            captured["events"].append("ocr")
+            captured["tasks"] = list(tasks)
+
+    monkeypatch.setattr(commands, "_run_pdf_to_pages", fake_render)
+    monkeypatch.setattr(
+        ocr_vllm,
+        "DeepSeekOcrOfflineProcessor",
+        FakeProcessor,
+    )
+    command = OcrPdfPages(None, StringIO(), None)
+    command._source_dir = str(pdf_root)
+    command.dest_dir = str(dest_dir)
+    command.pdf_to_pages = True
+    command.pdf_recursive = True
+    command._pdf_parallelism = 4
+    command._pdf_dpi = 350
+    command._scan_parallelism = 2
+    command.output_format = "md"
+    command.prompt_mode = "markdown"
+    command.force = True
+
+    command.run()
+
+    assert captured["events"] == ["render", "processor", "ocr"]
+    assert captured["render"]["source_dir"] == str(pdf_root)
+    assert captured["render"]["dest_dir"] == str(dest_dir)
+    assert captured["render"]["recursive"] is True
+    assert captured["render"]["parallelism"] == 4
+    assert captured["render"]["dpi"] == 350
+    assert captured["render"]["force"] is True
+    assert captured["render"]["no_text"] is False
+    assert captured["render"]["record_encrypted_sentinels"] is False
+    assert len(captured["tasks"]) == 1
+    task = captured["tasks"][0]
+    assert task.image_path == str(dest_dir / "paper/page-01.png")
+    assert task.text_source_path == str(dest_dir / "paper/page-01.txt")
+    assert task.output_path == str(dest_dir / "paper/page-01.md")
+
+
+def test_ocr_pdf_pages_reruns_stale_markdown_for_rendered_image(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.commands as commands
+    import sneeze.tpn.ocr_vllm as ocr_vllm
+    from sneeze.tpn.commands import OcrPdfPages
+
+    pdf_root = tmp_path / "pdfs"
+    dest_dir = tmp_path / "pages"
+    page_dir = dest_dir / "paper"
+    pdf_root.mkdir()
+    page_dir.mkdir(parents=True)
+    image_path = page_dir / "page-01.png"
+    markdown_path = page_dir / "page-01.md"
+    markdown_path.write_text("stale markdown", encoding="utf-8")
+    captured = {}
+
+    def fake_render(**_kwargs):
+        image_path.write_bytes(VALID_PNG_BYTES)
+        return commands.PdfPagesRunResult(
+            image_paths=(str(image_path),),
+            rendered_image_paths=frozenset({str(image_path)}),
+            rendered_text_image_paths=frozenset(),
+        )
+
+    class FakeProcessor:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self, tasks):
+            captured["tasks"] = list(tasks)
+
+    monkeypatch.setattr(commands, "_run_pdf_to_pages", fake_render)
+    monkeypatch.setattr(
+        ocr_vllm,
+        "DeepSeekOcrOfflineProcessor",
+        FakeProcessor,
+    )
+    command = OcrPdfPages(None, StringIO(), None)
+    command._source_dir = str(pdf_root)
+    command.dest_dir = str(dest_dir)
+    command.pdf_to_pages = True
+    command._scan_parallelism = 1
+    command.output_format = "md"
+    command.prompt_mode = "markdown"
+    command.force = False
+
+    command.run()
+
+    assert len(captured["tasks"]) == 1
+    assert captured["tasks"][0].image_path == str(image_path)
+    assert captured["tasks"][0].output_path == str(markdown_path)
+
+
+def test_ocr_pdf_pages_render_ignores_stale_pages_when_no_pdfs(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.commands as commands
+    import sneeze.tpn.ocr_vllm as ocr_vllm
+    from sneeze.tpn.commands import OcrPdfPages
+
+    source_dir = tmp_path / "pdfs"
+    dest_dir = tmp_path / "pages"
+    source_dir.mkdir()
+    stale_dir = dest_dir / "removed-paper"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "page-01.png").write_bytes(VALID_PNG_BYTES)
+    constructed = False
+
+    monkeypatch.setattr(
+        commands,
+        "_run_pdf_to_pages",
+        lambda **_kwargs: commands.PdfPagesRunResult(
+            (),
+            frozenset(),
+            frozenset(),
+        ),
+    )
+
+    class FakeProcessor:
+        def __init__(self, **_kwargs):
+            nonlocal constructed
+            constructed = True
+
+    monkeypatch.setattr(
+        ocr_vllm,
+        "DeepSeekOcrOfflineProcessor",
+        FakeProcessor,
+    )
+    command = OcrPdfPages(None, StringIO(), None)
+    command._source_dir = str(source_dir)
+    command.dest_dir = str(dest_dir)
+    command.pdf_to_pages = True
+    command._scan_parallelism = 1
+
+    command.run()
+
+    assert constructed is False
+
+
+def test_ocr_pdf_pages_render_requires_explicit_destination(tmp_path):
+    from sneeze.command import CommandError
+
+    from sneeze.tpn.commands import OcrPdfPages
+
+    source_dir = tmp_path / "pdfs"
+    source_dir.mkdir()
+    command = OcrPdfPages(None, StringIO(), None)
+    command._source_dir = str(source_dir)
+    command.pdf_to_pages = True
+
+    with pytest.raises(
+        CommandError,
+        match="requires an explicit --dest-dir",
+    ):
+        command.run()
+
+    assert list(source_dir.iterdir()) == []
+
+
+def test_ocr_pdf_pages_render_failure_stops_before_processor(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.command import CommandError
+
+    import sneeze.tpn.commands as commands
+    import sneeze.tpn.ocr_vllm as ocr_vllm
+    from sneeze.tpn.commands import OcrPdfPages
+
+    source_dir = tmp_path / "pdfs"
+    dest_dir = tmp_path / "pages"
+    source_dir.mkdir()
+    constructed = False
+
+    def fake_render(**_kwargs):
+        (dest_dir / "partial.marker").write_text("partial", encoding="utf-8")
+        raise RuntimeError("synthetic Poppler failure")
+
+    class FakeProcessor:
+        def __init__(self, **_kwargs):
+            nonlocal constructed
+            constructed = True
+
+    monkeypatch.setattr(commands, "_run_pdf_to_pages", fake_render)
+    monkeypatch.setattr(
+        ocr_vllm,
+        "DeepSeekOcrOfflineProcessor",
+        FakeProcessor,
+    )
+    command = OcrPdfPages(None, StringIO(), None)
+    command._source_dir = str(source_dir)
+    command.dest_dir = str(dest_dir)
+    command.pdf_to_pages = True
+
+    with pytest.raises(
+        CommandError,
+        match="PDF rendering failed before OCR: synthetic Poppler failure",
+    ):
+        command.run()
+
+    assert constructed is False
+    assert (dest_dir / "partial.marker").read_text() == "partial"
+
+
+def test_ocr_pdf_pages_retry_refreshes_image_changed_before_failure(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.command import CommandError
+
+    import sneeze.tpn.commands as commands
+    import sneeze.tpn.ocr_vllm as ocr_vllm
+    from sneeze.tpn.commands import OcrPdfPages
+
+    source_dir = tmp_path / "pdfs"
+    dest_dir = tmp_path / "pages"
+    page_dir = dest_dir / "paper"
+    source_dir.mkdir()
+    page_dir.mkdir(parents=True)
+    image_path = page_dir / "page-01.png"
+    markdown_path = page_dir / "page-01.md"
+    markdown_path.write_text("stale markdown", encoding="utf-8")
+    os.utime(markdown_path, ns=(1_000_000_000, 1_000_000_000))
+    render_calls = 0
+    captured = {}
+
+    def fake_render(**_kwargs):
+        nonlocal render_calls
+        render_calls += 1
+        if render_calls == 1:
+            image_path.write_bytes(VALID_PNG_BYTES)
+            os.utime(image_path, ns=(2_000_000_000, 2_000_000_000))
+            raise RuntimeError("later page failed")
+        return commands.PdfPagesRunResult(
+            image_paths=(str(image_path),),
+            rendered_image_paths=frozenset(),
+            rendered_text_image_paths=frozenset(),
+        )
+
+    class FakeProcessor:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self, tasks):
+            captured["tasks"] = list(tasks)
+
+    monkeypatch.setattr(commands, "_run_pdf_to_pages", fake_render)
+    monkeypatch.setattr(
+        ocr_vllm,
+        "DeepSeekOcrOfflineProcessor",
+        FakeProcessor,
+    )
+    command = OcrPdfPages(None, StringIO(), None)
+    command._source_dir = str(source_dir)
+    command.dest_dir = str(dest_dir)
+    command.pdf_to_pages = True
+    command._scan_parallelism = 1
+    command.output_format = "md"
+    command.prompt_mode = "markdown"
+    command.force = False
+
+    with pytest.raises(CommandError, match="later page failed"):
+        command.run()
+    command.run()
+
+    assert render_calls == 2
+    assert len(captured["tasks"]) == 1
+    assert captured["tasks"][0].image_path == str(image_path)
+    assert captured["tasks"][0].output_path == str(markdown_path)
+
+
+def test_ocr_pdf_pages_validates_mode_before_rendering(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.command import CommandError
+
+    import sneeze.tpn.commands as commands
+    from sneeze.tpn.commands import OcrPdfPages
+
+    source_dir = tmp_path / "pdfs"
+    dest_dir = tmp_path / "pages"
+    source_dir.mkdir()
+    rendered = False
+
+    def fake_render(**_kwargs):
+        nonlocal rendered
+        rendered = True
+
+    monkeypatch.setattr(commands, "_run_pdf_to_pages", fake_render)
+    command = OcrPdfPages(None, StringIO(), None)
+    command._source_dir = str(source_dir)
+    command.dest_dir = str(dest_dir)
+    command.pdf_to_pages = True
+    command.output_format = "html"
+    command.prompt_mode = "full"
+
+    with pytest.raises(CommandError, match="requires --output-format md"):
+        command.run()
+
+    assert rendered is False
+    assert not dest_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "option_name",
+    ["scheduler_delay_factor", "gpu_memory_utilization", "temperature"],
+)
+def test_ocr_pdf_pages_validates_float_options_before_rendering(
+    tmp_path,
+    monkeypatch,
+    option_name,
+):
+    from sneeze.command import CommandError
+
+    import sneeze.tpn.commands as commands
+    from sneeze.tpn.commands import OcrPdfPages
+
+    source_dir = tmp_path / "pdfs"
+    dest_dir = tmp_path / "pages"
+    source_dir.mkdir()
+    rendered = False
+
+    def fake_render(**_kwargs):
+        nonlocal rendered
+        rendered = True
+
+    monkeypatch.setattr(commands, "_run_pdf_to_pages", fake_render)
+    command = OcrPdfPages(None, StringIO(), None)
+    command._source_dir = str(source_dir)
+    command.dest_dir = str(dest_dir)
+    command.pdf_to_pages = True
+    setattr(command, option_name, "not-a-number")
+
+    with pytest.raises(CommandError, match="Expected a float"):
+        command.run()
+
+    assert rendered is False
+    assert not dest_dir.exists()
 
 
 def test_ocr_pdf_pages_full_mode_writes_bundle(tmp_path, monkeypatch):
@@ -823,6 +1537,7 @@ def test_command_docstrings_explain_workflow_prerequisites():
     assert "pdftotext" in PdfToPages.__doc__
     assert "sne ocr-pdf-pages" in PdfToPages.__doc__
     assert "sne pdf-to-pages" in OcrPdfPages.__doc__
+    assert "--pdf-to-pages" in OcrPdfPages.__doc__
     assert "sne deepseek-ocr-create-env" in OcrPdfPages.__doc__
     assert "sne deepseek-ocr-download-model" in OcrPdfPages.__doc__
     assert "--prompt-mode full" in OcrPdfPages.__doc__
@@ -841,6 +1556,84 @@ def test_markdown_provider_options_belong_only_to_ocr_command():
     ):
         assert hasattr(OcrPdfPages, argument)
         assert not hasattr(PdfToPages, argument)
+
+
+def test_combined_pdf_options_belong_to_ocr_command():
+    from sneeze.tpn.commands import OcrPdfPages
+
+    for argument in (
+        "PdfToPagesArg",
+        "PdfRecursiveArg",
+        "PdfParallelismArg",
+        "PdfDpiArg",
+    ):
+        assert hasattr(OcrPdfPages, argument)
+
+
+def test_combined_pdf_options_preserve_legacy_short_cli_mappings(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze import cli as sneeze_cli
+    from sneeze.tpn.commands import OcrPdfPages
+
+    captured = {}
+
+    def fake_run(self):
+        captured.update(
+            prompt=self.prompt,
+            prompt_mode=self.prompt_mode,
+            offset=self._offset,
+            scan_parallelism=self._scan_parallelism,
+            attention_backend=self.attention_backend,
+            pdf_to_pages=self.pdf_to_pages,
+            pdf_recursive=self.pdf_recursive,
+            pdf_parallelism=self._pdf_parallelism,
+            pdf_dpi=self._pdf_dpi,
+        )
+
+    monkeypatch.setattr(OcrPdfPages, "run", fake_run)
+    cli = sneeze_cli.CLI(
+        program_name="sne",
+        module_names=["sneeze", "sneeze.tpn"],
+        introspect=True,
+        auto_plugins=False,
+    )
+    commandline = cli._commands_by_name["ocr-pdf-pages"]
+    commandline.run(
+        [
+            "--source-dir",
+            str(tmp_path),
+            "-p",
+            "legacy prompt",
+            "-r",
+            "full",
+            "-f",
+            "2",
+            "-a",
+            "3",
+            "-i",
+            "FLASH_ATTN",
+            "--pdf-to-pages",
+            "--pdf-recursive",
+            "--pdf-parallelism",
+            "4",
+            "--pdf-dpi",
+            "350",
+        ]
+    )
+
+    assert captured == {
+        "prompt": "legacy prompt",
+        "prompt_mode": "full",
+        "offset": 2,
+        "scan_parallelism": 3,
+        "attention_backend": "FLASH_ATTN",
+        "pdf_to_pages": True,
+        "pdf_recursive": True,
+        "pdf_parallelism": 4,
+        "pdf_dpi": 350,
+    }
 
 
 def test_documented_commands_are_visible_to_sneeze_cli():

@@ -30,16 +30,31 @@ OCR rendered page images with a local vLLM DeepSeek OCR environment:
 sne ocr-pdf-pages --source-dir ./pages --dest-dir ./ocr --limit 4
 ```
 
-For the full OCR bundle, render pages first and then run:
+For the full OCR bundle, one command can render each PDF and then OCR the
+resulting page tree:
 
 ```bash
-sne pdf-to-pages --source-dir ./pdfs --dest-dir ./pages --recursive
-sne ocr-pdf-pages --source-dir ./pages --dest-dir ./ocr --prompt-mode full
+sne ocr-pdf-pages \
+  --pdf-to-pages \
+  --source-dir ./pdfs \
+  --dest-dir ./pages \
+  --pdf-recursive \
+  --pdf-parallelism 32 \
+  --pdf-dpi 400 \
+  --prompt-mode full
 ```
 
-`--prompt-mode full` consumes existing page PNGs and writes `.ocr`, `.md`, and
-`.json` outputs. It does not render PDFs itself. HTML OCR remains a separate
-single-output mode via `--output-format html`.
+With `--pdf-to-pages`, `--source-dir` is the PDF root and an explicit
+`--dest-dir` receives the page PNGs, extracted text, and OCR outputs. Existing
+page files are reused. `--force` rerenders them and reruns OCR, while
+`--pdf-parallelism` and `--pdf-dpi` control only the Poppler stage. The
+combined path leaves the PDF source tree read-only; encrypted or unreadable
+PDFs are reported without creating source-side `.encrypted` sentinels.
+
+Without `--pdf-to-pages`, the command consumes existing page PNGs as before.
+Use the two separate commands when rendered pages and OCR outputs need distinct
+destination trees. HTML OCR remains a separate single-output mode via
+`--output-format html`.
 
 Full mode normally uses DeepSeek-OCR for both grounded OCR and Markdown. It can
 instead keep DeepSeek for the grounded `.ocr` pass and use a local provider for

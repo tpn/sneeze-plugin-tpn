@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 from sneeze.command import CommandError
@@ -30,6 +31,123 @@ DEFAULT_OCR_ENV_NAME = "sneeze-ocr-vllm"
 DEFAULT_TORCH_BACKEND = "cu130"
 DEFAULT_PYTHON_VERSION = "3.12"
 DEFAULT_CUDA_130_VLLM_WHEEL_INDEX = "https://wheels.vllm.ai/nightly/cu130/"
+
+
+@dataclass(frozen=True)
+class PdfPagesRunResult:
+    """Page identities produced or reused by one renderer pass."""
+
+    image_paths: tuple[str, ...]
+    rendered_image_paths: frozenset[str]
+    rendered_text_image_paths: frozenset[str]
+
+
+def _run_pdf_to_pages(
+    *,
+    source_dir: str,
+    dest_dir: str,
+    recursive: bool,
+    parallelism: int | None,
+    limit: int | None,
+    dpi: int,
+    force: bool,
+    no_text: bool,
+    record_encrypted_sentinels: bool,
+    out,
+) -> PdfPagesRunResult:
+    """Render one PDF tree using the shared command implementation."""
+
+    from .pdf_pages import (
+        build_pdf_page_tasks,
+        build_pdf_pages_tasks,
+        extract_pdf_page_and_text,
+        inspect_png_file,
+        preferred_page_image_path,
+        prepare_pdf_pages_tasks,
+        run_tasks_in_threads,
+        write_encrypted_sentinels,
+    )
+
+    dest_dir = os.path.abspath(dest_dir)
+    extract_text = not no_text
+    workers = _resolve_workers(parallelism)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    out(f"Scanning for PDFs under {source_dir}...")
+    tasks = build_pdf_pages_tasks(
+        source_dir,
+        dest_dir,
+        recursive=recursive,
+        limit=limit,
+        text_root=dest_dir if extract_text else None,
+    )
+    if not tasks:
+        out("No PDFs found.")
+        return PdfPagesRunResult((), frozenset(), frozenset())
+
+    out(f"Found {len(tasks)} PDF(s); preparing with {workers} worker(s).")
+    tasks, skipped = prepare_pdf_pages_tasks(
+        tasks,
+        max_workers=workers,
+    )
+    _report_skipped_pdfs(skipped, out)
+    if not tasks:
+        out("No readable PDFs found.")
+        return PdfPagesRunResult((), frozenset(), frozenset())
+
+    page_tasks = build_pdf_page_tasks(
+        tasks,
+        extract_text=extract_text,
+        force=force,
+        dpi=dpi,
+    )
+    rendered_image_paths = frozenset(
+        os.path.abspath(task.image_output_path)
+        for task in page_tasks
+        if task.render_image
+    )
+    rendered_text_image_paths = frozenset(
+        os.path.abspath(task.image_output_path)
+        for task in page_tasks
+        if task.render_text
+    )
+    if not page_tasks:
+        out("No PDF pages need extraction.")
+    else:
+        run_tasks_in_threads(
+            page_tasks,
+            extract_pdf_page_and_text,
+            max_workers=workers,
+            desc="Extracting PDF pages",
+        )
+
+    expected_images = []
+    for task in tasks:
+        page_count = int(task.page_count or 0)
+        digits = max(1, len(str(page_count)))
+        for page_num in range(1, page_count + 1):
+            image_path = preferred_page_image_path(
+                task.dest_dir,
+                page_num,
+                digits,
+            )
+            problem = inspect_png_file(image_path)
+            if problem is not None:
+                raise RuntimeError(
+                    f"Rendered page image is invalid: {image_path} "
+                    f"({problem})"
+                )
+            expected_images.append(os.path.abspath(image_path))
+    if page_tasks and record_encrypted_sentinels:
+        written = write_encrypted_sentinels(skipped)
+        if written:
+            label = "sentinel" if len(written) == 1 else "sentinels"
+            out(f"Wrote {len(written)} .encrypted {label}.")
+    return PdfPagesRunResult(
+        image_paths=tuple(expected_images),
+        rendered_image_paths=rendered_image_paths,
+        rendered_text_image_paths=rendered_text_image_paths,
+    )
 
 
 class TpnPluginInfo(InvariantAwareCommand):
@@ -113,15 +231,6 @@ class PdfToPages(InvariantAwareCommand):
         _default = False
 
     def run(self):
-        from .pdf_pages import (
-            build_pdf_page_tasks,
-            build_pdf_pages_tasks,
-            extract_pdf_page_and_text,
-            prepare_pdf_pages_tasks,
-            run_tasks_in_threads,
-            write_encrypted_sentinels,
-        )
-
         source_dir = _option_value(
             self,
             "source_dir",
@@ -130,54 +239,18 @@ class PdfToPages(InvariantAwareCommand):
         dest_dir = os.path.abspath(
             _option_value(self, "dest_dir", source_dir)
         )
-        extract_text = not bool(self.no_text)
-        workers = _resolve_workers(self._parallelism)
-        os.makedirs(dest_dir, exist_ok=True)
-
-        self._out(f"Scanning for PDFs under {source_dir}...")
-        tasks = build_pdf_pages_tasks(
-            source_dir,
-            dest_dir,
+        _run_pdf_to_pages(
+            source_dir=source_dir,
+            dest_dir=dest_dir,
             recursive=bool(self.recursive),
+            parallelism=self._parallelism,
             limit=self._limit,
-            text_root=dest_dir if extract_text else None,
-        )
-        if not tasks:
-            self._out("No PDFs found.")
-            return
-
-        self._out(
-            f"Found {len(tasks)} PDF(s); preparing with {workers} worker(s)."
-        )
-        tasks, skipped = prepare_pdf_pages_tasks(
-            tasks,
-            max_workers=workers,
-        )
-        _report_skipped_pdfs(skipped, self._out)
-        if not tasks:
-            self._out("No readable PDFs found.")
-            return
-
-        page_tasks = build_pdf_page_tasks(
-            tasks,
-            extract_text=extract_text,
-            force=bool(self.force),
             dpi=self._dpi or 400,
+            force=bool(self.force),
+            no_text=bool(self.no_text),
+            record_encrypted_sentinels=True,
+            out=self._out,
         )
-        if not page_tasks:
-            self._out("No PDF pages need extraction.")
-            return
-
-        run_tasks_in_threads(
-            page_tasks,
-            extract_pdf_page_and_text,
-            max_workers=workers,
-            desc="Extracting PDF pages",
-        )
-        written = write_encrypted_sentinels(skipped)
-        if written:
-            label = "sentinel" if len(written) == 1 else "sentinels"
-            self._out(f"Wrote {len(written)} .encrypted {label}.")
 
 
 class PdfsToPages(PdfToPages):
@@ -188,11 +261,13 @@ class PdfsToPages(PdfToPages):
 
 
 class OcrPdfPages(InvariantAwareCommand):
-    """OCR page images generated by `sne pdf-to-pages`.
+    """OCR page images, optionally rendering source PDFs first.
 
-    Before running, render pages with `sne pdf-to-pages`, create a vLLM env
-    with `sne deepseek-ocr-create-env`, and cache the model with
-    `sne deepseek-ocr-download-model`. Run this command inside that env.
+    Pass `--pdf-to-pages` to render PDFs from `--source-dir` into
+    `--dest-dir` before OCR; otherwise render pages separately with
+    `sne pdf-to-pages`. Create a vLLM env with
+    `sne deepseek-ocr-create-env`, cache the model with
+    `sne deepseek-ocr-download-model`, and run this command inside that env.
     Use `--prompt-mode full` to write `.ocr`, `.md`, and `.json` page
     bundles from existing page images. HTML output is a separate
     `--output-format html` mode, not part of `full`.
@@ -204,7 +279,10 @@ class OcrPdfPages(InvariantAwareCommand):
     _source_dir = None
 
     class SourceDirArg(DirectoryInvariant):
-        _help = "Directory containing page PNG images."
+        _help = (
+            "Directory containing page PNG images, or PDFs with "
+            "--pdf-to-pages."
+        )
 
     dest_dir = None
     _dest_dir = None
@@ -212,7 +290,8 @@ class OcrPdfPages(InvariantAwareCommand):
     class DestDirArg(StringInvariant):
         _help = (
             "Destination directory for OCR output. "
-            "[default: <source-dir>]"
+            "Required with --pdf-to-pages; otherwise defaults to "
+            "<source-dir>."
         )
         _mandatory = False
 
@@ -225,6 +304,50 @@ class OcrPdfPages(InvariantAwareCommand):
             "<source-dir> if present."
         )
         _mandatory = False
+
+    pdf_to_pages = None
+
+    class PdfToPagesArg(BoolInvariant):
+        _arg = "--pdf-to-pages"
+        _help = (
+            "Render PDFs from --source-dir into --dest-dir before OCR. "
+            "OCR then reads page images and extracted text from --dest-dir. "
+            "[default: %default]"
+        )
+        _mandatory = False
+        _default = False
+
+    pdf_recursive = None
+
+    class PdfRecursiveArg(BoolInvariant):
+        _arg = "--pdf-recursive"
+        _help = (
+            "Recursively find PDFs when --pdf-to-pages is enabled. "
+            "[default: %default]"
+        )
+        _mandatory = False
+        _default = False
+
+    pdf_parallelism = None
+    _pdf_parallelism = None
+
+    class PdfParallelismArg(NonNegativeIntegerInvariant):
+        _arg = "--pdf-parallelism"
+        _help = (
+            "PDF-render worker count; 0 means CPU count. "
+            "[default: %default]"
+        )
+        _mandatory = False
+        _default = 0
+
+    pdf_dpi = None
+    _pdf_dpi = None
+
+    class PdfDpiArg(PositiveIntegerInvariant):
+        _arg = "--pdf-dpi"
+        _help = "PDF render DPI. [default: %default]"
+        _mandatory = False
+        _default = 400
 
     output_format = None
     _output_format = None
@@ -419,7 +542,8 @@ class OcrPdfPages(InvariantAwareCommand):
 
     class ForceArg(BoolInvariant):
         _help = (
-            "Re-run OCR when output files already exist. "
+            "Re-run OCR when output files already exist; with "
+            "--pdf-to-pages, also re-render page images/text. "
             "[default: %default]"
         )
         _mandatory = False
@@ -465,10 +589,14 @@ class OcrPdfPages(InvariantAwareCommand):
             "source_dir",
             private_first=True,
         )
+        dest_option = _option_value(self, "dest_dir", private_first=True)
+        if self.pdf_to_pages and dest_option is None:
+            raise CommandError(
+                "--pdf-to-pages requires an explicit --dest-dir"
+            )
         dest_dir = os.path.abspath(
-            _option_value(self, "dest_dir", source_dir)
+            dest_option or source_dir
         )
-        os.makedirs(dest_dir, exist_ok=True)
 
         output_format = _option_value(self, "output_format", "md")
         output_format = output_format.lower().strip()
@@ -485,30 +613,79 @@ class OcrPdfPages(InvariantAwareCommand):
                 "--prompt-mode full writes .ocr, .md, and .json and "
                 "requires --output-format md"
             )
+        scheduler_delay_factor = _maybe_float(
+            _option_value(self, "scheduler_delay_factor")
+        )
+        gpu_memory_utilization = _maybe_float(
+            _option_value(self, "gpu_memory_utilization")
+        )
+        temperature = _maybe_float(
+            _option_value(self, "temperature"),
+            default=0.0,
+        )
+        page_source_dir = dest_dir if self.pdf_to_pages else source_dir
         markdown_provider = self._prepare_markdown_provider(
             prompt_mode=prompt_mode,
-            source_dir=source_dir,
+            source_dir=page_source_dir,
             dest_dir=dest_dir,
         )
+        os.makedirs(dest_dir, exist_ok=True)
+        pdf_pages_result = None
+        if self.pdf_to_pages:
+            try:
+                pdf_pages_result = _run_pdf_to_pages(
+                    source_dir=source_dir,
+                    dest_dir=dest_dir,
+                    recursive=bool(self.pdf_recursive),
+                    parallelism=self._pdf_parallelism,
+                    limit=None,
+                    dpi=self._pdf_dpi or 400,
+                    force=bool(self.force),
+                    no_text=False,
+                    record_encrypted_sentinels=False,
+                    out=self._out,
+                )
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                raise CommandError(
+                    f"PDF rendering failed before OCR: {exc}"
+                ) from exc
         output_ext = "ocr" if output_format == "ocr" else output_format
         text_source_dir = _option_value(
             self,
             "text_source_dir",
             private_first=True,
         )
-        if text_source_dir is None and os.path.isdir(f"{source_dir}.txt"):
-            text_source_dir = f"{source_dir}.txt"
+        if text_source_dir is None and os.path.isdir(
+            f"{page_source_dir}.txt"
+        ):
+            text_source_dir = f"{page_source_dir}.txt"
         elif text_source_dir is None:
-            text_source_dir = source_dir
+            text_source_dir = page_source_dir
 
         scan_workers = resolve_scan_workers(self._scan_parallelism)
-        self._out(f"Scanning page images under {source_dir}...")
+        self._out(f"Scanning page images under {page_source_dir}...")
         items = []
         if prompt_mode == "full":
             items, pdf_count = collect_ocr_full_items(
-                source_dir=source_dir,
+                source_dir=page_source_dir,
                 dest_dir=dest_dir,
                 text_source_dir=text_source_dir,
+                allowed_image_paths=(
+                    pdf_pages_result.image_paths
+                    if pdf_pages_result is not None
+                    else None
+                ),
+                refresh_image_paths=(
+                    pdf_pages_result.rendered_image_paths
+                    if pdf_pages_result is not None
+                    else None
+                ),
+                refresh_metadata_image_paths=(
+                    pdf_pages_result.rendered_text_image_paths
+                    if pdf_pages_result is not None
+                    else None
+                ),
+                verify_input_freshness=bool(self.pdf_to_pages),
                 force=bool(self.force),
                 scan_parallelism=scan_workers,
                 out=self._out,
@@ -523,9 +700,20 @@ class OcrPdfPages(InvariantAwareCommand):
             work_count = len(items)
         else:
             tasks, pdf_count = collect_ocr_tasks(
-                source_dir=source_dir,
+                source_dir=page_source_dir,
                 dest_dir=dest_dir,
                 text_source_dir=text_source_dir,
+                allowed_image_paths=(
+                    pdf_pages_result.image_paths
+                    if pdf_pages_result is not None
+                    else None
+                ),
+                refresh_image_paths=(
+                    pdf_pages_result.rendered_image_paths
+                    if pdf_pages_result is not None
+                    else None
+                ),
+                verify_input_freshness=bool(self.pdf_to_pages),
                 output_ext=output_ext,
                 force=bool(self.force),
                 scan_parallelism=scan_workers,
@@ -573,17 +761,10 @@ class OcrPdfPages(InvariantAwareCommand):
                     self,
                     "mm_encoder_attn_backend",
                 ),
-                scheduler_delay_factor=_maybe_float(
-                    _option_value(self, "scheduler_delay_factor")
-                ),
+                scheduler_delay_factor=scheduler_delay_factor,
                 tensor_parallel_size=self._tensor_parallel_size,
-                gpu_memory_utilization=_maybe_float(
-                    _option_value(self, "gpu_memory_utilization")
-                ),
-                temperature=_maybe_float(
-                    _option_value(self, "temperature"),
-                    default=0.0,
-                ),
+                gpu_memory_utilization=gpu_memory_utilization,
+                temperature=temperature,
                 max_tokens=self._max_tokens or 8192,
                 ngram_size=self._ngram_size or 10,
                 window_size=window_size,

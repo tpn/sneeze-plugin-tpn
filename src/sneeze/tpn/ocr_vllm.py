@@ -36,6 +36,9 @@ class OcrScanCandidate:
     image_path: str
     base: str
     text_path: str | None = None
+    refresh_output: bool = False
+    refresh_metadata: bool = False
+    verify_input_freshness: bool = False
 
 
 @dataclass(frozen=True)
@@ -69,11 +72,17 @@ def collect_ocr_tasks(
     force: bool,
     scan_parallelism: int,
     out: Callable[[str], None] | None = None,
+    allowed_image_paths: Iterable[str] | None = None,
+    refresh_image_paths: Iterable[str] | None = None,
+    verify_input_freshness: bool = False,
 ) -> tuple[list[OcrPageTask], int]:
     candidates, pdf_count = collect_ocr_scan_candidates(
         source_dir=source_dir,
         dest_dir=dest_dir,
         text_source_dir=text_source_dir,
+        allowed_image_paths=allowed_image_paths,
+        refresh_image_paths=refresh_image_paths,
+        verify_input_freshness=verify_input_freshness,
     )
     if not candidates:
         return [], pdf_count
@@ -116,11 +125,19 @@ def collect_ocr_full_items(
     force: bool,
     scan_parallelism: int,
     out: Callable[[str], None] | None = None,
+    allowed_image_paths: Iterable[str] | None = None,
+    refresh_image_paths: Iterable[str] | None = None,
+    refresh_metadata_image_paths: Iterable[str] | None = None,
+    verify_input_freshness: bool = False,
 ) -> tuple[list[OcrFullItem], int]:
     candidates, pdf_count = collect_ocr_scan_candidates(
         source_dir=source_dir,
         dest_dir=dest_dir,
         text_source_dir=text_source_dir,
+        allowed_image_paths=allowed_image_paths,
+        refresh_image_paths=refresh_image_paths,
+        refresh_metadata_image_paths=refresh_metadata_image_paths,
+        verify_input_freshness=verify_input_freshness,
     )
     if not candidates:
         return [], pdf_count
@@ -147,11 +164,27 @@ def collect_ocr_scan_candidates(
     source_dir: str,
     dest_dir: str,
     text_source_dir: str | None,
+    allowed_image_paths: Iterable[str] | None = None,
+    refresh_image_paths: Iterable[str] | None = None,
+    refresh_metadata_image_paths: Iterable[str] | None = None,
+    verify_input_freshness: bool = False,
 ) -> tuple[list[OcrScanCandidate], int]:
     candidates = []
     pdf_dirs = set()
     dest_dir = os.path.abspath(dest_dir)
     source_dir = os.path.abspath(source_dir)
+    allowed_paths = (
+        {os.path.abspath(path) for path in allowed_image_paths}
+        if allowed_image_paths is not None
+        else None
+    )
+    refresh_paths = {
+        os.path.abspath(path) for path in (refresh_image_paths or ())
+    }
+    refresh_metadata_paths = {
+        os.path.abspath(path)
+        for path in (refresh_metadata_image_paths or ())
+    }
     for root, dirs, files in os.walk(source_dir):
         dirs.sort()
         root_abs = os.path.abspath(root)
@@ -161,6 +194,9 @@ def collect_ocr_scan_candidates(
             continue
         for filename in sorted(files):
             if not filename.lower().endswith(".png"):
+                continue
+            image_path = os.path.abspath(os.path.join(root, filename))
+            if allowed_paths is not None and image_path not in allowed_paths:
                 continue
             rel_root = os.path.relpath(root, source_dir)
             if rel_root == ".":
@@ -178,9 +214,14 @@ def collect_ocr_scan_candidates(
                     text_path = candidate
             candidates.append(
                 OcrScanCandidate(
-                    image_path=os.path.join(root, filename),
+                    image_path=image_path,
                     base=base,
                     text_path=text_path,
+                    refresh_output=image_path in refresh_paths,
+                    refresh_metadata=(
+                        image_path in refresh_metadata_paths
+                    ),
+                    verify_input_freshness=verify_input_freshness,
                 )
             )
             pdf_dirs.add(rel_root if rel_root else ".")
@@ -194,7 +235,13 @@ def ocr_task_record_from_candidate(
     force: bool,
 ) -> tuple[str, str, str | None] | None:
     output_path = os.path.join(dest_dir, f"{candidate.base}.{output_ext}")
-    if not force and os.path.exists(output_path):
+    refresh_output = force or candidate.refresh_output
+    if (
+        candidate.verify_input_freshness
+        and path_is_newer(candidate.image_path, output_path)
+    ):
+        refresh_output = True
+    if not refresh_output and os.path.exists(output_path):
         return None
     return candidate.image_path, output_path, candidate.text_path
 
@@ -207,9 +254,26 @@ def ocr_full_item_from_candidate(
     ocr_path = os.path.join(dest_dir, f"{candidate.base}.ocr")
     markdown_path = os.path.join(dest_dir, f"{candidate.base}.md")
     json_path = os.path.join(dest_dir, f"{candidate.base}.json")
-    need_ocr = force or not os.path.exists(ocr_path)
-    need_markdown = force or not os.path.exists(markdown_path)
-    need_json = force or not os.path.exists(json_path)
+    refresh_output = force or candidate.refresh_output
+    refresh_metadata = candidate.refresh_metadata
+    if candidate.verify_input_freshness:
+        if any(
+            path_is_newer(candidate.image_path, output_path)
+            for output_path in (ocr_path, markdown_path, json_path)
+        ):
+            refresh_output = True
+        if candidate.text_path and path_is_newer(
+            candidate.text_path,
+            json_path,
+        ):
+            refresh_metadata = True
+    need_ocr = refresh_output or not os.path.exists(ocr_path)
+    need_markdown = refresh_output or not os.path.exists(markdown_path)
+    need_json = (
+        refresh_output
+        or refresh_metadata
+        or not os.path.exists(json_path)
+    )
     if (
         not force
         and not (need_ocr or need_markdown or need_json)
@@ -231,6 +295,20 @@ def ocr_full_item_from_candidate(
         image_dims=ocr_image_dims(candidate.image_path),
         image_sha256=file_sha256(candidate.image_path),
     )
+
+
+def path_is_newer(source_path: str, output_path: str) -> bool:
+    """Return whether a source exists and is newer than an output."""
+
+    try:
+        source_mtime = os.stat(source_path).st_mtime_ns
+    except OSError:
+        return False
+    try:
+        output_mtime = os.stat(output_path).st_mtime_ns
+    except OSError:
+        return False
+    return source_mtime > output_mtime
 
 
 def persisted_markdown_quality_status(json_path: str) -> str | None:
