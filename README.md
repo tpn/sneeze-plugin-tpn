@@ -37,19 +37,49 @@ resulting page tree:
 sne ocr-pdf-pages \
   --pdf-to-pages \
   --source-dir ./pdfs \
-  --dest-dir ./pages \
   --pdf-recursive \
   --pdf-parallelism 32 \
   --pdf-dpi 400 \
   --prompt-mode full
 ```
 
-With `--pdf-to-pages`, `--source-dir` is the PDF root and an explicit
-`--dest-dir` receives the page PNGs, extracted text, and OCR outputs. Existing
-page files are reused. `--force` rerenders them and reruns OCR, while
-`--pdf-parallelism` and `--pdf-dpi` control only the Poppler stage. The
-combined path leaves the PDF source tree read-only; encrypted or unreadable
-PDFs are reported without creating source-side `.encrypted` sentinels.
+With `--pdf-to-pages`, `--source-dir` is the PDF root. If `--dest-dir` is
+omitted, per-PDF page directories, extracted text, and OCR outputs are written
+under that same root, matching the defaults of the separate commands. Supply
+an explicit `--dest-dir` when the PDF tree should remain read-only or the
+rendered/OCR files belong elsewhere. Existing page files are reused. `--force`
+rerenders them and reruns OCR, while `--pdf-parallelism` and `--pdf-dpi`
+control only the Poppler stage. Encrypted or unreadable PDFs are reported
+without creating source-side `.encrypted` sentinels.
+
+`ocr-pdf-pages` always uses the in-process DeepSeek-OCR/vLLM adapter for
+grounded OCR. Select its checkpoint with `--model` and pair a non-default Hub
+model with its own immutable `--model-revision`; omitting both uses the pinned
+DeepSeek-OCR defaults. The batching, memory, attention, token, n-gram, and
+window flags only tune that engine and are not needed merely to choose the
+default model. For example, the following optional settings reproduce the
+constrained single-GPU profile from the corpus investigation:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 sne ocr-pdf-pages \
+  --pdf-to-pages \
+  --source-dir ./pdfs \
+  --pdf-recursive \
+  --prompt-mode full \
+  --model deepseek-ai/DeepSeek-OCR \
+  --model-revision 9f30c71f441d010e5429c532364a86705536c53a \
+  --batch-size 1 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 8192 \
+  --max-tokens 8192 \
+  --gpu-memory-utilization 0.8
+```
+
+MinerU is not selected through `--model`: in full mode it is the qualified
+out-of-process Markdown provider, while DeepSeek remains the grounded-OCR
+engine. Select it with `--markdown-provider-spec`,
+`--markdown-provider-lane`, and `--markdown-provider-run-dir` as documented
+below. Hosted OpenAI and Anthropic profiles remain benchmark-only.
 
 Without `--pdf-to-pages`, the command consumes existing page PNGs as before.
 Use the two separate commands when rendered pages and OCR outputs need distinct

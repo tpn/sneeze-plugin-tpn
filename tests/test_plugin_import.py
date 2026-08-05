@@ -844,24 +844,49 @@ def test_ocr_pdf_pages_render_ignores_stale_pages_when_no_pdfs(
     assert constructed is False
 
 
-def test_ocr_pdf_pages_render_requires_explicit_destination(tmp_path):
-    from sneeze.command import CommandError
-
+def test_ocr_pdf_pages_render_defaults_destination_to_source(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.commands as commands
+    import sneeze.tpn.ocr_vllm as ocr_vllm
     from sneeze.tpn.commands import OcrPdfPages
 
     source_dir = tmp_path / "pdfs"
     source_dir.mkdir()
+    captured = {}
+    processor_constructed = False
+
+    def fake_render(**kwargs):
+        captured.update(kwargs)
+        return commands.PdfPagesRunResult(
+            (),
+            frozenset(),
+            frozenset(),
+        )
+
+    class FakeProcessor:
+        def __init__(self, **_kwargs):
+            nonlocal processor_constructed
+            processor_constructed = True
+
+    monkeypatch.setattr(commands, "_run_pdf_to_pages", fake_render)
+    monkeypatch.setattr(
+        ocr_vllm,
+        "DeepSeekOcrOfflineProcessor",
+        FakeProcessor,
+    )
     command = OcrPdfPages(None, StringIO(), None)
     command._source_dir = str(source_dir)
     command.pdf_to_pages = True
+    command._scan_parallelism = 1
 
-    with pytest.raises(
-        CommandError,
-        match="requires an explicit --dest-dir",
-    ):
-        command.run()
+    command.run()
 
-    assert list(source_dir.iterdir()) == []
+    assert captured["source_dir"] == str(source_dir)
+    assert captured["dest_dir"] == str(source_dir)
+    assert captured["record_encrypted_sentinels"] is False
+    assert processor_constructed is False
 
 
 def test_ocr_pdf_pages_render_failure_stops_before_processor(

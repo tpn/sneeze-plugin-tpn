@@ -263,8 +263,9 @@ class PdfsToPages(PdfToPages):
 class OcrPdfPages(InvariantAwareCommand):
     """OCR page images, optionally rendering source PDFs first.
 
-    Pass `--pdf-to-pages` to render PDFs from `--source-dir` into
-    `--dest-dir` before OCR; otherwise render pages separately with
+    Pass `--pdf-to-pages` to render PDFs from `--source-dir` into the
+    effective destination before OCR; it defaults to `--source-dir` when
+    `--dest-dir` is omitted. Otherwise render pages separately with
     `sne pdf-to-pages`. Create a vLLM env with
     `sne deepseek-ocr-create-env`, cache the model with
     `sne deepseek-ocr-download-model`, and run this command inside that env.
@@ -290,8 +291,7 @@ class OcrPdfPages(InvariantAwareCommand):
     class DestDirArg(StringInvariant):
         _help = (
             "Destination directory for OCR output. "
-            "Required with --pdf-to-pages; otherwise defaults to "
-            "<source-dir>."
+            "Defaults to <source-dir>, including with --pdf-to-pages."
         )
         _mandatory = False
 
@@ -310,8 +310,9 @@ class OcrPdfPages(InvariantAwareCommand):
     class PdfToPagesArg(BoolInvariant):
         _arg = "--pdf-to-pages"
         _help = (
-            "Render PDFs from --source-dir into --dest-dir before OCR. "
-            "OCR then reads page images and extracted text from --dest-dir. "
+            "Render PDFs from --source-dir into the effective destination "
+            "before OCR; it defaults to --source-dir. OCR then reads page "
+            "images and extracted text from that destination. "
             "[default: %default]"
         )
         _mandatory = False
@@ -590,10 +591,6 @@ class OcrPdfPages(InvariantAwareCommand):
             private_first=True,
         )
         dest_option = _option_value(self, "dest_dir", private_first=True)
-        if self.pdf_to_pages and dest_option is None:
-            raise CommandError(
-                "--pdf-to-pages requires an explicit --dest-dir"
-            )
         dest_dir = os.path.abspath(
             dest_option or source_dir
         )
