@@ -1,18 +1,27 @@
 from __future__ import annotations
 
+import copy
+import hashlib
+import importlib.metadata
 import inspect
 import json
 import multiprocessing
 import os
+import platform
 import re
 import shutil
 import subprocess
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
+from enum import Enum
 from functools import partial
 
 DEFAULT_OCR_MODEL = "deepseek-ai/DeepSeek-OCR"
+DEFAULT_OCR_MODEL_REVISION = "9f30c71f441d010e5429c532364a86705536c53a"
+DEFAULT_OCR_WINDOW_SIZE = 50
+DEFAULT_MARKDOWN_WINDOW_SIZE = 128
 
 
 @dataclass(frozen=True)
@@ -27,6 +36,9 @@ class OcrScanCandidate:
     image_path: str
     base: str
     text_path: str | None = None
+    refresh_output: bool = False
+    refresh_metadata: bool = False
+    verify_input_freshness: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,6 +53,7 @@ class OcrFullItem:
     need_markdown: bool = False
     need_json: bool = False
     image_dims: dict[str, int] | None = None
+    image_sha256: str | None = None
 
 
 def resolve_scan_workers(scan_parallelism: int | None) -> int:
@@ -59,11 +72,17 @@ def collect_ocr_tasks(
     force: bool,
     scan_parallelism: int,
     out: Callable[[str], None] | None = None,
+    allowed_image_paths: Iterable[str] | None = None,
+    refresh_image_paths: Iterable[str] | None = None,
+    verify_input_freshness: bool = False,
 ) -> tuple[list[OcrPageTask], int]:
     candidates, pdf_count = collect_ocr_scan_candidates(
         source_dir=source_dir,
         dest_dir=dest_dir,
         text_source_dir=text_source_dir,
+        allowed_image_paths=allowed_image_paths,
+        refresh_image_paths=refresh_image_paths,
+        verify_input_freshness=verify_input_freshness,
     )
     if not candidates:
         return [], pdf_count
@@ -106,11 +125,19 @@ def collect_ocr_full_items(
     force: bool,
     scan_parallelism: int,
     out: Callable[[str], None] | None = None,
+    allowed_image_paths: Iterable[str] | None = None,
+    refresh_image_paths: Iterable[str] | None = None,
+    refresh_metadata_image_paths: Iterable[str] | None = None,
+    verify_input_freshness: bool = False,
 ) -> tuple[list[OcrFullItem], int]:
     candidates, pdf_count = collect_ocr_scan_candidates(
         source_dir=source_dir,
         dest_dir=dest_dir,
         text_source_dir=text_source_dir,
+        allowed_image_paths=allowed_image_paths,
+        refresh_image_paths=refresh_image_paths,
+        refresh_metadata_image_paths=refresh_metadata_image_paths,
+        verify_input_freshness=verify_input_freshness,
     )
     if not candidates:
         return [], pdf_count
@@ -137,11 +164,27 @@ def collect_ocr_scan_candidates(
     source_dir: str,
     dest_dir: str,
     text_source_dir: str | None,
+    allowed_image_paths: Iterable[str] | None = None,
+    refresh_image_paths: Iterable[str] | None = None,
+    refresh_metadata_image_paths: Iterable[str] | None = None,
+    verify_input_freshness: bool = False,
 ) -> tuple[list[OcrScanCandidate], int]:
     candidates = []
     pdf_dirs = set()
     dest_dir = os.path.abspath(dest_dir)
     source_dir = os.path.abspath(source_dir)
+    allowed_paths = (
+        {os.path.abspath(path) for path in allowed_image_paths}
+        if allowed_image_paths is not None
+        else None
+    )
+    refresh_paths = {
+        os.path.abspath(path) for path in (refresh_image_paths or ())
+    }
+    refresh_metadata_paths = {
+        os.path.abspath(path)
+        for path in (refresh_metadata_image_paths or ())
+    }
     for root, dirs, files in os.walk(source_dir):
         dirs.sort()
         root_abs = os.path.abspath(root)
@@ -151,6 +194,9 @@ def collect_ocr_scan_candidates(
             continue
         for filename in sorted(files):
             if not filename.lower().endswith(".png"):
+                continue
+            image_path = os.path.abspath(os.path.join(root, filename))
+            if allowed_paths is not None and image_path not in allowed_paths:
                 continue
             rel_root = os.path.relpath(root, source_dir)
             if rel_root == ".":
@@ -168,9 +214,14 @@ def collect_ocr_scan_candidates(
                     text_path = candidate
             candidates.append(
                 OcrScanCandidate(
-                    image_path=os.path.join(root, filename),
+                    image_path=image_path,
                     base=base,
                     text_path=text_path,
+                    refresh_output=image_path in refresh_paths,
+                    refresh_metadata=(
+                        image_path in refresh_metadata_paths
+                    ),
+                    verify_input_freshness=verify_input_freshness,
                 )
             )
             pdf_dirs.add(rel_root if rel_root else ".")
@@ -184,7 +235,13 @@ def ocr_task_record_from_candidate(
     force: bool,
 ) -> tuple[str, str, str | None] | None:
     output_path = os.path.join(dest_dir, f"{candidate.base}.{output_ext}")
-    if not force and os.path.exists(output_path):
+    refresh_output = force or candidate.refresh_output
+    if (
+        candidate.verify_input_freshness
+        and path_is_newer(candidate.image_path, output_path)
+    ):
+        refresh_output = True
+    if not refresh_output and os.path.exists(output_path):
         return None
     return candidate.image_path, output_path, candidate.text_path
 
@@ -197,9 +254,32 @@ def ocr_full_item_from_candidate(
     ocr_path = os.path.join(dest_dir, f"{candidate.base}.ocr")
     markdown_path = os.path.join(dest_dir, f"{candidate.base}.md")
     json_path = os.path.join(dest_dir, f"{candidate.base}.json")
-    need_ocr = force or not os.path.exists(ocr_path)
-    need_markdown = force or not os.path.exists(markdown_path)
-    need_json = force or not os.path.exists(json_path)
+    refresh_output = force or candidate.refresh_output
+    refresh_metadata = candidate.refresh_metadata
+    if candidate.verify_input_freshness:
+        if any(
+            path_is_newer(candidate.image_path, output_path)
+            for output_path in (ocr_path, markdown_path, json_path)
+        ):
+            refresh_output = True
+        if candidate.text_path and path_is_newer(
+            candidate.text_path,
+            json_path,
+        ):
+            refresh_metadata = True
+    need_ocr = refresh_output or not os.path.exists(ocr_path)
+    need_markdown = refresh_output or not os.path.exists(markdown_path)
+    need_json = (
+        refresh_output
+        or refresh_metadata
+        or not os.path.exists(json_path)
+    )
+    if (
+        not force
+        and not (need_ocr or need_markdown or need_json)
+        and persisted_markdown_quality_status(json_path) == "fail"
+    ):
+        need_json = True
     if not (need_ocr or need_markdown or need_json):
         return None
     return OcrFullItem(
@@ -213,7 +293,37 @@ def ocr_full_item_from_candidate(
         need_markdown=need_markdown,
         need_json=need_json,
         image_dims=ocr_image_dims(candidate.image_path),
+        image_sha256=file_sha256(candidate.image_path),
     )
+
+
+def path_is_newer(source_path: str, output_path: str) -> bool:
+    """Return whether a source exists and is newer than an output."""
+
+    try:
+        source_mtime = os.stat(source_path).st_mtime_ns
+    except OSError:
+        return False
+    try:
+        output_mtime = os.stat(output_path).st_mtime_ns
+    except OSError:
+        return False
+    return source_mtime > output_mtime
+
+
+def persisted_markdown_quality_status(json_path: str) -> str | None:
+    try:
+        with open(json_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    quality = payload.get("markdown_quality")
+    if not isinstance(quality, dict):
+        return None
+    status = quality.get("status")
+    return status if isinstance(status, str) else None
 
 
 def ocr_image_dims(image_path: str) -> dict[str, int] | None:
@@ -229,17 +339,47 @@ def ocr_image_dims(image_path: str) -> dict[str, int] | None:
         return None
 
 
-def write_ocr_page_bundle(item: OcrFullItem) -> None:
+def file_sha256(path: str) -> str | None:
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def write_ocr_page_bundle(
+    item: OcrFullItem,
+    *,
+    generation_metadata: dict | None = None,
+) -> dict:
+    ocr_text = read_optional_text(item.ocr_path)
+    markdown_text = read_optional_text(item.markdown_path)
+    raw_text = read_optional_text(item.text_path)
+    merged_metadata = read_existing_generation_metadata(item.json_path) or {}
+    merged_metadata.update(generation_metadata or {})
+    generation_metadata = merged_metadata
     payload = {
         "image_path": item.image_path,
         "ocr_path": item.ocr_path,
         "markdown_path": item.markdown_path,
         "text_path": item.text_path,
-        "ocr_text": read_optional_text(item.ocr_path),
-        "markdown_text": read_optional_text(item.markdown_path),
-        "raw_text": read_optional_text(item.text_path),
+        "ocr_text": ocr_text,
+        "markdown_text": markdown_text,
+        "raw_text": raw_text,
         "image_dims": item.image_dims,
+        "image_sha256": item.image_sha256,
     }
+    if generation_metadata:
+        payload["generation_metadata"] = generation_metadata
+    if markdown_text is not None:
+        payload["markdown_quality"] = analyze_markdown_quality(
+            markdown_text,
+            ocr_text=ocr_text,
+            raw_text=raw_text,
+        )
     payload = {
         key: value
         for key, value in payload.items()
@@ -251,6 +391,19 @@ def write_ocr_page_bundle(item: OcrFullItem) -> None:
     with open(item.json_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
+    return payload
+
+
+def read_existing_generation_metadata(json_path: str) -> dict | None:
+    try:
+        with open(json_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    metadata = payload.get("generation_metadata")
+    return metadata if isinstance(metadata, dict) else None
 
 
 def read_optional_text(path: str | None) -> str | None:
@@ -261,6 +414,529 @@ def read_optional_text(path: str | None) -> str | None:
             return handle.read()
     except OSError:
         return None
+
+
+_INTEGER_RE = re.compile(r"(?<![\w.])[-+]?\d+(?![\w.])")
+_WORD_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)?", re.UNICODE)
+_TABLE_CAPTION_RE = re.compile(
+    r"^\s*(?:(?:<[^>\n]+>|[*_]{1,2})\s*)*"
+    r"table\s+(\d+[a-z]?)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_TABLE_LABEL_RE = re.compile(
+    r"\btable\s+(\d+[a-z]?)\b",
+    re.IGNORECASE,
+)
+_PIPE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+
+
+def _word_tokens(text: str | None) -> list[str]:
+    return _WORD_RE.findall((text or "").casefold())
+
+
+def _source_coverage(text: str, source: str | None) -> float | None:
+    source_words = [word.lower() for word in _word_tokens(source)]
+    if not source_words:
+        return None
+    output_counts = Counter(word.lower() for word in _word_tokens(text))
+    source_counts = Counter(source_words)
+    matched = sum(
+        min(count, output_counts.get(word, 0))
+        for word, count in source_counts.items()
+    )
+    return round(matched / len(source_words), 6)
+
+
+def monotonic_integer_run(
+    text: str,
+    *,
+    max_gap_chars: int = 64,
+) -> dict:
+    matches = list(_INTEGER_RE.finditer(text or ""))
+    if not matches:
+        return {
+            "terms": 0,
+            "step": None,
+            "first": None,
+            "last": None,
+            "char_start": None,
+            "char_end": None,
+        }
+    best_count = run_count = 1
+    best_start = run_start = 0
+    best_end = 0
+    best_step = run_step = None
+    for index in range(1, len(matches)):
+        previous = matches[index - 1]
+        current = matches[index]
+        delta = int(current.group()) - int(previous.group())
+        gap = current.start() - previous.end()
+        if delta and gap <= max_gap_chars:
+            if run_count >= 2 and delta == run_step:
+                run_count += 1
+            else:
+                run_count = 2
+                run_start = index - 1
+                run_step = delta
+        else:
+            run_count = 1
+            run_start = index
+            run_step = None
+        if run_count > best_count:
+            best_count = run_count
+            best_start = run_start
+            best_end = index
+            best_step = run_step
+    return {
+        "terms": best_count,
+        "step": best_step,
+        "first": int(matches[best_start].group()),
+        "last": int(matches[best_end].group()),
+        "char_start": matches[best_start].start(),
+        "char_end": matches[best_end].end(),
+    }
+
+
+def repeated_long_block_metrics(
+    text: str,
+    *,
+    source_text: str | None = None,
+) -> dict | None:
+    blocks = [
+        re.sub(r"\s+", " ", block).strip()
+        for block in re.split(r"\n\s*\n", text)
+    ]
+    blocks = [block for block in blocks if len(_word_tokens(block)) >= 40]
+    if not blocks:
+        return None
+    counts = Counter(blocks)
+    block, occurrences = max(
+        counts.items(),
+        key=lambda item: (item[1], len(item[0])),
+    )
+    if occurrences < 2:
+        return None
+    source_coverage = _source_coverage(block, source_text)
+    return {
+        "occurrences": occurrences,
+        "characters": len(block),
+        "words": len(_word_tokens(block)),
+        "sha256": hashlib.sha256(block.encode("utf-8")).hexdigest(),
+        "source_coverage": source_coverage,
+    }
+
+
+def _ngrams(tokens: list[str], size: int) -> set[tuple[str, ...]]:
+    return {
+        tuple(tokens[index : index + size])
+        for index in range(len(tokens) - size + 1)
+    }
+
+
+def _nonoverlapping(positions: list[int], span_words: int) -> list[int]:
+    selected = []
+    for position in positions:
+        if not selected or position - selected[-1] >= span_words:
+            selected.append(position)
+    return selected
+
+
+def repeated_word_window_metrics(
+    markdown_text: str,
+    raw_text: str | None,
+    grounded_ocr_text: str | None,
+    *,
+    span_words: int = 50,
+    support_ngram_words: int = 5,
+) -> dict:
+    tokens = _word_tokens(markdown_text)
+    positions_by_window: dict[tuple[str, ...], list[int]] = defaultdict(list)
+    for index in range(len(tokens) - span_words + 1):
+        window = tuple(tokens[index : index + span_words])
+        positions_by_window[window].append(index)
+    raw_support = _ngrams(_word_tokens(raw_text), support_ngram_words)
+    ocr_support = _ngrams(
+        _word_tokens(grounded_ocr_text),
+        support_ngram_words,
+    )
+    combined_support = raw_support | ocr_support
+    candidates = []
+    for window, positions in positions_by_window.items():
+        selected = _nonoverlapping(positions, span_words)
+        if len(selected) < 2:
+            continue
+        window_ngrams = [
+            window[index : index + support_ngram_words]
+            for index in range(span_words - support_ngram_words + 1)
+        ]
+
+        def coverage(support, ngrams=tuple(window_ngrams)):
+            return sum(
+                ngram in support for ngram in ngrams
+            ) / len(ngrams)
+
+        candidates.append(
+            {
+                "nonoverlap_occurrences": len(selected),
+                "period_words": min(
+                    right - left
+                    for left, right in zip(
+                        positions,
+                        positions[1:],
+                        strict=False,
+                    )
+                ),
+                "first_word_offset": positions[0],
+                "raw_5gram_coverage": coverage(raw_support),
+                "grounded_ocr_5gram_coverage": coverage(ocr_support),
+                "combined_5gram_coverage": coverage(combined_support),
+                "span_sha256": hashlib.sha256(
+                    " ".join(window).encode()
+                ).hexdigest(),
+            }
+        )
+
+    def score(candidate):
+        return (
+            candidate["nonoverlap_occurrences"],
+            -candidate["combined_5gram_coverage"],
+            -candidate["first_word_offset"],
+        )
+
+    best = max(candidates, key=score, default=None)
+    unsupported = max(
+        (
+            candidate
+            for candidate in candidates
+            if candidate["combined_5gram_coverage"] < 0.2
+        ),
+        key=score,
+        default=None,
+    )
+    return {
+        "span_words": span_words,
+        "support_ngram_words": support_ngram_words,
+        "max_repeat": best,
+        "max_unsupported_repeat": unsupported,
+    }
+
+
+def table_completion_metrics(
+    markdown_text: str,
+    raw_text: str | None,
+    grounded_ocr_text: str | None,
+) -> dict:
+    def captions(text):
+        return {
+            label.casefold()
+            for label in _TABLE_CAPTION_RE.findall(text or "")
+        }
+
+    expected = captions(raw_text) & captions(grounded_ocr_text)
+    observed = {
+        label.casefold()
+        for label in _TABLE_LABEL_RE.findall(markdown_text or "")
+    }
+    missing = expected - observed
+    raw_words = _word_tokens(raw_text)
+    markdown_words = _word_tokens(markdown_text)
+    raw_counts = Counter(raw_words)
+    markdown_counts = Counter(markdown_words)
+    recall = (
+        sum((raw_counts & markdown_counts).values()) / len(raw_words)
+        if raw_words
+        else 1.0
+    )
+    word_ratio = (
+        len(markdown_words) / len(raw_words) if raw_words else 1.0
+    )
+    lines = (markdown_text or "").splitlines()
+    return {
+        "expected_caption_labels": sorted(expected),
+        "observed_table_labels": sorted(observed),
+        "missing_caption_labels": sorted(missing),
+        "missing_caption_fraction": (
+            len(missing) / len(expected) if expected else 0.0
+        ),
+        "raw_token_multiset_recall": recall,
+        "markdown_raw_word_ratio": word_ratio,
+        "nonblank_lines": sum(bool(line.strip()) for line in lines),
+        "pipe_table_rows": sum(
+            bool(_PIPE_ROW_RE.match(line)) for line in lines
+        ),
+        "ends_with_pipe_table_row": bool(
+            re.search(r"\|\s*$", markdown_text or "")
+        ),
+    }
+
+
+def token_repetition_metrics(token_ids: Iterable[int]) -> dict:
+    ids = list(token_ids)
+    metrics = {"token_count": len(ids), "unique_token_fraction": 0.0}
+    if ids:
+        metrics["unique_token_fraction"] = round(len(set(ids)) / len(ids), 6)
+    ngrams = {}
+    for size in (10, 25, 50, 75):
+        windows = len(ids) - size + 1
+        if windows <= 0:
+            ngrams[str(size)] = {
+                "max_occurrences": 0,
+                "repeated_window_fraction": 0.0,
+            }
+            continue
+        counts = Counter(
+            tuple(ids[index : index + size])
+            for index in range(windows)
+        )
+        repeated = sum(count for count in counts.values() if count > 1)
+        ngrams[str(size)] = {
+            "max_occurrences": max(counts.values()),
+            "repeated_window_fraction": round(repeated / windows, 6),
+        }
+    metrics["ngrams"] = ngrams
+    return metrics
+
+
+def analyze_markdown_quality(
+    markdown_text: str,
+    *,
+    ocr_text: str | None,
+    raw_text: str | None,
+) -> dict:
+    axis = monotonic_integer_run(markdown_text)
+    repetition = repeated_word_window_metrics(
+        markdown_text,
+        raw_text,
+        ocr_text,
+    )
+    table = table_completion_metrics(
+        markdown_text,
+        raw_text,
+        ocr_text,
+    )
+    flags = []
+    if axis["terms"] >= 64:
+        flags.append("runaway_monotonic_integer_axis")
+    unsupported = repetition["max_unsupported_repeat"]
+    if (
+        unsupported
+        and unsupported["nonoverlap_occurrences"] >= 3
+    ):
+        flags.append("unsupported_long_span_repetition")
+    if (
+        table["expected_caption_labels"]
+        and table["missing_caption_fraction"] >= 0.5
+        and table["raw_token_multiset_recall"] < 0.5
+        and table["markdown_raw_word_ratio"] < 0.5
+    ):
+        flags.append("premature_table_truncation")
+    return {
+        "schema_version": 1,
+        "status": "fail" if flags else "pass",
+        "flags": flags,
+        "thresholds": {
+            "axis_min_terms": 64,
+            "axis_max_gap_chars": 64,
+            "repeat_min_occurrences": 3,
+            "repeat_span_words": 50,
+            "repeat_support_ngram_words": 5,
+            "repeat_max_evidence_coverage": 0.2,
+            "table_min_missing_caption_fraction": 0.5,
+            "table_max_raw_token_recall": 0.5,
+            "table_max_markdown_raw_word_ratio": 0.5,
+        },
+        "axis": axis,
+        "repetition": repetition,
+        "table_completion": table,
+    }
+
+
+def _json_safe(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Enum):
+        return _json_safe(value.value)
+    if is_dataclass(value):
+        return _json_safe(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_json_safe(item) for item in value), key=repr)
+    return repr(value)
+
+
+def sampling_params_metadata(sampling_params) -> dict:
+    field_names = getattr(sampling_params, "__struct_fields__", None)
+    if field_names:
+        return {
+            name: _json_safe(getattr(sampling_params, name))
+            for name in field_names
+        }
+    try:
+        values = vars(sampling_params)
+    except TypeError:
+        return {"repr": repr(sampling_params)}
+    return _json_safe(values)
+
+
+def sampling_params_with_minimum_window(
+    sampling_params,
+    minimum_window_size: int,
+):
+    clone = getattr(sampling_params, "clone", None)
+    if callable(clone):
+        updated = clone()
+    else:
+        updated = copy.deepcopy(sampling_params)
+    extra_args = dict(getattr(updated, "extra_args", None) or {})
+    extra_args["window_size"] = max(
+        int(extra_args.get("window_size") or 0),
+        minimum_window_size,
+    )
+    updated.extra_args = extra_args
+    return updated
+
+
+def _package_version(name: str) -> str | None:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _poppler_version() -> str | None:
+    executable = shutil.which("pdftoppm")
+    if not executable:
+        return None
+    try:
+        completed = subprocess.run(
+            [executable, "-v"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    output = "\n".join((completed.stdout, completed.stderr))
+    match = re.search(r"\bversion\s+([^\s]+)", output)
+    return match.group(1) if match else None
+
+
+def resolve_model_metadata(
+    model: str,
+    revision: str | None = None,
+) -> dict:
+    resolved_path = None
+    if os.path.exists(model):
+        resolved_path = os.path.realpath(model)
+    else:
+        try:
+            from huggingface_hub import snapshot_download
+
+            resolved_path = snapshot_download(
+                repo_id=model,
+                revision=revision,
+                local_files_only=True,
+            )
+        except Exception:
+            resolved_path = None
+    snapshot = None
+    if resolved_path:
+        normalized = resolved_path.replace(os.sep, "/")
+        match = re.search(r"/snapshots/([^/]+)(?:/|$)", normalized)
+        if match:
+            snapshot = match.group(1)
+    return {
+        "requested": model,
+        "revision": revision,
+        "resolved_path": resolved_path,
+        "snapshot": snapshot,
+    }
+
+
+def selected_attention_backend(llm) -> str | None:
+    try:
+        from vllm.config import set_current_vllm_config
+        from vllm.v1.attention.selector import get_attn_backend
+
+        vllm_config = llm.llm_engine.vllm_config
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        with set_current_vllm_config(vllm_config):
+            backend = get_attn_backend(
+                head_size=model_config.get_head_size(),
+                dtype=model_config.dtype,
+                kv_cache_dtype=(
+                    cache_config.cache_dtype if cache_config else None
+                ),
+                use_mla=model_config.use_mla,
+                num_heads=model_config.get_num_attention_heads(
+                    vllm_config.parallel_config
+                ),
+            )
+        return backend.get_name()
+    except Exception:
+        return None
+
+
+def engine_metadata(
+    llm,
+    *,
+    model: str,
+    model_revision: str | None,
+    requested_attention_backend: str | None,
+    requested_mm_encoder_attn_backend: str | None,
+) -> dict:
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - vLLM requires torch
+        torch = None
+    try:
+        import vllm
+    except ImportError:  # pragma: no cover - caller already imported vLLM
+        vllm = None
+    configured_backend = None
+    try:
+        configured_backend = (
+            llm.llm_engine.vllm_config.attention_config.backend
+        )
+        configured_backend = getattr(
+            configured_backend,
+            "name",
+            configured_backend,
+        )
+    except Exception:
+        configured_backend = None
+    return {
+        "model": resolve_model_metadata(model, model_revision),
+        "runtime": {
+            "python": platform.python_version(),
+            "torch": getattr(torch, "__version__", None),
+            "torch_cuda": getattr(
+                getattr(torch, "version", None),
+                "cuda",
+                None,
+            ),
+            "vllm": getattr(vllm, "__version__", None),
+            "transformers": _package_version("transformers"),
+            "tokenizers": _package_version("tokenizers"),
+            "pillow": _package_version("pillow"),
+            "poppler": _poppler_version(),
+            "attention_backend_requested": (
+                requested_attention_backend or configured_backend
+            ),
+            "attention_backend_selected": selected_attention_backend(llm),
+            "mm_encoder_attention_backend_requested": (
+                requested_mm_encoder_attn_backend
+            ),
+            "vllm_batch_invariant": os.environ.get(
+                "VLLM_BATCH_INVARIANT",
+                "0",
+            ),
+        },
+    }
 
 
 def collect_ocr_scan_results(
@@ -476,6 +1152,7 @@ class DeepSeekOcrOfflineProcessor:
         self,
         *,
         model: str,
+        model_revision: str | None = DEFAULT_OCR_MODEL_REVISION,
         output_format: str,
         prompt: str | None = None,
         prompt_mode: str | None = None,
@@ -495,13 +1172,14 @@ class DeepSeekOcrOfflineProcessor:
         temperature: float = 0.0,
         max_tokens: int = 8192,
         ngram_size: int = 10,
-        window_size: int = 50,
+        window_size: int = DEFAULT_OCR_WINDOW_SIZE,
         whitelist_token_ids: list[int] | None = None,
         no_tqdm: bool = False,
         out: Callable[[str], None] | None = None,
         verbose: Callable[[str], None] | None = None,
     ) -> None:
         self.model = model
+        self.model_revision = model_revision
         self.output_format = output_format
         self.prompt = prompt
         self.prompt_mode = prompt_mode
@@ -530,6 +1208,8 @@ class DeepSeekOcrOfflineProcessor:
         self._out = out
         self._verbose = verbose
         self._tqdm = None
+        self.generation_metadata: dict[str, dict] = {}
+        self._engine_metadata: dict = {}
 
     def prepare_engine(self):
         return self._build_llm_and_params()
@@ -620,6 +1300,7 @@ class DeepSeekOcrOfflineProcessor:
             "logits_processors": [NGramPerReqLogitsProcessor],
             "trust_remote_code": True,
         }
+        self._maybe_add(llm_kwargs, "revision", self.model_revision)
         self._maybe_add(
             llm_kwargs,
             "enable_chunked_prefill",
@@ -679,6 +1360,15 @@ class DeepSeekOcrOfflineProcessor:
         elif "extra_args" in inspect.signature(SamplingParams).parameters:
             params["extra_args"] = extra_args
         sampling_params = SamplingParams(**params)
+        self._engine_metadata = engine_metadata(
+            llm,
+            model=self.model,
+            model_revision=self.model_revision,
+            requested_attention_backend=self.attention_backend,
+            requested_mm_encoder_attn_backend=(
+                self.mm_encoder_attn_backend
+            ),
+        )
         return llm, sampling_params
 
     def _resolve_batch_size(self) -> int:
@@ -699,7 +1389,7 @@ class DeepSeekOcrOfflineProcessor:
         batch: list[OcrPageTask],
     ) -> list[str | None]:
         results: list[str | None] = [None] * len(batch)
-        prepared_tasks: list[tuple[int, OcrPageTask]] = []
+        prepared_tasks: list[tuple[int, OcrPageTask, str]] = []
         inputs = []
         images = []
         for index, task in enumerate(batch):
@@ -713,7 +1403,7 @@ class DeepSeekOcrOfflineProcessor:
                 {"prompt": prompt, "multi_modal_data": {"image": image}}
             )
             images.append(image)
-            prepared_tasks.append((index, task))
+            prepared_tasks.append((index, task, prompt))
         if not prepared_tasks:
             return results
         try:
@@ -722,16 +1412,36 @@ class DeepSeekOcrOfflineProcessor:
                 inputs,
                 sampling_params=sampling_params,
             )
-            for (index, _task), output in zip(
+            for (index, task, prompt), output in zip(
                 prepared_tasks,
                 outputs,
                 strict=False,
             ):
-                results[index] = output.outputs[0].text
+                if not output.outputs:
+                    continue
+                completion = output.outputs[0]
+                results[index] = completion.text
+                self.generation_metadata[task.output_path] = (
+                    self._generation_metadata(
+                        task=task,
+                        prompt=prompt,
+                        request_output=output,
+                        completion=completion,
+                        sampling_params=sampling_params,
+                    )
+                )
             return results
         except Exception as exc:
             if len(prepared_tasks) == 1:
-                _index, task = prepared_tasks[0]
+                _index, task, prompt = prepared_tasks[0]
+                self.generation_metadata[task.output_path] = (
+                    self._generation_failure_metadata(
+                        task=task,
+                        prompt=prompt,
+                        sampling_params=sampling_params,
+                        exc=exc,
+                    )
+                )
                 self._log_skip(task, exc, reason="OCR failed")
                 return results
             self._log(
@@ -745,13 +1455,104 @@ class DeepSeekOcrOfflineProcessor:
                     image.close()
                 except Exception:
                     pass
-        for index, task in prepared_tasks:
+        for index, task, _prompt in prepared_tasks:
             results[index] = self._generate_batch_results(
                 llm,
                 sampling_params,
                 [task],
             )[0]
         return results
+
+    def _generation_metadata(
+        self,
+        *,
+        task: OcrPageTask,
+        prompt: str,
+        request_output,
+        completion,
+        sampling_params,
+    ) -> dict:
+        token_ids = list(completion.token_ids or [])
+        prompt_token_ids = list(request_output.prompt_token_ids or [])
+        finish_reason = getattr(completion, "finish_reason", None)
+        stop_reason = getattr(completion, "stop_reason", None)
+        max_tokens = getattr(sampling_params, "max_tokens", None)
+        stopped = finish_reason == "stop"
+        return {
+            "status": "completed",
+            "image": {
+                "path": task.image_path,
+                "sha256": file_sha256(task.image_path),
+                "dimensions": ocr_image_dims(task.image_path),
+            },
+            "prompt": prompt,
+            "prompt_mode": self.prompt_mode,
+            "output_format": self.output_format,
+            **self._engine_metadata,
+            "sampling_params": sampling_params_metadata(sampling_params),
+            "logits_processor_extra_args": _json_safe(
+                getattr(sampling_params, "extra_args", None)
+            ),
+            "request_id": getattr(request_output, "request_id", None),
+            "prompt_token_count": len(prompt_token_ids),
+            "prompt_token_ids_sha256": hashlib.sha256(
+                json.dumps(prompt_token_ids, separators=(",", ":")).encode(
+                    "ascii"
+                )
+            ).hexdigest(),
+            "generated_token_count": len(token_ids),
+            "generated_token_ids_sha256": hashlib.sha256(
+                json.dumps(token_ids, separators=(",", ":")).encode("ascii")
+            ).hexdigest(),
+            "finish_reason": finish_reason,
+            "stop_reason": _json_safe(stop_reason),
+            "termination": {
+                "eos": stopped and stop_reason is None,
+                "length": finish_reason == "length",
+                "max_tokens": (
+                    max_tokens is not None
+                    and len(token_ids) >= max_tokens
+                ),
+            },
+            "repetition": {
+                "tokens": token_repetition_metrics(token_ids),
+                "longest_monotonic_integer_run": monotonic_integer_run(
+                    completion.text
+                ),
+                "repeated_long_block": repeated_long_block_metrics(
+                    completion.text
+                ),
+            },
+        }
+
+    def _generation_failure_metadata(
+        self,
+        *,
+        task: OcrPageTask,
+        prompt: str,
+        sampling_params,
+        exc: Exception,
+    ) -> dict:
+        return {
+            "status": "error",
+            "image": {
+                "path": task.image_path,
+                "sha256": file_sha256(task.image_path),
+                "dimensions": ocr_image_dims(task.image_path),
+            },
+            "prompt": prompt,
+            "prompt_mode": self.prompt_mode,
+            "output_format": self.output_format,
+            **self._engine_metadata,
+            "sampling_params": sampling_params_metadata(sampling_params),
+            "logits_processor_extra_args": _json_safe(
+                getattr(sampling_params, "extra_args", None)
+            ),
+            "error": {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            },
+        }
 
     def _open_image(self, path: str):
         try:
