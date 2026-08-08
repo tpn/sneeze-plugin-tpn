@@ -5,12 +5,14 @@ import hashlib
 import importlib
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import re
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -22,6 +24,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .ocr_path_security import TrustedPathError, prepare_private_directory
+from .ocr_process_lifecycle import isolated_subprocess_signal_guard
 from .ocr_vllm import (
     analyze_markdown_quality,
     file_sha256,
@@ -44,10 +48,25 @@ _PROTOCOL_ARGUMENTS = (
     *_BASE_PROTOCOL_ARGUMENTS,
     *_EXTERNAL_PROTOCOL_ARGUMENTS,
 )
-PROTECTED_CORPUS_ROOTS = (
-    Path("/home/trentn/src/cuphoton-papers/papers"),
-    Path("/home/trentn/src/astropies/papers"),
+_GIT_PROVENANCE_PATHS = (
+    "src",
+    "tests",
+    "benchmarks",
+    ".gitignore",
+    "AGENTS.md",
+    "README.md",
+    "environment-ocr.yml",
+    "pyproject.toml",
 )
+_SOURCE_TREE_CACHE_DIRECTORIES = frozenset(
+    {
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "__pycache__",
+    }
+)
+_SOURCE_TREE_CACHE_SUFFIXES = frozenset({".pyc", ".pyo"})
 _SECRET_ENV_RE = re.compile(
     r"(?:AUTH|COOKIE|CREDENTIAL|KEY|PASS(?:WORD)?|SECRET|TOKEN)",
     re.IGNORECASE,
@@ -115,6 +134,8 @@ _PROVIDER_SPEC_KEYS = frozenset(
 )
 _SECRET_VALUE_RES = (
     re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bhf_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bBearer\s+\S+", re.IGNORECASE),
     re.compile(r"-----BEGIN [A-Z ]+ PRIVATE KEY-----"),
     re.compile(r"https?://[^/@\s:]+:[^/@\s]+@", re.IGNORECASE),
@@ -128,6 +149,7 @@ _ALLOWED_METRICS = frozenset(
     {
         "quality.axis.terms",
         "quality.table_completion.raw_token_multiset_recall",
+        "quality.table_completion.grounded_ocr_token_multiset_recall",
         "quality.table_completion.markdown_raw_word_ratio",
         "quality.table_completion.nonblank_lines",
         "quality.table_completion.pipe_table_rows",
@@ -147,12 +169,33 @@ class BenchmarkError(ValueError):
     """Raised when a benchmark input or provider response is unsafe."""
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise BenchmarkError("duplicate JSON field")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON number is not allowed: {value}")
+
+
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number is not allowed: {value}")
+    return parsed
+
+
 def _json_bytes(value: Any) -> bytes:
     return json.dumps(
         value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
 
 
@@ -185,7 +228,12 @@ def _resolve_source_path(
 
 def _decode_json(payload: bytes, path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(payload)
+        value = json.loads(
+            payload,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+            parse_float=_parse_finite_json_float,
+        )
     except ValueError as exc:
         raise BenchmarkError(
             f"Could not read JSON from {path}: {exc}"
@@ -203,7 +251,14 @@ def _read_json(path: str | os.PathLike[str]) -> dict[str, Any]:
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="") as handle:
-        json.dump(value, handle, indent=2, ensure_ascii=False, sort_keys=True)
+        json.dump(
+            value,
+            handle,
+            indent=2,
+            ensure_ascii=False,
+            sort_keys=True,
+            allow_nan=False,
+        )
         handle.write("\n")
 
 
@@ -225,7 +280,12 @@ def _decode_jsonl(payload: bytes, path: Path) -> list[dict[str, Any]]:
         if not line.strip():
             continue
         try:
-            value = json.loads(line)
+            value = json.loads(
+                line,
+                object_pairs_hook=_unique_json_object,
+                parse_constant=_reject_json_constant,
+                parse_float=_parse_finite_json_float,
+            )
         except ValueError as exc:
             raise BenchmarkError(
                 f"Invalid JSON at {path}:{line_number}: {exc}"
@@ -406,6 +466,18 @@ def load_manifest(
 def _validate_assertion(assertion: Any, label: str) -> None:
     if not isinstance(assertion, dict):
         raise BenchmarkError(f"{label} must be an object")
+    lanes = assertion.get("lanes")
+    if lanes is not None:
+        if (
+            not isinstance(lanes, list)
+            or not lanes
+            or len(lanes) != len(set(lanes))
+        ):
+            raise BenchmarkError(
+                f"{label}.lanes must be a nonempty unique list"
+            )
+        for index, lane in enumerate(lanes, 1):
+            _safe_component(lane, f"{label}.lanes[{index}]")
     kind = assertion.get("type") or assertion.get("kind")
     if kind == "quality_status":
         expected = assertion.get("equals", assertion.get("value", "pass"))
@@ -441,9 +513,7 @@ def _validate_assertion(assertion: Any, label: str) -> None:
     if "min" not in assertion and "max" not in assertion:
         raise BenchmarkError(f"{label} must specify min and/or max")
     for bound in ("min", "max"):
-        if bound in assertion and not isinstance(
-            assertion[bound], (int, float)
-        ):
+        if bound in assertion and not _is_finite_number(assertion[bound]):
             raise BenchmarkError(f"{label}.{bound} must be numeric")
 
 
@@ -486,6 +556,8 @@ def load_provider_spec(
         raise BenchmarkError(
             "provider argv cannot contain credential-bearing options or URLs"
         )
+    for index, argument in enumerate(argv):
+        _reject_embedded_secret_material(argument, f"provider argv[{index}]")
     executable = Path(argv[0]).expanduser()
     if not executable.is_absolute():
         raise BenchmarkError("provider argv[0] must be an absolute path")
@@ -599,6 +671,8 @@ def load_provider_spec(
             "provider env must map valid environment names to "
             "NUL-free strings"
         )
+    for name, value in overrides.items():
+        _reject_embedded_secret_material(value, f"provider env.{name}")
     secret_overrides = [
         key for key in overrides if _SECRET_ENV_RE.search(key)
     ]
@@ -638,7 +712,7 @@ def _is_within(path: Path, root: Path) -> bool:
     return True
 
 
-def _validate_destination(input_root: Path, dest_dir: Path) -> None:
+def _validate_destination(input_root: Path, dest_dir: Path) -> Path:
     resolved_input = input_root.resolve()
     resolved_dest = dest_dir.resolve()
     if _is_within(resolved_dest, resolved_input) or _is_within(
@@ -647,17 +721,14 @@ def _validate_destination(input_root: Path, dest_dir: Path) -> None:
         raise BenchmarkError(
             "Benchmark destination must be separate from the input root"
         )
-    for protected in PROTECTED_CORPUS_ROOTS:
-        if _is_within(resolved_dest, protected.resolve()):
-            raise BenchmarkError(
-                "Refusing benchmark output inside canonical corpus: "
-                f"{protected}"
-            )
-    if dest_dir.exists():
-        if not dest_dir.is_dir():
-            raise BenchmarkError("Benchmark destination is not a directory")
-        if any(dest_dir.iterdir()):
-            raise BenchmarkError("Benchmark destination must be empty")
+    try:
+        return prepare_private_directory(
+            dest_dir,
+            label="benchmark destination",
+            require_empty=True,
+        )
+    except TrustedPathError as exc:
+        raise BenchmarkError(str(exc)) from exc
 
 
 def _png_dimensions(path: Path) -> dict[str, int] | None:
@@ -692,7 +763,7 @@ def prepare_run(
     dest_path = Path(dest_dir).expanduser()
     if not input_path.is_dir():
         raise BenchmarkError(f"Input root does not exist: {input_path}")
-    _validate_destination(input_path, dest_path)
+    dest_path = _validate_destination(input_path, dest_path)
 
     prepared = []
     for case in manifest:
@@ -762,7 +833,6 @@ def prepare_run(
             }
         )
 
-    dest_path.mkdir(parents=True, exist_ok=True)
     inputs = dest_path / "inputs"
     for item in prepared:
         case = item["case"]
@@ -856,6 +926,7 @@ def evaluate_assertions(
     *,
     raw_text: str | None = None,
     grounded_ocr_text: str | None = None,
+    lane: str | None = None,
 ) -> list[dict[str, Any]]:
     if assertions is None:
         assertions = quality_or_assertions
@@ -871,6 +942,9 @@ def evaluate_assertions(
     context = {"quality": quality}
     outcomes = []
     for assertion in assertions:
+        lanes = assertion.get("lanes")
+        if isinstance(lanes, list) and lane not in lanes:
+            continue
         kind = assertion.get("type") or assertion.get("kind")
         if kind == "quality_status":
             expected = assertion.get("equals", assertion.get("value", "pass"))
@@ -1272,6 +1346,17 @@ def _terminate_process_group(
         pass
 
 
+def _terminate_and_reap_provider_process(
+    process: subprocess.Popen,
+) -> None:
+    _terminate_process_group(process.pid)
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        _terminate_process_group(process.pid, grace_seconds=0)
+        process.wait()
+
+
 def _run_provider_process(
     argv: list[str],
     *,
@@ -1281,29 +1366,60 @@ def _run_provider_process(
     stderr_handle,
     timeout_seconds: int,
 ) -> tuple[int, str | None]:
-    try:
-        process = subprocess.Popen(
+    with isolated_subprocess_signal_guard() as lifecycle:
+        return _run_provider_process_guarded(
             argv,
             cwd=cwd,
-            env=environment,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            start_new_session=True,
+            environment=environment,
+            stdout_handle=stdout_handle,
+            stderr_handle=stderr_handle,
+            timeout_seconds=timeout_seconds,
+            lifecycle=lifecycle,
         )
-    except OSError as exc:
-        return 127, f"could not execute provider: {exc}"
+
+
+def _run_provider_process_guarded(
+    argv: list[str],
+    *,
+    cwd: str | None,
+    environment: dict[str, str],
+    stdout_handle,
+    stderr_handle,
+    timeout_seconds: int,
+    lifecycle: Any,
+) -> tuple[int, str | None]:
+    process: subprocess.Popen | None = None
     try:
-        returncode = process.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        _terminate_process_group(process.pid)
         try:
-            process.wait(timeout=2)
+            with lifecycle.spawn_window():
+                process = subprocess.Popen(
+                    argv,
+                    cwd=cwd,
+                    env=environment,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    start_new_session=True,
+                )
+        except OSError as exc:
+            return 127, f"could not execute provider: {exc}"
+        assert process is not None
+        try:
+            returncode = lifecycle.wait(
+                process,
+                timeout_seconds=timeout_seconds,
+            )
         except subprocess.TimeoutExpired:
-            _terminate_process_group(process.pid, grace_seconds=0)
-            process.wait()
-        return 124, f"provider timed out after {timeout_seconds} seconds"
-    _terminate_process_group(process.pid)
-    return returncode, None
+            return 124, (
+                f"provider timed out after {timeout_seconds} seconds"
+            )
+        return returncode, None
+    finally:
+        # Cleanup remains inside the passive guard and is unconditional:
+        # normal providers can leave helpers, and failures can occur anywhere
+        # after the private process group is created.
+        with lifecycle.cleanup_window():
+            if process is not None:
+                _terminate_and_reap_provider_process(process)
 
 
 def _is_nonnegative_integer(value: Any) -> bool:
@@ -1314,12 +1430,17 @@ def _is_nonnegative_integer(value: Any) -> bool:
     )
 
 
+def _is_finite_number(value: Any) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def _is_nonnegative_number(value: Any) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and value >= 0
-    )
+    return _is_finite_number(value) and value >= 0
 
 
 def _provider_metadata_gaps(
@@ -1535,6 +1656,7 @@ def _result_for_response(
         case["assertions"],
         raw_text=raw_text,
         grounded_ocr_text=grounded,
+        lane=request["lane"],
     )
     metadata_gaps = []
     if response is None:
@@ -1555,6 +1677,7 @@ def _result_for_response(
         status == "completed"
         and not response_error
         and not metadata_gaps
+        and bool(assertion_outcomes)
         and all(outcome["passed"] for outcome in assertion_outcomes)
     )
     output_sha256 = _sha256_text(output_text)
@@ -1765,24 +1888,157 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _git_metadata(path: Path) -> dict[str, Any]:
-    values = {}
-    for key, args in (
-        ("sha", ["rev-parse", "HEAD"]),
-        ("branch", ["branch", "--show-current"]),
-        ("status", ["status", "--short", "--branch"]),
-    ):
+def _git_probe_environment() -> dict[str, str]:
+    return {
+        "PATH": os.defpath,
+        "LC_ALL": "C",
+        "TZ": "UTC",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+
+def _git_repository_context(path: Path) -> dict[str, Any]:
+    declared_root = path.resolve(strict=True)
+    environment = _git_probe_environment()
+    try:
         completed = subprocess.run(
-            ["git", *args],
-            cwd=path,
+            [
+                "git",
+                "--no-pager",
+                "-c",
+                "core.fsmonitor=false",
+                "rev-parse",
+                "--show-toplevel",
+            ],
+            cwd=declared_root,
+            env=environment,
             check=False,
             capture_output=True,
             text=True,
         )
+    except OSError:
+        return {
+            "available": False,
+            "root": declared_root,
+            "environment": environment,
+            "unavailable_reason": "git_probe_launch_failed",
+        }
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return {
+            "available": False,
+            "root": declared_root,
+            "environment": environment,
+            "unavailable_reason": "git_toplevel_unavailable",
+        }
+    try:
+        discovered_root = Path(completed.stdout.strip()).resolve(strict=True)
+    except OSError:
+        discovered_root = None
+    if discovered_root != declared_root:
+        return {
+            "available": False,
+            "root": declared_root,
+            "environment": environment,
+            "unavailable_reason": "git_toplevel_mismatch",
+        }
+    return {
+        "available": True,
+        "root": declared_root,
+        "environment": environment,
+        "unavailable_reason": None,
+    }
+
+
+def _run_git_probe(
+    context: dict[str, Any],
+    args: list[str],
+    *,
+    text: bool,
+) -> subprocess.CompletedProcess:
+    if context.get("available") is not True:
+        raise BenchmarkError("Git probe requires an exact repository root")
+    try:
+        return subprocess.run(
+            [
+                "git",
+                "--no-pager",
+                "-c",
+                "core.fsmonitor=false",
+                *args,
+            ],
+            cwd=context["root"],
+            env=context["environment"],
+            check=False,
+            capture_output=True,
+            text=text,
+        )
+    except OSError:
+        raise BenchmarkError(
+            "Git provenance probe could not be launched"
+        ) from None
+
+
+def _git_metadata(
+    path: Path,
+    *,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    git_context = context or _git_repository_context(path)
+    if git_context.get("available") is not True:
+        return {
+            "available": False,
+            "unavailable_reason": git_context.get("unavailable_reason"),
+            "sha": None,
+            "branch": None,
+            "status": None,
+        }
+    values: dict[str, Any] = {
+        "available": True,
+        "unavailable_reason": None,
+        "status": None,
+    }
+    for key, args in (
+        ("sha", ["rev-parse", "HEAD"]),
+        ("branch", ["branch", "--show-current"]),
+    ):
+        completed = _run_git_probe(git_context, args, text=True)
         values[key] = (
             completed.stdout.strip() if completed.returncode == 0 else None
         )
     return values
+
+
+def _snapshot_git_diff(
+    evidence_root: Path,
+    *,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    diff_path = evidence_root / "harness" / "git-diff.patch"
+    diff_path.parent.mkdir(parents=True, exist_ok=True)
+    # Git worktree operations can invoke repository-configured clean/process
+    # filters through .gitattributes.  Do not execute them in an evidence
+    # collection path.  The deterministic raw source-tree snapshot below
+    # binds tracked, dirty, ignored, and untracked in-scope files instead.
+    payload = b""
+    available = False
+    unavailable_reason = (
+        "working_tree_git_diff_disabled"
+        if context.get("available") is True
+        else context.get("unavailable_reason")
+    )
+    returncode: int | None = None
+    diff_path.write_bytes(payload)
+    return {
+        "available": available,
+        "unavailable_reason": unavailable_reason,
+        "evidence_path": str(diff_path.relative_to(evidence_root)),
+        "returncode": returncode,
+        "size_bytes": diff_path.stat().st_size,
+        "sha256": file_sha256(str(diff_path)),
+    }
 
 
 def _argv_file_metadata(
@@ -1877,12 +2133,185 @@ def _snapshot_file(
     }
 
 
+def _scoped_source_files(root: Path) -> list[Path]:
+    resolved_root = root.resolve(strict=True)
+    files: list[Path] = []
+
+    def visit(path: Path) -> None:
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise BenchmarkError(
+                "source-tree evidence changed during enumeration"
+            ) from exc
+        relative = path.relative_to(resolved_root)
+        mode = metadata.st_mode
+        if stat.S_ISLNK(mode):
+            raise BenchmarkError(
+                "source-tree evidence contains an unsafe symlink: "
+                + relative.as_posix()
+            )
+        if stat.S_ISREG(mode):
+            if path.suffix.casefold() not in _SOURCE_TREE_CACHE_SUFFIXES:
+                files.append(path)
+            return
+        if stat.S_ISDIR(mode):
+            if path.name in _SOURCE_TREE_CACHE_DIRECTORIES:
+                return
+            try:
+                children = sorted(path.iterdir(), key=lambda item: item.name)
+            except OSError as exc:
+                raise BenchmarkError(
+                    "could not enumerate source-tree evidence: "
+                    + relative.as_posix()
+                ) from exc
+            for child in children:
+                visit(child)
+            return
+        raise BenchmarkError(
+            "source-tree evidence contains a special file: "
+            + relative.as_posix()
+        )
+
+    for raw_scope in _GIT_PROVENANCE_PATHS:
+        scope = resolved_root / raw_scope
+        if not os.path.lexists(scope):
+            continue
+        visit(scope)
+    return sorted(
+        files,
+        key=lambda item: item.relative_to(resolved_root).as_posix(),
+    )
+
+
+def _read_stable_source_file(path: Path, *, root: Path) -> bytes:
+    resolved_root = root.resolve(strict=True)
+    try:
+        relative = path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise BenchmarkError("source-tree evidence escaped its root") from exc
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise BenchmarkError(
+                    "source-tree evidence is not a regular file: "
+                    + relative.as_posix()
+                )
+            payload = handle.read()
+            after = os.fstat(handle.fileno())
+        current = path.lstat()
+    except BenchmarkError:
+        raise
+    except OSError as exc:
+        raise BenchmarkError(
+            "could not read source-tree evidence: " + relative.as_posix()
+        ) from exc
+    signatures = {
+        (
+            item.st_dev,
+            item.st_ino,
+            item.st_size,
+            item.st_mtime_ns,
+        )
+        for item in (before, after, current)
+    }
+    if len(signatures) != 1 or len(payload) != before.st_size:
+        raise BenchmarkError(
+            "source-tree evidence changed while being read: "
+            + relative.as_posix()
+        )
+    return payload
+
+
+def _snapshot_source_tree(
+    root: Path,
+    evidence_root: Path,
+) -> dict[str, Any]:
+    resolved_root = root.resolve(strict=True)
+    resolved_evidence = evidence_root.resolve(strict=True)
+    for raw_scope in _GIT_PROVENANCE_PATHS:
+        scope = resolved_root / raw_scope
+        if resolved_evidence == scope or resolved_evidence.is_relative_to(
+            scope
+        ):
+            raise BenchmarkError(
+                "source-tree evidence destination overlaps its source scope"
+            )
+
+    source_files = _scoped_source_files(resolved_root)
+    snapshot_root = evidence_root / "source-tree" / "files"
+    records = []
+    for source in source_files:
+        relative = source.relative_to(resolved_root)
+        payload = _read_stable_source_file(source, root=resolved_root)
+        destination = snapshot_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+        records.append(
+            {
+                "path": relative.as_posix(),
+                "evidence_path": destination.relative_to(
+                    evidence_root
+                ).as_posix(),
+                "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+
+    observed_again = _scoped_source_files(resolved_root)
+    expected_paths = [
+        item.relative_to(resolved_root).as_posix() for item in source_files
+    ]
+    observed_paths = [
+        item.relative_to(resolved_root).as_posix() for item in observed_again
+    ]
+    if observed_paths != expected_paths:
+        raise BenchmarkError(
+            "source-tree evidence changed during snapshot creation"
+        )
+    for source, record in zip(observed_again, records, strict=True):
+        payload = _read_stable_source_file(source, root=resolved_root)
+        if (
+            len(payload) != record["size_bytes"]
+            or hashlib.sha256(payload).hexdigest() != record["sha256"]
+        ):
+            raise BenchmarkError(
+                "source-tree evidence changed during snapshot creation"
+            )
+
+    unsigned = {
+        "schema_version": SCHEMA_VERSION,
+        "scope_paths": list(_GIT_PROVENANCE_PATHS),
+        "excluded_directory_names": sorted(_SOURCE_TREE_CACHE_DIRECTORIES),
+        "excluded_file_suffixes": sorted(_SOURCE_TREE_CACHE_SUFFIXES),
+        "file_count": len(records),
+        "files": records,
+    }
+    inventory = {
+        **unsigned,
+        "aggregate_sha256": _sha256_json(unsigned),
+    }
+    inventory_path = evidence_root / "source-tree" / "inventory.json"
+    _write_json(inventory_path, inventory)
+    return {
+        **inventory,
+        "inventory_evidence_path": inventory_path.relative_to(
+            evidence_root
+        ).as_posix(),
+        "inventory_file_sha256": file_sha256(str(inventory_path)),
+    }
+
+
 def _snapshot_run_evidence(
     dest_path: Path,
     manifest_path: Path,
     provider_spec_path: Path,
     spec: dict[str, Any],
-    repo_root: Path,
+    git_context: dict[str, Any],
     *,
     manifest_source_bytes: bytes,
     provider_spec_source_bytes: bytes,
@@ -1923,34 +2352,51 @@ def _snapshot_run_evidence(
                 Path("harness") / source.name,
             )
         )
-    diff_path = evidence_root / "harness" / "git-diff.patch"
-    completed = subprocess.run(
-        [
-            "git",
-            "diff",
-            "--binary",
-            "HEAD",
-            "--",
-            "src",
-            "tests",
-            "benchmarks",
-        ],
-        cwd=repo_root,
-        check=False,
-        capture_output=True,
-    )
-    diff_path.write_bytes(completed.stdout)
+    git_diff = _snapshot_git_diff(evidence_root, context=git_context)
+    source_tree = _snapshot_source_tree(git_context["root"], evidence_root)
     return {
         "manifest": manifest,
         "provider_spec": provider_spec,
         "argv_files": argv_files,
         "harness_files": harness_files,
+        "git_diff": git_diff,
+        "source_tree": source_tree,
+    }
+
+
+def _experiment_identity_payload(
+    *,
+    manifest_file_sha256: str,
+    provider_spec_file_sha256: str,
+    environment: dict[str, str],
+    argv_files: list[dict[str, Any]],
+    harness_files: list[dict[str, Any]],
+    git_metadata: dict[str, Any],
+    git_diff: dict[str, Any],
+    source_tree_sha256: str,
+    external_identity: dict[str, Any] | None,
+) -> dict[str, Any]:
+    repository_identity = {
+        "available": git_metadata.get("available"),
+        "unavailable_reason": git_metadata.get("unavailable_reason"),
+        "sha": git_metadata.get("sha"),
         "git_diff": {
-            "evidence_path": str(diff_path.relative_to(evidence_root)),
-            "returncode": completed.returncode,
-            "size_bytes": diff_path.stat().st_size,
-            "sha256": file_sha256(str(diff_path)),
+            "available": git_diff.get("available"),
+            "unavailable_reason": git_diff.get("unavailable_reason"),
+            "returncode": git_diff.get("returncode"),
+            "sha256": git_diff.get("sha256"),
         },
+    }
+    return {
+        "manifest_file_sha256": manifest_file_sha256,
+        "provider_spec_file_sha256": provider_spec_file_sha256,
+        "environment": environment,
+        "argv_files": _argv_file_identity(argv_files),
+        "harness_files": [record["sha256"] for record in harness_files],
+        "git_diff_sha256": git_diff["sha256"],
+        "source_tree_sha256": source_tree_sha256,
+        "repository": repository_identity,
+        "external_identity": external_identity,
     }
 
 
@@ -2131,6 +2577,7 @@ def run_benchmark(
     input_root: str | os.PathLike[str],
     provider_spec_path: str | os.PathLike[str],
     dest_dir: str | os.PathLike[str],
+    expected_provider_spec_file_sha256: str | None = None,
     lanes: list[str] | tuple[str, ...] | None = None,
     repeats: int = 5,
     allow_external: bool = False,
@@ -2138,7 +2585,11 @@ def run_benchmark(
     external_approval_path: str | os.PathLike[str] | None = None,
     out=None,
 ) -> dict[str, Any]:
-    if not isinstance(repeats, int) or repeats <= 0:
+    if (
+        not isinstance(repeats, int)
+        or isinstance(repeats, bool)
+        or repeats <= 0
+    ):
         raise BenchmarkError("repeats must be a positive integer")
     manifest_source = _resolve_source_path(manifest_path, "manifest")
     provider_spec_source = _resolve_source_path(
@@ -2147,6 +2598,24 @@ def run_benchmark(
     )
     manifest_source_bytes = _read_bytes(manifest_source)
     provider_spec_source_bytes = _read_bytes(provider_spec_source)
+    if expected_provider_spec_file_sha256 is not None:
+        if (
+            not isinstance(expected_provider_spec_file_sha256, str)
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", expected_provider_spec_file_sha256
+            )
+        ):
+            raise BenchmarkError(
+                "expected provider specification SHA-256 is invalid"
+            )
+        observed_provider_spec_hash = hashlib.sha256(
+            provider_spec_source_bytes
+        ).hexdigest()
+        if observed_provider_spec_hash != expected_provider_spec_file_sha256:
+            raise BenchmarkError(
+                "provider specification file differs from the caller-bound "
+                "SHA-256"
+            )
     manifest = load_manifest(
         manifest_source,
         _source_bytes=manifest_source_bytes,
@@ -2195,12 +2664,14 @@ def run_benchmark(
     manifest_file_hash = hashlib.sha256(manifest_source_bytes).hexdigest()
     spec_file_hash = hashlib.sha256(provider_spec_source_bytes).hexdigest()
     repo_root = Path(__file__).resolve().parents[3]
+    git_context = _git_repository_context(repo_root)
+    git_metadata = _git_metadata(repo_root, context=git_context)
     evidence = _snapshot_run_evidence(
         dest_path,
         manifest_source,
         provider_spec_source,
         spec,
-        repo_root,
+        git_context,
         manifest_source_bytes=manifest_source_bytes,
         provider_spec_source_bytes=provider_spec_source_bytes,
     )
@@ -2295,27 +2766,18 @@ def run_benchmark(
         provider_environment,
         spec,
     )
-    experiment_hash = _sha256_json(
-        {
-            "manifest_file_sha256": manifest_file_hash,
-            "provider_spec_file_sha256": spec_file_hash,
-            "environment": recorded_environment,
-            "argv_files": [
-                {
-                    "argv_index": record["argv_index"],
-                    "path": record["path"],
-                    "size_bytes": record["size_bytes"],
-                    "sha256": record["sha256"],
-                }
-                for record in evidence["argv_files"]
-            ],
-            "harness_files": [
-                record["sha256"] for record in evidence["harness_files"]
-            ],
-            "git_diff_sha256": evidence["git_diff"]["sha256"],
-            "external_identity": external_identity,
-        }
+    experiment_identity = _experiment_identity_payload(
+        manifest_file_sha256=manifest_file_hash,
+        provider_spec_file_sha256=spec_file_hash,
+        environment=recorded_environment,
+        argv_files=evidence["argv_files"],
+        harness_files=evidence["harness_files"],
+        git_metadata=git_metadata,
+        git_diff=evidence["git_diff"],
+        source_tree_sha256=evidence["source_tree"]["aggregate_sha256"],
+        external_identity=external_identity,
     )
+    experiment_hash = _sha256_json(experiment_identity)
     run_record = {
         "schema_version": SCHEMA_VERSION,
         "started_at": datetime.now(UTC).isoformat(),
@@ -2326,7 +2788,7 @@ def run_benchmark(
         },
         "repository": {
             "root": str(repo_root),
-            **_git_metadata(repo_root),
+            **git_metadata,
         },
         "invocation": list(sys.argv),
         "evidence": evidence,

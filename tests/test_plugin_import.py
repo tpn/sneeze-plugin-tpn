@@ -13,6 +13,132 @@ VALID_PNG_BYTES = base64.b64decode(
 )
 
 
+def _structured_reuse_receipt(profile_id="profile-a"):
+    from sneeze.tpn.ocr_backend_setup import make_receipt
+    from sneeze.tpn.ocr_profiles import get_pipeline_definition
+
+    pipeline = get_pipeline_definition("local-mineru25")
+    profile_sha256 = hashlib.sha256(
+        profile_id.encode("utf-8")
+    ).hexdigest()
+    return make_receipt(
+        "ocr_structured_execution",
+        {
+            "pipeline_id": pipeline["pipeline_id"],
+            "pipeline_definition_sha256": pipeline[
+                "definition_sha256"
+            ],
+            "profile_id": profile_id,
+            "profile_sha256": profile_sha256,
+            "qualification_state": "qualified",
+            "allow_provisional_profile": False,
+            "memory_tier": "max",
+            "memory_budget_bytes": 40 * 1024**3,
+            "reserve_bytes": 2 * 1024**3,
+            "hardware_selector": {
+                "schema_version": 1,
+                "vendor": "nvidia",
+                "product_name": "Synthetic GPU",
+                "pci_device_id": "0x1234",
+                "compute_capability": [9, 0],
+                "memory_model": "dedicated",
+                "total_memory_bytes": 48 * 1024**3,
+            },
+            "match": {
+                "schema_version": 1,
+                "profile_id": profile_id,
+                "pipeline_id": pipeline["pipeline_id"],
+                "memory_tier": "max",
+                "matched": True,
+                "reasons": [],
+                "profile_sha256": profile_sha256,
+            },
+            "stage_settings": {
+                "grounded_ocr": {"batch_size": 1},
+                "markdown": {"batch_size": 1},
+            },
+            "attention_backend": {
+                "requested": "FLASH_ATTN",
+                "qualified_selected": "FLASH_ATTN",
+                "selected_verification": (
+                    "deferred_until_engine_initialization"
+                ),
+            },
+            "installation_record_sha256": {
+                "deepseek-vllm": hashlib.sha256(b"deepseek").hexdigest(),
+                "mineru25-pro-2605": hashlib.sha256(b"mineru").hexdigest(),
+            },
+            "deepseek_snapshot": {
+                "revision": "9" * 40,
+                "files_sha256": hashlib.sha256(b"snapshot").hexdigest(),
+            },
+        },
+    )
+
+
+def _reseal_structured_reuse_receipt(receipt):
+    from sneeze.tpn.ocr_backend_setup import make_receipt
+
+    payload = {
+        key: value
+        for key, value in receipt.items()
+        if key not in {"schema_version", "kind", "receipt_sha256"}
+    }
+    return make_receipt("ocr_structured_execution", payload)
+
+
+def _write_structured_reuse_bundle(tmp_path, receipt, stem="page-1"):
+    pages = tmp_path / "pages"
+    pages.mkdir(exist_ok=True)
+    image_path = pages / f"{stem}.png"
+    ocr_path = pages / f"{stem}.ocr"
+    markdown_path = pages / f"{stem}.md"
+    json_path = pages / f"{stem}.json"
+    image_path.write_bytes(VALID_PNG_BYTES)
+    ocr_path.write_text("grounded evidence\n", encoding="utf-8")
+    markdown_path.write_text("structured markdown\n", encoding="utf-8")
+    image_sha256 = hashlib.sha256(VALID_PNG_BYTES).hexdigest()
+
+    def stage_metadata(output_path):
+        output_sha256 = hashlib.sha256(output_path.read_bytes()).hexdigest()
+        return {
+            "status": "completed",
+            "image": {"sha256": image_sha256},
+            "execution_profile": receipt,
+            "finish_reason": "stop",
+            "termination": {
+                "eos": True,
+                "length": False,
+                "max_tokens": False,
+            },
+            "validation": {"status": "pass", "flags": []},
+            "promotion": {
+                "promoted": True,
+                "candidate_sha256": output_sha256,
+                "persisted_output_sha256": output_sha256,
+            },
+        }
+
+    payload = {
+        "image_sha256": image_sha256,
+        "ocr_text": ocr_path.read_text(encoding="utf-8"),
+        "markdown_text": markdown_path.read_text(encoding="utf-8"),
+        "generation_metadata": {
+            "ocr": stage_metadata(ocr_path),
+            "markdown": stage_metadata(markdown_path),
+        },
+    }
+    json_path.write_text(json.dumps(payload), encoding="utf-8")
+    return {
+        "pages": pages,
+        "image": image_path,
+        "ocr": ocr_path,
+        "markdown": markdown_path,
+        "json": json_path,
+        "payload": payload,
+    }
+
+
 def test_plugin_package_imports():
     import importlib
 
@@ -188,6 +314,43 @@ def test_pdf_to_pages_forwards_shared_renderer_options(
         "record_encrypted_sentinels": True,
         "out": command._out,
     }
+
+
+def test_combined_render_rejects_different_text_source_before_writes(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.command import CommandError
+
+    import sneeze.tpn.commands as commands
+    from sneeze.tpn.commands import OcrPdfPages
+
+    source_dir = tmp_path / "pdfs"
+    dest_dir = tmp_path / "pages"
+    text_source_dir = tmp_path / "stale-text"
+    source_dir.mkdir()
+    text_source_dir.mkdir()
+    called = False
+
+    def unexpected_render(**_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(commands, "_run_pdf_to_pages", unexpected_render)
+    command = OcrPdfPages(None, StringIO(), None)
+    command._source_dir = str(source_dir)
+    command.dest_dir = str(dest_dir)
+    command.text_source_dir = str(text_source_dir)
+    command.pdf_to_pages = True
+
+    with pytest.raises(
+        CommandError,
+        match="--text-source-dir must equal the effective destination",
+    ):
+        command.run()
+
+    assert called is False
+    assert not dest_dir.exists()
 
 
 def test_combined_renderer_does_not_write_source_encrypted_sentinel(
@@ -566,6 +729,362 @@ def test_ocr_full_collection_rechecks_persisted_quality_failure(tmp_path):
     assert items[0].need_json is True
 
 
+def test_structured_full_collection_reuses_exact_provenance(tmp_path):
+    from sneeze.tpn.ocr_vllm import collect_ocr_full_items
+
+    receipt = _structured_reuse_receipt()
+    bundle = _write_structured_reuse_bundle(tmp_path, receipt)
+
+    items, pdf_count = collect_ocr_full_items(
+        source_dir=str(bundle["pages"]),
+        dest_dir=str(bundle["pages"]),
+        text_source_dir=str(bundle["pages"]),
+        force=False,
+        scan_parallelism=1,
+        expected_execution_receipt=receipt,
+    )
+
+    assert pdf_count == 1
+    assert items == []
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "stage"),
+    (
+        ("legacy", "grounded_ocr"),
+        ("profile", "grounded_ocr"),
+        ("image", "grounded_ocr"),
+        ("output_hash", "markdown"),
+    ),
+)
+def test_structured_full_collection_rejects_unproven_reuse(
+    tmp_path,
+    mismatch,
+    stage,
+):
+    from sneeze.tpn.ocr_vllm import (
+        StructuredOutputReuseError,
+        collect_ocr_full_items,
+    )
+
+    receipt = _structured_reuse_receipt()
+    bundle = _write_structured_reuse_bundle(tmp_path, receipt)
+    if mismatch == "legacy":
+        bundle["json"].write_text("{}", encoding="utf-8")
+    elif mismatch == "profile":
+        different = _structured_reuse_receipt("profile-b")
+        for metadata in bundle["payload"]["generation_metadata"].values():
+            metadata["execution_profile"] = different
+        bundle["json"].write_text(
+            json.dumps(bundle["payload"]),
+            encoding="utf-8",
+        )
+    elif mismatch == "image":
+        bundle["payload"]["image_sha256"] = "0" * 64
+        bundle["json"].write_text(
+            json.dumps(bundle["payload"]),
+            encoding="utf-8",
+        )
+    else:
+        bundle["markdown"].write_text(
+            "structured markdown changed\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(StructuredOutputReuseError) as raised:
+        collect_ocr_full_items(
+            source_dir=str(bundle["pages"]),
+            dest_dir=str(bundle["pages"]),
+            text_source_dir=str(bundle["pages"]),
+            force=False,
+            scan_parallelism=1,
+            expected_execution_receipt=receipt,
+        )
+
+    message = str(raised.value)
+    assert str(bundle["json"]) in message
+    assert f"stage {stage}" in message
+    assert "fresh --dest-dir" in message
+    assert "--force" in message
+
+
+def test_structured_full_collection_rejects_reused_stage_in_partial_bundle(
+    tmp_path,
+):
+    from sneeze.tpn.ocr_vllm import (
+        StructuredOutputReuseError,
+        collect_ocr_full_items,
+    )
+
+    receipt = _structured_reuse_receipt()
+    bundle = _write_structured_reuse_bundle(tmp_path, receipt)
+    bundle["ocr"].unlink()
+    bundle["payload"]["generation_metadata"].pop("markdown")
+    bundle["json"].write_text(
+        json.dumps(bundle["payload"]),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(StructuredOutputReuseError, match="stage markdown"):
+        collect_ocr_full_items(
+            source_dir=str(bundle["pages"]),
+            dest_dir=str(bundle["pages"]),
+            text_source_dir=str(bundle["pages"]),
+            force=False,
+            scan_parallelism=1,
+            expected_execution_receipt=receipt,
+        )
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+def test_structured_full_collection_explicit_regeneration_bypasses_reuse(
+    tmp_path,
+    refresh,
+):
+    from sneeze.tpn.ocr_vllm import collect_ocr_full_items
+
+    receipt = _structured_reuse_receipt()
+    bundle = _write_structured_reuse_bundle(tmp_path, receipt)
+    bundle["json"].write_text("{}", encoding="utf-8")
+
+    items, _pdf_count = collect_ocr_full_items(
+        source_dir=str(bundle["pages"]),
+        dest_dir=str(bundle["pages"]),
+        text_source_dir=str(bundle["pages"]),
+        force=not refresh,
+        refresh_image_paths=(str(bundle["image"]),) if refresh else None,
+        scan_parallelism=1,
+        expected_execution_receipt=receipt,
+    )
+
+    assert len(items) == 1
+    assert items[0].need_ocr is True
+    assert items[0].need_markdown is True
+    assert items[0].need_json is True
+
+
+def test_structured_full_collection_rejects_noncanonical_receipt(tmp_path):
+    from sneeze.tpn.ocr_vllm import (
+        StructuredOutputReuseError,
+        collect_ocr_full_items,
+    )
+
+    receipt = _structured_reuse_receipt()
+    bundle = _write_structured_reuse_bundle(tmp_path, receipt)
+    invalid_receipt = {**receipt, "profile_id": "tampered"}
+
+    with pytest.raises(
+        StructuredOutputReuseError,
+        match="selected execution receipt is invalid",
+    ):
+        collect_ocr_full_items(
+            source_dir=str(bundle["pages"]),
+            dest_dir=str(bundle["pages"]),
+            text_source_dir=str(bundle["pages"]),
+            force=False,
+            scan_parallelism=1,
+            expected_execution_receipt=invalid_receipt,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("finish_reason", "length"), ("termination.length", True)),
+)
+def test_structured_full_collection_rejects_contradictory_termination(
+    tmp_path,
+    field,
+    value,
+):
+    from sneeze.tpn.ocr_vllm import (
+        StructuredOutputReuseError,
+        collect_ocr_full_items,
+    )
+
+    receipt = _structured_reuse_receipt()
+    bundle = _write_structured_reuse_bundle(tmp_path, receipt)
+    metadata = bundle["payload"]["generation_metadata"]["ocr"]
+    if field == "finish_reason":
+        metadata[field] = value
+    else:
+        metadata["termination"]["length"] = value
+    bundle["json"].write_text(
+        json.dumps(bundle["payload"]), encoding="utf-8"
+    )
+
+    with pytest.raises(
+        StructuredOutputReuseError,
+        match="stage grounded_ocr",
+    ):
+        collect_ocr_full_items(
+            source_dir=str(bundle["pages"]),
+            dest_dir=str(bundle["pages"]),
+            text_source_dir=str(bundle["pages"]),
+            force=False,
+            scan_parallelism=1,
+            expected_execution_receipt=receipt,
+        )
+
+
+@pytest.mark.parametrize("candidate", [None, "0" * 64])
+def test_structured_full_collection_rejects_candidate_digest_drift(
+    tmp_path,
+    candidate,
+):
+    from sneeze.tpn.ocr_vllm import (
+        StructuredOutputReuseError,
+        collect_ocr_full_items,
+    )
+
+    receipt = _structured_reuse_receipt()
+    bundle = _write_structured_reuse_bundle(tmp_path, receipt)
+    promotion = bundle["payload"]["generation_metadata"]["ocr"][
+        "promotion"
+    ]
+    if candidate is None:
+        promotion.pop("candidate_sha256")
+    else:
+        promotion["candidate_sha256"] = candidate
+    bundle["json"].write_text(
+        json.dumps(bundle["payload"]), encoding="utf-8"
+    )
+
+    with pytest.raises(
+        StructuredOutputReuseError,
+        match="promoted output hash",
+    ):
+        collect_ocr_full_items(
+            source_dir=str(bundle["pages"]),
+            dest_dir=str(bundle["pages"]),
+            text_source_dir=str(bundle["pages"]),
+            force=False,
+            scan_parallelism=1,
+            expected_execution_receipt=receipt,
+        )
+
+
+@pytest.mark.parametrize("bundle_text", [None, "stale markdown\n"])
+def test_structured_full_collection_rejects_missing_or_stale_bundle_text(
+    tmp_path,
+    bundle_text,
+):
+    from sneeze.tpn.ocr_vllm import (
+        StructuredOutputReuseError,
+        collect_ocr_full_items,
+    )
+
+    receipt = _structured_reuse_receipt()
+    bundle = _write_structured_reuse_bundle(tmp_path, receipt)
+    if bundle_text is None:
+        bundle["payload"].pop("markdown_text")
+    else:
+        bundle["payload"]["markdown_text"] = bundle_text
+    bundle["json"].write_text(
+        json.dumps(bundle["payload"]), encoding="utf-8"
+    )
+
+    with pytest.raises(
+        StructuredOutputReuseError,
+        match="stage markdown.*bundle markdown_text",
+    ):
+        collect_ocr_full_items(
+            source_dir=str(bundle["pages"]),
+            dest_dir=str(bundle["pages"]),
+            text_source_dir=str(bundle["pages"]),
+            force=False,
+            scan_parallelism=1,
+            expected_execution_receipt=receipt,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    (
+        ("missing_pipeline", None),
+        ("pipeline_id", "deepseek-vllm-full"),
+        ("profile_id", ""),
+        ("pipeline_definition_sha256", "0" * 64),
+    ),
+)
+def test_structured_full_collection_rejects_incomplete_validly_hashed_receipt(
+    tmp_path,
+    mutation,
+    value,
+):
+    from sneeze.tpn.ocr_vllm import (
+        StructuredOutputReuseError,
+        collect_ocr_full_items,
+    )
+
+    receipt = _structured_reuse_receipt()
+    bundle = _write_structured_reuse_bundle(tmp_path, receipt)
+    mutated = dict(receipt)
+    if mutation == "missing_pipeline":
+        mutated.pop("pipeline_id")
+    else:
+        mutated[mutation] = value
+    mutated = _reseal_structured_reuse_receipt(mutated)
+
+    with pytest.raises(
+        StructuredOutputReuseError,
+        match="selected execution receipt is invalid",
+    ):
+        collect_ocr_full_items(
+            source_dir=str(bundle["pages"]),
+            dest_dir=str(bundle["pages"]),
+            text_source_dir=str(bundle["pages"]),
+            force=False,
+            scan_parallelism=1,
+            expected_execution_receipt=mutated,
+        )
+
+
+def test_structured_full_collection_propagates_parallel_reuse_error(tmp_path):
+    from sneeze.tpn.ocr_vllm import (
+        StructuredOutputReuseError,
+        collect_ocr_full_items,
+    )
+
+    receipt = _structured_reuse_receipt()
+    first = _write_structured_reuse_bundle(tmp_path, receipt)
+    second = _write_structured_reuse_bundle(tmp_path, receipt, stem="page-2")
+    second["payload"]["markdown_text"] = "stale markdown\n"
+    second["json"].write_text(
+        json.dumps(second["payload"]), encoding="utf-8"
+    )
+
+    with pytest.raises(
+        StructuredOutputReuseError,
+        match="page-2.json stage markdown",
+    ):
+        collect_ocr_full_items(
+            source_dir=str(first["pages"]),
+            dest_dir=str(first["pages"]),
+            text_source_dir=str(first["pages"]),
+            force=False,
+            scan_parallelism=2,
+            expected_execution_receipt=receipt,
+        )
+
+
+def test_unstructured_full_collection_preserves_legacy_reuse(tmp_path):
+    from sneeze.tpn.ocr_vllm import collect_ocr_full_items
+
+    receipt = _structured_reuse_receipt()
+    bundle = _write_structured_reuse_bundle(tmp_path, receipt)
+    bundle["json"].write_text("{}", encoding="utf-8")
+
+    items, _pdf_count = collect_ocr_full_items(
+        source_dir=str(bundle["pages"]),
+        dest_dir=str(bundle["pages"]),
+        text_source_dir=str(bundle["pages"]),
+        force=False,
+        scan_parallelism=1,
+    )
+
+    assert items == []
+
+
 def test_bundle_recheck_preserves_existing_generation_metadata(tmp_path):
     from sneeze.tpn.ocr_vllm import OcrFullItem, write_ocr_page_bundle
 
@@ -578,11 +1097,7 @@ def test_bundle_recheck_preserves_existing_generation_metadata(tmp_path):
     markdown_path.write_text("markdown", encoding="utf-8")
     json_path.write_text(
         json.dumps(
-            {
-                "generation_metadata": {
-                    "markdown": {"request_id": "preserved"}
-                }
-            }
+            {"generation_metadata": {"markdown": {"request_id": "preserved"}}}
         ),
         encoding="utf-8",
     )
@@ -1268,9 +1783,7 @@ def test_full_mode_local_provider_releases_engine_before_markdown(
             "lanes": {
                 "best": {
                     "prompt": "native two-stage",
-                    "settings": {
-                        "backend": "official-two-step-transformers"
-                    },
+                    "settings": {"backend": "official-two-step-transformers"},
                 }
             }
         },
@@ -1296,9 +1809,9 @@ def test_full_mode_local_provider_releases_engine_before_markdown(
     )
     promotion = payload["generation_metadata"]["markdown"]["promotion"]
     assert promotion["promoted"] is True
-    assert promotion["candidate_sha256"] == promotion[
-        "persisted_output_sha256"
-    ]
+    assert (
+        promotion["candidate_sha256"] == promotion["persisted_output_sha256"]
+    )
     assert payload["markdown_quality"]["status"] == "pass"
 
 
@@ -1390,9 +1903,7 @@ def test_full_mode_local_provider_rejects_candidate_atomically(
             "lanes": {
                 "best": {
                     "prompt": "native two-stage",
-                    "settings": {
-                        "backend": "official-two-step-transformers"
-                    },
+                    "settings": {"backend": "official-two-step-transformers"},
                 }
             }
         },
@@ -1418,23 +1929,22 @@ def test_full_mode_local_provider_rejects_candidate_atomically(
     ]
     promotion = markdown_metadata["promotion"]
     assert promotion["promoted"] is False
-    assert promotion["candidate_sha256"] != promotion[
-        "persisted_output_sha256"
-    ]
-    assert promotion["persisted_output_sha256"] == hashlib.sha256(
-        b"previous validated markdown\n"
-    ).hexdigest()
+    assert (
+        promotion["candidate_sha256"] != promotion["persisted_output_sha256"]
+    )
+    assert (
+        promotion["persisted_output_sha256"]
+        == hashlib.sha256(b"previous validated markdown\n").hexdigest()
+    )
     assert "1 page(s)" in str(exc_info.value)
     assert str(markdown_path) in str(exc_info.value)
     assert str(exc_info.value).count(str(markdown_path)) == 1
 
 
-def test_markdown_provider_preparation_resolves_spec_and_protects_corpora(
+def test_markdown_provider_preparation_resolves_spec(
     tmp_path,
     monkeypatch,
 ):
-    from sneeze.command import CommandError
-
     from sneeze.tpn.commands import OcrPdfPages
 
     home = tmp_path / "home"
@@ -1475,16 +1985,40 @@ def test_markdown_provider_preparation_resolves_spec_and_protects_corpora(
     )
     assert provider["spec_path"] == str(spec_path.resolve())
 
-    command.markdown_provider_run_dir = (
-        "/home/trentn/src/cuphoton-papers/papers/"
-        ".provider-evidence-must-not-be-created"
+def test_structured_ocr_rejects_provider_lane_before_runtime_side_effects(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.command import CommandError
+
+    from sneeze.tpn import ocr_installations
+    from sneeze.tpn.commands import OcrPdfPages
+
+    calls = []
+
+    def unexpected_registry_load(*_args, **_kwargs):
+        calls.append("registry")
+        raise AssertionError("registry must not be read for a CLI conflict")
+
+    monkeypatch.setattr(
+        ocr_installations,
+        "load_installation_registry",
+        unexpected_registry_load,
     )
-    with pytest.raises(CommandError, match="protected canonical corpora"):
-        command._prepare_markdown_provider(
-            prompt_mode="full",
-            source_dir=str(tmp_path / "source"),
-            dest_dir=str(tmp_path / "dest"),
+    evidence_dir = tmp_path / "provider-evidence"
+    command = OcrPdfPages(None, StringIO(), None)
+    command.pipeline = "local-mineru25"
+    command.markdown_provider_lane = "parity"
+    command.markdown_provider_run_dir = str(evidence_dir)
+
+    with pytest.raises(CommandError, match="--markdown-provider-lane"):
+        command._resolve_structured_execution(
+            prompt_mode="markdown",
+            output_format="md",
         )
+
+    assert calls == []
+    assert not evidence_dir.exists()
 
 
 def test_atomic_write_text_preserves_or_applies_normal_file_mode(tmp_path):
@@ -1563,12 +2097,54 @@ def test_command_docstrings_explain_workflow_prerequisites():
     assert "sne ocr-pdf-pages" in PdfToPages.__doc__
     assert "sne pdf-to-pages" in OcrPdfPages.__doc__
     assert "--pdf-to-pages" in OcrPdfPages.__doc__
+    assert "Recommended" in OcrPdfPages.__doc__
+    assert "--pipeline local-mineru25" in OcrPdfPages.__doc__
+    assert "sne ocr-backend-list" in OcrPdfPages.__doc__
+    assert "sne ocr-profile-list" in OcrPdfPages.__doc__
+    assert "Legacy manual mode" in OcrPdfPages.__doc__
     assert "sne deepseek-ocr-create-env" in OcrPdfPages.__doc__
     assert "sne deepseek-ocr-download-model" in OcrPdfPages.__doc__
-    assert "--prompt-mode full" in OcrPdfPages.__doc__
-    assert "--output-format html" in OcrPdfPages.__doc__
+    assert OcrPdfPages.__doc__.index("Recommended") < (
+        OcrPdfPages.__doc__.index("Legacy manual mode")
+    )
     assert "sne ocr-pdf-pages" in DeepseekOcrCreateEnv.__doc__
     assert "sne ocr-pdf-pages" in DeepseekOcrDownloadModel.__doc__
+
+
+def test_ocr_pdf_pages_help_leads_with_structured_pipeline(capsys):
+    from sneeze import cli as sneeze_cli
+
+    cli = sneeze_cli.CLI(
+        program_name="sne",
+        module_names=["sneeze", "sneeze.tpn"],
+        introspect=True,
+        auto_plugins=False,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli._commands_by_name["ocr-pdf-pages"].run(["--help"])
+
+    assert exc_info.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "Recommended: select `--pipeline local-mineru25`" in help_text
+    assert "the default" in help_text
+    assert "Legacy manual mode" in help_text
+    assert (
+        "Comma-separated absolute profile JSON files or directories."
+        in help_text
+    )
+    assert "[default in structured mode: max]" in help_text
+    assert (
+        "Legacy manual mode only: DeepSeek OCR model name or local path; "
+        "structured pipelines pin the model." in help_text
+    )
+    assert (
+        "Legacy manual mode only: immutable Hugging Face model revision; "
+        "structured pipelines pin the revision." in help_text
+    )
+    assert help_text.index("Recommended:") < help_text.index(
+        "Legacy manual mode"
+    )
 
 
 def test_markdown_provider_options_belong_only_to_ocr_command():
@@ -1722,6 +2298,39 @@ def test_markdown_quality_accepts_supported_repetition():
     )
     assert quality["status"] == "pass"
     assert quality["flags"] == []
+
+
+def test_grounded_recall_ignores_layout_boxes_but_keeps_table_numbers():
+    from sneeze.tpn.ocr_vllm import table_completion_metrics
+
+    reference = """\
+table[[361, 519, 706, 774]]
+table_caption[[115, 778, 881, 792]]
+Table 9
+<table>Dense24 relus Dense16 relu Dense8 relus value 519</table>
+"""
+    candidate = """\
+table[[361, 518, 706, 772]]
+table_caption[[115, 777, 881, 791]]
+Table 9
+<table>Dense24 relus Dense16 relu Dense8 relus value 519</table>
+"""
+
+    metrics = table_completion_metrics(candidate, None, reference)
+
+    assert metrics["grounded_ocr_token_multiset_recall"] == 1.0
+
+    missing_layout_block = candidate.replace(
+        "table_caption[[115, 777, 881, 791]]\n", ""
+    )
+    metrics = table_completion_metrics(missing_layout_block, None, reference)
+
+    assert metrics["grounded_ocr_token_multiset_recall"] < 1.0
+
+    missing_table_value = candidate.replace("value 519", "value 518")
+    metrics = table_completion_metrics(missing_table_value, None, reference)
+
+    assert metrics["grounded_ocr_token_multiset_recall"] < 1.0
 
 
 def test_generation_metadata_keeps_vllm_completion_details(tmp_path):

@@ -1,0 +1,251 @@
+{
+  "display_name": "NVIDIA RTX A6000 48 GB local MinerU 2.5",
+  "hardware_selector": {
+    "compute_capability": [
+      8,
+      6
+    ],
+    "memory_model": "dedicated",
+    "pci_device_id": "0x223010de",
+    "product_name": "NVIDIA RTX A6000",
+    "schema_version": 1,
+    "total_memory_bytes": 51527024640,
+    "vendor": "nvidia"
+  },
+  "kind": "ocr_execution_profile",
+  "memory_tiers": {
+    "25": {
+      "budget_bytes": 12881756160,
+      "budget_fraction": 0.25,
+      "reason": null,
+      "reserve_bytes": 2147483648,
+      "stages": {
+        "grounded_ocr": {
+          "confirmed_pages_per_second": 0.04752251806996227,
+          "observed_peak_memory_bytes": 12127109120,
+          "settings": {
+            "attention_backend": "auto",
+            "batch_size": 3,
+            "enable_chunked_prefill": true,
+            "engine_overhead_headroom_bytes": 1073741824,
+            "gpu_memory_utilization": 0.22916158,
+            "gpu_memory_utilization_denominator_bytes": 51527024640,
+            "max_num_batched_tokens": 16384,
+            "max_num_seqs": 3,
+            "max_tokens": 8192,
+            "memory_budget_bytes": 12881756160,
+            "memory_tier": "25",
+            "mm_encoder_attn_backend": "auto",
+            "ngram_size": 10,
+            "temperature": 0.0,
+            "window_size": 50
+          }
+        },
+        "markdown": {
+          "confirmed_pages_per_second": 0.03524130121869987,
+          "observed_peak_memory_bytes": 4477419520,
+          "settings": {
+            "backend": "official-two-step-transformers",
+            "batch_size": 2,
+            "image_analysis": false,
+            "memory_budget_bytes": 12881756160,
+            "memory_tier": "25"
+          }
+        }
+      },
+      "supported": true
+    },
+    "50": {
+      "budget_bytes": 25763512320,
+      "budget_fraction": 0.5,
+      "reason": null,
+      "reserve_bytes": 2147483648,
+      "stages": {
+        "grounded_ocr": {
+          "confirmed_pages_per_second": 0.047444560232717974,
+          "observed_peak_memory_bytes": 23778885632,
+          "settings": {
+            "attention_backend": "auto",
+            "batch_size": 3,
+            "enable_chunked_prefill": true,
+            "engine_overhead_headroom_bytes": 2147483648,
+            "gpu_memory_utilization": 0.45832316,
+            "gpu_memory_utilization_denominator_bytes": 51527024640,
+            "max_num_batched_tokens": 16384,
+            "max_num_seqs": 3,
+            "max_tokens": 8192,
+            "memory_budget_bytes": 25763512320,
+            "memory_tier": "50",
+            "mm_encoder_attn_backend": "auto",
+            "ngram_size": 10,
+            "temperature": 0.0,
+            "window_size": 50
+          }
+        },
+        "markdown": {
+          "confirmed_pages_per_second": 0.03554790838417682,
+          "observed_peak_memory_bytes": 4477419520,
+          "settings": {
+            "backend": "official-two-step-transformers",
+            "batch_size": 2,
+            "image_analysis": false,
+            "memory_budget_bytes": 25763512320,
+            "memory_tier": "50"
+          }
+        }
+      },
+      "supported": true
+    },
+    "max": {
+      "budget_bytes": 46374322176,
+      "budget_fraction": 0.9,
+      "reason": null,
+      "reserve_bytes": 2147483648,
+      "stages": {
+        "grounded_ocr": {
+          "confirmed_pages_per_second": 0.047318670799862135,
+          "observed_peak_memory_bytes": 45195001856,
+          "settings": {
+            "attention_backend": "auto",
+            "batch_size": 3,
+            "enable_chunked_prefill": true,
+            "engine_overhead_headroom_bytes": 1073741824,
+            "gpu_memory_utilization": 0.87916158,
+            "gpu_memory_utilization_denominator_bytes": 51527024640,
+            "max_num_batched_tokens": 16384,
+            "max_num_seqs": 3,
+            "max_tokens": 8192,
+            "memory_budget_bytes": 46374322176,
+            "memory_tier": "max",
+            "mm_encoder_attn_backend": "auto",
+            "ngram_size": 10,
+            "temperature": 0.0,
+            "window_size": 50
+          }
+        },
+        "markdown": {
+          "confirmed_pages_per_second": 0.03561368637766287,
+          "observed_peak_memory_bytes": 4477419520,
+          "settings": {
+            "backend": "official-two-step-transformers",
+            "batch_size": 2,
+            "image_analysis": false,
+            "memory_budget_bytes": 46374322176,
+            "memory_tier": "max"
+          }
+        }
+      },
+      "supported": true
+    }
+  },
+  "pipeline_definition_sha256": "3f438a3f6c83ede025bb5e1f302750300a0a2236203271145af5712aead1fa47",
+  "pipeline_id": "local-mineru25",
+  "profile_id": "local-mineru25-nvidia-rtx-a6000-sm86-48gb",
+  "profile_sha256": "0b15775d6931f451b4efa9bb77a38ca2c546a707932e4ddee33da11955ac7f58",
+  "qualification": {
+    "evidence": [
+      {
+        "all_pass": true,
+        "experiment_sha256": "d57cb9137957ac8fb644081f97ec4586e245635f17dc217d3107f651a3970585",
+        "manifest_sha256": "750775d33387ba5387b6ae96d558b9c82aaeb6c0ae67c76c5c74a31c2a3ca8dc",
+        "memory_tier": "25",
+        "provenance_complete": true,
+        "repeats": 5,
+        "suite_id": "cuphoton-three-page-smoke",
+        "summary_sha256": "c027c3957d6535ec25ae173db70d64fa8a430ae7f7bb9a4ea991f418dc4d4c07"
+      },
+      {
+        "all_pass": true,
+        "experiment_sha256": "d74a2b88879fefc56255be587977ae9c68805bac92f0dca7f90ae4363f1aedf3",
+        "manifest_sha256": "750775d33387ba5387b6ae96d558b9c82aaeb6c0ae67c76c5c74a31c2a3ca8dc",
+        "memory_tier": "50",
+        "provenance_complete": true,
+        "repeats": 5,
+        "suite_id": "cuphoton-three-page-smoke",
+        "summary_sha256": "df580b5f52ffb836945b6a9cccc42e31f5cea50e3e7bf4e886638c4847f2a6e4"
+      },
+      {
+        "all_pass": true,
+        "experiment_sha256": "2ad5528d6a2a6736c82cd5708895e3422440332e670f469596b66b954a37171b",
+        "manifest_sha256": "750775d33387ba5387b6ae96d558b9c82aaeb6c0ae67c76c5c74a31c2a3ca8dc",
+        "memory_tier": "max",
+        "provenance_complete": true,
+        "repeats": 5,
+        "suite_id": "cuphoton-three-page-smoke",
+        "summary_sha256": "58442252a57ab7cd15da1a71347a87618503f53dd2a81aa502c938e2e051f459"
+      }
+    ],
+    "policy_sha256": "ab65f1f22b4a75005c81f511fdfeee213ff1f0c1c1c1810329cf6ff3fd266d87",
+    "required_suites": [
+      "cuphoton-three-page-smoke"
+    ],
+    "state": "qualified"
+  },
+  "schema_version": 1,
+  "stages": {
+    "grounded_ocr": {
+      "backend_id": "deepseek-vllm",
+      "batch_semantics": "page_batch",
+      "capability": "grounded_ocr",
+      "model": {
+        "requested": "deepseek-ai/DeepSeek-OCR",
+        "revision": "9f30c71f441d010e5429c532364a86705536c53a",
+        "snapshot_files_sha256": "9cc5b8e79d72b75da2c39748b2e3f34a8ce06c338bebdcfd88fbc4a0eb66dcf4"
+      },
+      "runtime_selector": {
+        "attention_backend": "FLASH_ATTN",
+        "dtype": "bfloat16",
+        "engine": "vllm",
+        "engine_version": "0.21.1rc1.dev438+g4ff865c38",
+        "implementation_sha256": "1572663ce37a0735db51abb66454a0b1c5cbd8db7dc8bb96153698342f2e58be",
+        "installed_distributions_count": 198,
+        "installed_distributions_sha256": "d8af7fd29b3636fa0a00282624b827bdad8946785a864828ceb966425614fa0d",
+        "packages": {
+          "huggingface-hub": "1.17.0",
+          "pdf2image": "1.17.0",
+          "pillow": "12.2.0",
+          "torch": "2.11.0+cu130",
+          "torchaudio": "2.11.0+cu130",
+          "torchvision": "0.26.0+cu130",
+          "tqdm": "4.67.3",
+          "transformers": "5.9.0",
+          "vllm": "0.21.1rc1.dev438+g4ff865c38"
+        },
+        "python": "3.12.13",
+        "torch": "2.11.0+cu130",
+        "torch_cuda": "13.0"
+      }
+    },
+    "markdown": {
+      "backend_id": "mineru25-pro-2605",
+      "batch_semantics": "layout_block_batch",
+      "capability": "markdown",
+      "model": {
+        "requested": "opendatalab/MinerU2.5-Pro-2605-1.2B",
+        "revision": "bff20d4ae2bf202df9f45284b4d43681555a97ed",
+        "snapshot_files_sha256": "d817d96ca8d0fda357b67054840c86664e5c26bbbfa9eedc05387978d3a157ef"
+      },
+      "runtime_selector": {
+        "attention_backend": "sdpa",
+        "dtype": "bfloat16",
+        "engine": "transformers",
+        "engine_version": "4.57.6",
+        "implementation_sha256": "c0fc973d6d3314e83d6acb28884f983721f29af4da53218c1ba0ca38e021e779",
+        "installed_distributions_count": 64,
+        "installed_distributions_sha256": "8360ec35dd52753ab661e632b8a2f8e7631286e9038562e5627c6bf21a7c9345",
+        "packages": {
+          "accelerate": "1.14.0",
+          "huggingface-hub": "0.36.2",
+          "mineru-vl-utils": "1.0.5",
+          "pillow": "12.2.0",
+          "torch": "2.11.0+cu130",
+          "torchvision": "0.26.0+cu130",
+          "transformers": "4.57.6"
+        },
+        "python": "3.12.13",
+        "torch": "2.11.0+cu130",
+        "torch_cuda": "13.0"
+      }
+    }
+  }
+}

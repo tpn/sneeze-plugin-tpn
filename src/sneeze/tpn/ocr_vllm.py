@@ -12,7 +12,7 @@ import re
 import shutil
 import subprocess
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
@@ -22,6 +22,29 @@ DEFAULT_OCR_MODEL = "deepseek-ai/DeepSeek-OCR"
 DEFAULT_OCR_MODEL_REVISION = "9f30c71f441d010e5429c532364a86705536c53a"
 DEFAULT_OCR_WINDOW_SIZE = 50
 DEFAULT_MARKDOWN_WINDOW_SIZE = 128
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_STRUCTURED_EXECUTION_RECEIPT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "pipeline_id",
+        "pipeline_definition_sha256",
+        "profile_id",
+        "profile_sha256",
+        "qualification_state",
+        "allow_provisional_profile",
+        "memory_tier",
+        "memory_budget_bytes",
+        "reserve_bytes",
+        "hardware_selector",
+        "match",
+        "stage_settings",
+        "attention_backend",
+        "installation_record_sha256",
+        "deepseek_snapshot",
+        "receipt_sha256",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -54,6 +77,10 @@ class OcrFullItem:
     need_json: bool = False
     image_dims: dict[str, int] | None = None
     image_sha256: str | None = None
+
+
+class StructuredOutputReuseError(RuntimeError):
+    """Raised when an existing bundle cannot prove structured provenance."""
 
 
 def resolve_scan_workers(scan_parallelism: int | None) -> int:
@@ -129,6 +156,7 @@ def collect_ocr_full_items(
     refresh_image_paths: Iterable[str] | None = None,
     refresh_metadata_image_paths: Iterable[str] | None = None,
     verify_input_freshness: bool = False,
+    expected_execution_receipt: Mapping | None = None,
 ) -> tuple[list[OcrFullItem], int]:
     candidates, pdf_count = collect_ocr_scan_candidates(
         source_dir=source_dir,
@@ -153,6 +181,11 @@ def collect_ocr_full_items(
             ocr_full_item_from_candidate,
             dest_dir=os.path.abspath(dest_dir),
             force=force,
+            expected_execution_receipt=(
+                dict(expected_execution_receipt)
+                if expected_execution_receipt is not None
+                else None
+            ),
         ),
         max_workers=scan_parallelism,
     )
@@ -250,6 +283,7 @@ def ocr_full_item_from_candidate(
     candidate: OcrScanCandidate,
     dest_dir: str,
     force: bool,
+    expected_execution_receipt: dict | None = None,
 ) -> OcrFullItem | None:
     ocr_path = os.path.join(dest_dir, f"{candidate.base}.ocr")
     markdown_path = os.path.join(dest_dir, f"{candidate.base}.md")
@@ -274,6 +308,20 @@ def ocr_full_item_from_candidate(
         or refresh_metadata
         or not os.path.exists(json_path)
     )
+    image_sha256 = file_sha256(candidate.image_path)
+    if expected_execution_receipt is not None:
+        reused_stages = []
+        if not need_ocr:
+            reused_stages.append(("grounded_ocr", "ocr", ocr_path))
+        if not need_markdown:
+            reused_stages.append(("markdown", "markdown", markdown_path))
+        if reused_stages:
+            _validate_structured_output_reuse(
+                json_path=json_path,
+                image_sha256=image_sha256,
+                expected_execution_receipt=expected_execution_receipt,
+                stages=reused_stages,
+            )
     if (
         not force
         and not (need_ocr or need_markdown or need_json)
@@ -293,8 +341,369 @@ def ocr_full_item_from_candidate(
         need_markdown=need_markdown,
         need_json=need_json,
         image_dims=ocr_image_dims(candidate.image_path),
-        image_sha256=file_sha256(candidate.image_path),
+        image_sha256=image_sha256,
     )
+
+
+def _canonical_json_sha256(value) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _execution_receipt_is_valid(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    receipt = dict(value)
+    if set(receipt) != _STRUCTURED_EXECUTION_RECEIPT_KEYS:
+        return False
+    digest = receipt.pop("receipt_sha256", None)
+    if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+        return False
+    profile_id = receipt.get("profile_id")
+    qualification_state = receipt.get("qualification_state")
+    allow_provisional = receipt.get("allow_provisional_profile")
+    memory_tier = receipt.get("memory_tier")
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("kind") != "ocr_structured_execution"
+        or receipt.get("pipeline_id") != "local-mineru25"
+        or not isinstance(profile_id, str)
+        or not re.fullmatch(
+            r"[a-z0-9]+(?:[a-z0-9._-]*[a-z0-9])?", profile_id
+        )
+        or not _SHA256_RE.fullmatch(str(receipt.get("profile_sha256", "")))
+        or qualification_state not in {"provisional", "qualified"}
+        or not isinstance(allow_provisional, bool)
+        or (qualification_state == "provisional" and not allow_provisional)
+        or memory_tier not in {"25", "50", "max"}
+        or not _positive_receipt_integer(receipt.get("memory_budget_bytes"))
+        or not _nonnegative_receipt_integer(receipt.get("reserve_bytes"))
+    ):
+        return False
+    try:
+        from .ocr_profiles import get_pipeline_definition
+
+        pipeline = get_pipeline_definition("local-mineru25")
+    except (ImportError, RuntimeError, ValueError):
+        return False
+    if (
+        not _SHA256_RE.fullmatch(
+            str(receipt.get("pipeline_definition_sha256", ""))
+        )
+        or receipt["pipeline_definition_sha256"]
+        != pipeline["definition_sha256"]
+        or not _structured_receipt_hardware_is_valid(
+            receipt.get("hardware_selector")
+        )
+        or not _structured_receipt_match_is_valid(receipt)
+        or not _structured_receipt_settings_are_valid(
+            receipt.get("stage_settings")
+        )
+        or not _structured_receipt_attention_is_valid(
+            receipt.get("attention_backend")
+        )
+        or not _structured_receipt_installations_are_valid(
+            receipt.get("installation_record_sha256")
+        )
+        or not _structured_receipt_snapshot_is_valid(
+            receipt.get("deepseek_snapshot")
+        )
+    ):
+        return False
+    try:
+        return digest == _canonical_json_sha256(receipt)
+    except (TypeError, ValueError):
+        return False
+
+
+def _positive_receipt_integer(value: object) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+    )
+
+
+def _nonnegative_receipt_integer(value: object) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+    )
+
+
+def _structured_receipt_hardware_is_valid(value: object) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "vendor",
+        "product_name",
+        "pci_device_id",
+        "compute_capability",
+        "memory_model",
+        "total_memory_bytes",
+    }:
+        return False
+    capability = value.get("compute_capability")
+    pci_device_id = value.get("pci_device_id")
+    return (
+        value.get("schema_version") == 1
+        and value.get("vendor") == "nvidia"
+        and isinstance(value.get("product_name"), str)
+        and bool(value["product_name"].strip())
+        and (pci_device_id is None or isinstance(pci_device_id, str))
+        and isinstance(capability, list)
+        and len(capability) == 2
+        and all(_nonnegative_receipt_integer(item) for item in capability)
+        and value.get("memory_model")
+        in {"dedicated", "unified", "unknown"}
+        and _positive_receipt_integer(value.get("total_memory_bytes"))
+    )
+
+
+def _structured_receipt_match_is_valid(receipt: Mapping) -> bool:
+    value = receipt.get("match")
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "profile_id",
+        "pipeline_id",
+        "memory_tier",
+        "matched",
+        "reasons",
+        "profile_sha256",
+    }:
+        return False
+    return (
+        value.get("schema_version") == 1
+        and value.get("profile_id") == receipt.get("profile_id")
+        and value.get("pipeline_id") == receipt.get("pipeline_id")
+        and value.get("memory_tier") == receipt.get("memory_tier")
+        and value.get("matched") is True
+        and value.get("reasons") == []
+        and value.get("profile_sha256") == receipt.get("profile_sha256")
+    )
+
+
+def _structured_receipt_settings_are_valid(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == {"grounded_ocr", "markdown"}
+        and all(
+            isinstance(value[stage], Mapping) and bool(value[stage])
+            for stage in ("grounded_ocr", "markdown")
+        )
+    )
+
+
+def _structured_receipt_attention_is_valid(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value)
+        == {"requested", "qualified_selected", "selected_verification"}
+        and isinstance(value.get("requested"), str)
+        and bool(value["requested"].strip())
+        and isinstance(value.get("qualified_selected"), str)
+        and bool(value["qualified_selected"].strip())
+        and value.get("selected_verification")
+        == "deferred_until_engine_initialization"
+    )
+
+
+def _structured_receipt_installations_are_valid(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == {"deepseek-vllm", "mineru25-pro-2605"}
+        and all(
+            isinstance(digest, str) and bool(_SHA256_RE.fullmatch(digest))
+            for digest in value.values()
+        )
+    )
+
+
+def _structured_receipt_snapshot_is_valid(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == {"revision", "files_sha256"}
+        and isinstance(value.get("revision"), str)
+        and bool(re.fullmatch(r"[0-9a-f]{40}", value["revision"]))
+        and isinstance(value.get("files_sha256"), str)
+        and bool(_SHA256_RE.fullmatch(value["files_sha256"]))
+    )
+
+
+def _structured_reuse_error(
+    json_path: str,
+    stage_label: str,
+    reason: str,
+) -> StructuredOutputReuseError:
+    return StructuredOutputReuseError(
+        f"Refusing to reuse structured OCR bundle {json_path} stage "
+        f"{stage_label}: {reason}. Use a fresh --dest-dir or deliberately "
+        "rerun with --force."
+    )
+
+
+def _validate_structured_output_reuse(
+    *,
+    json_path: str,
+    image_sha256: str | None,
+    expected_execution_receipt: Mapping,
+    stages: Iterable[tuple[str, str, str]],
+) -> None:
+    """Require exact, successful provenance before reusing stage outputs."""
+
+    stage_records = list(stages)
+    stage_label = stage_records[0][0] if stage_records else "bundle"
+    if not _execution_receipt_is_valid(expected_execution_receipt):
+        raise _structured_reuse_error(
+            json_path,
+            stage_label,
+            "the selected execution receipt is invalid",
+        )
+    try:
+        with open(json_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, TypeError) as exc:
+        raise _structured_reuse_error(
+            json_path,
+            stage_label,
+            "the existing JSON provenance is absent or malformed",
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise _structured_reuse_error(
+            json_path,
+            stage_label,
+            "the existing JSON provenance is not an object",
+        )
+    if not isinstance(image_sha256, str) or payload.get(
+        "image_sha256"
+    ) != image_sha256:
+        raise _structured_reuse_error(
+            json_path,
+            stage_label,
+            "the bundle image SHA-256 does not match the current image",
+        )
+    generation_metadata = payload.get("generation_metadata")
+    if not isinstance(generation_metadata, Mapping):
+        raise _structured_reuse_error(
+            json_path,
+            stage_label,
+            "generation metadata is missing",
+        )
+    expected_receipt = dict(expected_execution_receipt)
+    for stage_label, metadata_key, output_path in stage_records:
+        metadata = generation_metadata.get(metadata_key)
+        if not isinstance(metadata, Mapping):
+            raise _structured_reuse_error(
+                json_path,
+                stage_label,
+                "stage generation metadata is missing",
+            )
+        observed_receipt = metadata.get("execution_profile")
+        if (
+            not _execution_receipt_is_valid(observed_receipt)
+            or dict(observed_receipt) != expected_receipt
+        ):
+            raise _structured_reuse_error(
+                json_path,
+                stage_label,
+                "the recorded execution profile or memory tier differs",
+            )
+        stage_image = metadata.get("image")
+        if not isinstance(stage_image, Mapping) or stage_image.get(
+            "sha256"
+        ) != image_sha256:
+            raise _structured_reuse_error(
+                json_path,
+                stage_label,
+                "the stage image SHA-256 does not match the current image",
+            )
+        if (
+            metadata.get("status") != "completed"
+            or metadata.get("finish_reason") != "stop"
+        ):
+            raise _structured_reuse_error(
+                json_path,
+                stage_label,
+                "the prior stage did not finish successfully",
+            )
+        validation = metadata.get("validation")
+        if (
+            not isinstance(validation, Mapping)
+            or validation.get("status") != "pass"
+            or validation.get("flags") != []
+        ):
+            raise _structured_reuse_error(
+                json_path,
+                stage_label,
+                "the prior stage did not complete validation successfully",
+            )
+        termination = metadata.get("termination")
+        if (
+            not isinstance(termination, Mapping)
+            or termination.get("eos") is not True
+            or termination.get("length") is not False
+            or termination.get("max_tokens") is not False
+        ):
+            raise _structured_reuse_error(
+                json_path,
+                stage_label,
+                "the prior stage was not EOS-terminated below max_tokens",
+            )
+        promotion = metadata.get("promotion")
+        candidate_sha256 = (
+            promotion.get("candidate_sha256")
+            if isinstance(promotion, Mapping)
+            else None
+        )
+        persisted_sha256 = (
+            promotion.get("persisted_output_sha256")
+            if isinstance(promotion, Mapping)
+            else None
+        )
+        try:
+            with open(output_path, "rb") as handle:
+                output_bytes = handle.read()
+            output_bytes.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise _structured_reuse_error(
+                json_path,
+                stage_label,
+                "the persisted stage output is missing or not UTF-8",
+            ) from exc
+        payload_text_key = (
+            "ocr_text" if metadata_key == "ocr" else "markdown_text"
+        )
+        payload_text = payload.get(payload_text_key)
+        if (
+            not isinstance(payload_text, str)
+            or payload_text.encode("utf-8") != output_bytes
+        ):
+            raise _structured_reuse_error(
+                json_path,
+                stage_label,
+                f"the bundle {payload_text_key} differs from the stage file",
+            )
+        output_sha256 = hashlib.sha256(output_bytes).hexdigest()
+        if (
+            not isinstance(promotion, Mapping)
+            or promotion.get("promoted") is not True
+            or not isinstance(candidate_sha256, str)
+            or not _SHA256_RE.fullmatch(candidate_sha256)
+            or not isinstance(persisted_sha256, str)
+            or not _SHA256_RE.fullmatch(persisted_sha256)
+            or candidate_sha256 != persisted_sha256
+            or persisted_sha256 != output_sha256
+        ):
+            raise _structured_reuse_error(
+                json_path,
+                stage_label,
+                "the promoted output hash does not match the current bytes",
+            )
 
 
 def path_is_newer(source_path: str, output_path: str) -> bool:
@@ -428,10 +837,23 @@ _TABLE_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 _PIPE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+_GROUNDING_BOX_LINE_RE = re.compile(
+    r"^[ \t]*(text|sub_title|equation|image|image_caption|title|table|"
+    r"table_caption|table_footnote)[ \t]*"
+    r"\[\[[ \t]*[-+]?\d+"
+    r"(?:[ \t]*,[ \t]*[-+]?\d+){3}[ \t]*\]\][ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def _word_tokens(text: str | None) -> list[str]:
     return _WORD_RE.findall((text or "").casefold())
+
+
+def _grounded_content_tokens(text: str | None) -> list[str]:
+    """Tokenize OCR content while ignoring DeepSeek box coordinates."""
+
+    return _word_tokens(_GROUNDING_BOX_LINE_RE.sub(r"\1", text or ""))
 
 
 def _source_coverage(text: str, source: str | None) -> float | None:
@@ -640,11 +1062,21 @@ def table_completion_metrics(
     missing = expected - observed
     raw_words = _word_tokens(raw_text)
     markdown_words = _word_tokens(markdown_text)
+    grounded_markdown_words = _grounded_content_tokens(markdown_text)
+    grounded_ocr_words = _grounded_content_tokens(grounded_ocr_text)
     raw_counts = Counter(raw_words)
     markdown_counts = Counter(markdown_words)
     recall = (
         sum((raw_counts & markdown_counts).values()) / len(raw_words)
         if raw_words
+        else 1.0
+    )
+    grounded_ocr_counts = Counter(grounded_ocr_words)
+    grounded_markdown_counts = Counter(grounded_markdown_words)
+    grounded_ocr_recall = (
+        sum((grounded_ocr_counts & grounded_markdown_counts).values())
+        / len(grounded_ocr_words)
+        if grounded_ocr_words
         else 1.0
     )
     word_ratio = (
@@ -659,6 +1091,7 @@ def table_completion_metrics(
             len(missing) / len(expected) if expected else 0.0
         ),
         "raw_token_multiset_recall": recall,
+        "grounded_ocr_token_multiset_recall": grounded_ocr_recall,
         "markdown_raw_word_ratio": word_ratio,
         "nonblank_lines": sum(bool(line.strip()) for line in lines),
         "pipe_table_rows": sum(
@@ -856,6 +1289,26 @@ def resolve_model_metadata(
     }
 
 
+def installed_distributions_identity() -> dict[str, object]:
+    """Return the complete normalized distribution identity."""
+
+    distributions = sorted(
+        f"{distribution.metadata.get('Name', distribution.name)}=="
+        f"{distribution.version}"
+        for distribution in importlib.metadata.distributions()
+    )
+    payload = json.dumps(
+        distributions,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "count": len(distributions),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "distributions": distributions,
+    }
+
+
 def selected_attention_backend(llm) -> str | None:
     try:
         from vllm.config import set_current_vllm_config
@@ -888,6 +1341,8 @@ def engine_metadata(
     model_revision: str | None,
     requested_attention_backend: str | None,
     requested_mm_encoder_attn_backend: str | None,
+    startup_installed_distributions: dict[str, object],
+    engine_init_kwargs: dict | None = None,
 ) -> dict:
     try:
         import torch
@@ -898,17 +1353,19 @@ def engine_metadata(
     except ImportError:  # pragma: no cover - caller already imported vLLM
         vllm = None
     configured_backend = None
+    configured_dtype = None
     try:
-        configured_backend = (
-            llm.llm_engine.vllm_config.attention_config.backend
-        )
+        vllm_config = llm.llm_engine.vllm_config
+        configured_backend = vllm_config.attention_config.backend
         configured_backend = getattr(
             configured_backend,
             "name",
             configured_backend,
         )
+        configured_dtype = str(vllm_config.model_config.dtype)
     except Exception:
         configured_backend = None
+        configured_dtype = None
     return {
         "model": resolve_model_metadata(model, model_revision),
         "runtime": {
@@ -924,6 +1381,7 @@ def engine_metadata(
             "tokenizers": _package_version("tokenizers"),
             "pillow": _package_version("pillow"),
             "poppler": _poppler_version(),
+            "dtype": configured_dtype,
             "attention_backend_requested": (
                 requested_attention_backend or configured_backend
             ),
@@ -934,6 +1392,13 @@ def engine_metadata(
             "vllm_batch_invariant": os.environ.get(
                 "VLLM_BATCH_INVARIANT",
                 "0",
+            ),
+            "engine_init_kwargs": _json_safe(engine_init_kwargs),
+            "installed_distributions_count": (
+                startup_installed_distributions["count"]
+            ),
+            "installed_distributions_sha256": (
+                startup_installed_distributions["sha256"]
             ),
         },
     }
@@ -1178,6 +1643,11 @@ class DeepSeekOcrOfflineProcessor:
         out: Callable[[str], None] | None = None,
         verbose: Callable[[str], None] | None = None,
     ) -> None:
+        startup_identity = installed_distributions_identity()
+        self._startup_installed_distributions = {
+            "count": startup_identity["count"],
+            "sha256": startup_identity["sha256"],
+        }
         self.model = model
         self.model_revision = model_revision
         self.output_format = output_format
@@ -1368,6 +1838,10 @@ class DeepSeekOcrOfflineProcessor:
             requested_mm_encoder_attn_backend=(
                 self.mm_encoder_attn_backend
             ),
+            startup_installed_distributions=(
+                self._startup_installed_distributions
+            ),
+            engine_init_kwargs=llm_kwargs,
         )
         return llm, sampling_params
 

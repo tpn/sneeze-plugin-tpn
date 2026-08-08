@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass
+from pathlib import PurePosixPath
 from typing import Any
 
 SCHEMA_VERSION = 1
@@ -22,13 +23,23 @@ MINERU_MODEL_ID = "opendatalab/MinerU2.5-Pro-2605-1.2B"
 MINERU_MODEL_REVISION = "bff20d4ae2bf202df9f45284b4d43681555a97ed"
 MINERU_PROVIDER_ID = "mineru2.5-pro-2605-transformers"
 MINERU_ADAPTER_SHA256 = (
-    "2ed21528fe34a01d5e897e1e50fe8162a71b14947dc1b6bf62f8120314db20d2"
+    "8cc54b6d009d4e9971f8aa712a7dd1963e4148c5851c8d30de513b12b894cafa"
 )
 MINERU_SNAPSHOT_IDENTITY_SHA256 = (
     "d817d96ca8d0fda357b67054840c86664e5c26bbbfa9eedc05387978d3a157ef"
 )
 MINERU_WEIGHTS_SHA256 = (
     "abf8681ca63b8dec7b67de257af47b821f179442f72998d0696ae2ed9232a5f0"
+)
+
+# Updated only after the declared implementation components have passed the
+# focused unit suite and GPU qualification.  The placeholders are replaced at
+# the end of a source-changing qualification cycle.
+DEEPSEEK_IMPLEMENTATION_SHA256 = (
+    "1289f449747f8cee57f07b66947a785422de3cf46fad4a2354a43b28ec93fdb8"
+)
+MINERU_IMPLEMENTATION_SHA256 = (
+    "ce8b6c5507a86e68470e4d608ea2927d4ee8532dae231a233491fe4ca4c2ad66"
 )
 
 _REVISION_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -78,12 +89,19 @@ class OcrBackendDefinition:
     default_python: str
     capabilities: tuple[CapabilityQualification, ...]
     environment_kind: str
+    runtime_engine: str
+    runtime_engine_package: str
+    qualified_torch_version: str
+    qualified_torch_cuda: str
+    qualified_dtype: str
     provider_id: str | None = None
     adapter_relative_path: str | None = None
     default_lane: str | None = None
     provider_prompt: str | None = None
     provider_settings: tuple[tuple[str, Any], ...] = ()
     runtime_packages: tuple[tuple[str, str], ...] = ()
+    implementation_relative_paths: tuple[str, ...] = ()
+    qualified_implementation_sha256: str | None = None
     qualified_adapter_sha256: str | None = None
     snapshot_identity_sha256: str | None = None
     weights_sha256: str | None = None
@@ -113,6 +131,18 @@ class OcrBackendDefinition:
             raise BackendRegistryError(
                 "backend environment defaults cannot be empty"
             )
+        runtime_packages = dict(self.runtime_packages)
+        if (
+            not self.runtime_engine
+            or not self.runtime_engine_package
+            or not self.qualified_torch_version
+            or not self.qualified_torch_cuda
+            or not self.qualified_dtype
+            or self.runtime_engine_package not in runtime_packages
+        ):
+            raise BackendRegistryError(
+                "backend qualified runtime identity is incomplete"
+            )
         if not self.capabilities:
             raise BackendRegistryError(
                 "backend must declare at least one capability"
@@ -122,6 +152,21 @@ class OcrBackendDefinition:
             raise BackendRegistryError(
                 f"duplicate capabilities for backend {self.backend_id}"
             )
+        if not self.implementation_relative_paths:
+            raise BackendRegistryError(
+                "backend must declare implementation components"
+            )
+        for value in self.implementation_relative_paths:
+            path = PurePosixPath(value)
+            if (
+                path.is_absolute()
+                or not path.parts
+                or any(part in {"", ".", ".."} for part in path.parts)
+            ):
+                raise BackendRegistryError(
+                    "backend implementation component must be a safe "
+                    "relative path"
+                )
         if self.execution_mode == "provider_process":
             required = (
                 self.provider_id,
@@ -147,6 +192,10 @@ class OcrBackendDefinition:
                 "in-process backends cannot declare provider metadata"
             )
         for label, digest in (
+            (
+                "qualified implementation",
+                self.qualified_implementation_sha256,
+            ),
             ("qualified adapter", self.qualified_adapter_sha256),
             ("snapshot identity", self.snapshot_identity_sha256),
             ("weights", self.weights_sha256),
@@ -181,6 +230,11 @@ class OcrBackendDefinition:
                 "default_name": self.default_env_name,
                 "python": self.default_python,
                 "runtime_packages": dict(self.runtime_packages),
+                "engine": self.runtime_engine,
+                "engine_package": self.runtime_engine_package,
+                "torch": self.qualified_torch_version,
+                "torch_cuda": self.qualified_torch_cuda,
+                "dtype": self.qualified_dtype,
             },
             "capabilities": [asdict(item) for item in self.capabilities],
             "provider": (
@@ -202,6 +256,12 @@ class OcrBackendDefinition:
                 else None
             ),
             "qualification_artifacts": {
+                "implementation_sha256": (
+                    self.qualified_implementation_sha256
+                ),
+                "implementation_components": list(
+                    self.implementation_relative_paths
+                ),
                 "adapter_sha256": self.qualified_adapter_sha256,
                 "snapshot_identity_sha256": (
                     self.snapshot_identity_sha256
@@ -222,16 +282,40 @@ _BACKENDS = (
         default_env_name="sneeze-ocr-vllm",
         default_python="3.12.13",
         environment_kind="deepseek_vllm",
+        runtime_engine="vllm",
+        runtime_engine_package="vllm",
+        qualified_torch_version="2.11.0+cu130",
+        qualified_torch_cuda="13.0",
+        qualified_dtype="bfloat16",
         runtime_packages=(
             ("huggingface-hub", "1.17.0"),
             ("pdf2image", "1.17.0"),
             ("pillow", "12.2.0"),
-            ("torch", "2.11.0"),
+            ("torch", "2.11.0+cu130"),
             ("torchaudio", "2.11.0+cu130"),
-            ("torchvision", "0.26.0"),
+            ("torchvision", "0.26.0+cu130"),
             ("tqdm", "4.67.3"),
             ("transformers", "5.9.0"),
             ("vllm", "0.21.1rc1.dev438+g4ff865c38"),
+        ),
+        implementation_relative_paths=(
+            "ocr_backend_setup.py",
+            "commands.py",
+            "ocr_benchmark.py",
+            "ocr_execution.py",
+            "ocr_hardware.py",
+            "ocr_implementation.py",
+            "ocr_installations.py",
+            "ocr_path_security.py",
+            "ocr_process_lifecycle.py",
+            "ocr_profiles.py",
+            "ocr_provider.py",
+            "ocr_tuning.py",
+            "ocr_vllm.py",
+            "providers/deepseek_vllm.py",
+        ),
+        qualified_implementation_sha256=(
+            DEEPSEEK_IMPLEMENTATION_SHA256
         ),
         capabilities=(
             CapabilityQualification(
@@ -269,6 +353,11 @@ _BACKENDS = (
         default_env_name="sneeze-ocr-mineru25",
         default_python="3.12.13",
         environment_kind="mineru25_transformers",
+        runtime_engine="transformers",
+        runtime_engine_package="transformers",
+        qualified_torch_version="2.11.0+cu130",
+        qualified_torch_cuda="13.0",
+        qualified_dtype="bfloat16",
         capabilities=(
             CapabilityQualification(
                 capability="markdown",
@@ -300,6 +389,22 @@ _BACKENDS = (
             ("torchvision", "0.26.0+cu130"),
             ("transformers", "4.57.6"),
         ),
+        implementation_relative_paths=(
+            "ocr_backend_setup.py",
+            "commands.py",
+            "ocr_benchmark.py",
+            "ocr_execution.py",
+            "ocr_hardware.py",
+            "ocr_implementation.py",
+            "ocr_installations.py",
+            "ocr_path_security.py",
+            "ocr_process_lifecycle.py",
+            "ocr_profiles.py",
+            "ocr_provider.py",
+            "ocr_tuning.py",
+            "providers/mineru25.py",
+        ),
+        qualified_implementation_sha256=MINERU_IMPLEMENTATION_SHA256,
         qualified_adapter_sha256=MINERU_ADAPTER_SHA256,
         snapshot_identity_sha256=MINERU_SNAPSHOT_IDENTITY_SHA256,
         weights_sha256=MINERU_WEIGHTS_SHA256,

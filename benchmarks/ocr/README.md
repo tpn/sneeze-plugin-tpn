@@ -10,6 +10,14 @@ stems, immutable input and reference hashes, image dimensions, and calibrated
 assertions. Stems are relative to the canonical `papers` directory and do not
 include a `papers/` prefix.
 
+An assertion may include a nonempty `lanes` list. It is evaluated only for
+those lane IDs; an assertion without `lanes` applies to every selected lane.
+The cuPhoton fixture scopes Markdown/raw-text recall to `parity` and `best`,
+while grounded-OCR recall and Acero table-completion checks target
+`grounded_ocr`. This distinction matters during structured pipeline tuning:
+grounded OCR is not rejected by a Markdown-specific recall contract, and the
+Markdown lane cannot satisfy the independent grounded-table gate.
+
 The hashes were verified against cuPhoton Papers commit
 `60141cdde89be393cf8839f505fcc4ac4017f7d2`. Its reference OCR and Markdown
 sidecars came from the historical Hiccup implementation at
@@ -296,7 +304,23 @@ a hash of that evaluator evidence.
 ## Built-in local backends
 
 The structured setup commands derive model and adapter identity from the
-built-in registry. Do not hand-edit those pins into a provider specification:
+built-in registry. Do not hand-edit those pins into a provider specification.
+
+This section is the lower-level provider-spec workflow for benchmark
+development. It is not the complete unknown-GPU onboarding procedure. Use the
+root README's **Install and register local backends** and **Tune a new GPU**
+sections for the trusted-filesystem contract, both runtime installations,
+25/50/max tuning, repeated confirmations, qualification review, and the final
+scratch smoke.
+
+Run these examples from a clean, activated control venv containing this
+checkout. The host prerequisites are Python 3.12 with `venv`, Git, Poppler,
+mamba or conda, and a supported NVIDIA GPU/driver; the root README gives the
+complete bootstrap. The exact pinned DeepSeek environment installs
+`vllm==0.21.1rc1.dev438+g4ff865c38` from vLLM's immutable full-build-commit
+CUDA 13.0 index. The mutable nightly alias no longer lists that build. Do not
+substitute a nearby build and treat it as qualified; upstream retention of the
+commit-specific wheel remains an external availability dependency.
 
 ```bash
 LOCAL_SCRATCH=$(mktemp -d /tmp/sneeze-tpn-ocr-local.XXXXXX)
@@ -325,6 +349,40 @@ snapshot check is appropriate. The registry reports qualification per
 capability. A new or benchmark-only capability must still pass this benchmark
 and the larger advance gates before production use.
 
+### Structured GPU-profile evidence
+
+The memory-tier capacity is
+`min(floor(total_bytes * fraction), total_bytes - reserve_bytes)`. Fractions
+are 25%, 50%, and 90% for dedicated max or 75% for unified max; the dedicated
+and unified reserves are 2 GiB and 16 GiB respectively. Live availability is a
+separate gate.
+
+DeepSeek tuning sweeps 1, 2, and 4 GiB of engine-overhead headroom for each
+eligible tier/batch candidate. Its vLLM denominator is
+`max(portable GPU total, torch CUDA total)`, and the target engine allocation
+is `tier budget - headroom`. Profiles retain the complete distribution
+manifest's package count and SHA-256 identity; package names are not persisted
+in candidate evidence. The tuning plan also binds the
+installation-record, executable, cache, snapshot, weights, adapter, and
+implementation identities. A resumed run requires the exact same plan and
+matching artifacts, even when all filesystem paths are unchanged.
+
+The bundled profile
+`local-mineru25-nvidia-rtx-a6000-sm86-48gb` is trusted at profile SHA-256
+`0b15775d6931f451b4efa9bb77a38ca2c546a707932e4ddee33da11955ac7f58`.
+Its formal A6000 onboarding run executed 39 discovery candidates and retained
+37 eligible configurations. All six selected capability/tier candidates then
+passed five repeats of the three-page suite with complete provenance and no
+max-token termination. Manual review covered all 25 distinct output hashes
+across the 90 confirmation artifacts. The selected DeepSeek batches are 3 at
+every tier, with 1, 2, and 1 GiB of engine headroom at 25%, 50%, and max.
+Selected MinerU batches are 2 at every tier.
+
+The GB10 run remains exploratory: MinerU passed all three pages at all three
+tiers, while DeepSeek failed quality, ran with vLLM 0.20.0 rather than the
+pinned tuple, and used an OCI-derived environment that the portable profile
+does not attest. It is not production qualification.
+
 ## Running the smoke benchmark
 
 Create the provider specification in scratch space, then run both lanes five
@@ -332,12 +390,13 @@ times:
 
 ```bash
 BENCH_SCRATCH=$(mktemp -d /tmp/sneeze-tpn-ocr-benchmark.XXXXXX)
-PLUGIN_ROOT=/home/trentn/src/sneeze-plugin-tpn
+PLUGIN_ROOT=$(git rev-parse --show-toplevel)
+INPUT_ROOT=/absolute/read-only/path/to/papers
 BENCH_MANIFEST="$PLUGIN_ROOT/benchmarks/ocr/cuphoton-regressions.jsonl"
 
 sne ocr-benchmark \
   --manifest "$BENCH_MANIFEST" \
-  --input-root /home/trentn/src/cuphoton-papers/papers \
+  --input-root "$INPUT_ROOT" \
   --provider-spec "$BENCH_SCRATCH/provider-spec.json" \
   --dest-dir "$BENCH_SCRATCH/run" \
   --lanes parity,best \
@@ -401,13 +460,14 @@ the manifest-bound PNG hashes and dimensions, then writes a secret-free
 
 ```bash
 HOSTED_SCRATCH=$(mktemp -d /tmp/sneeze-tpn-ocr-hosted.XXXXXX)
-PLUGIN_ROOT=/home/trentn/src/sneeze-plugin-tpn
+PLUGIN_ROOT=$(git rev-parse --show-toplevel)
+INPUT_ROOT=/absolute/read-only/path/to/papers
 BENCH_MANIFEST="$PLUGIN_ROOT/benchmarks/ocr/cuphoton-regressions.jsonl"
 
 sne ocr-external-plan \
   --profile openai-responses-gpt-5.6-sol \
   --manifest "$BENCH_MANIFEST" \
-  --input-root /home/trentn/src/cuphoton-papers/papers \
+  --input-root "$INPUT_ROOT" \
   --dest-dir "$HOSTED_SCRATCH/plan" \
   --lane parity \
   --prompt-mode parity \
@@ -466,7 +526,7 @@ repeats default to the values in the plan:
 ```bash
 sne ocr-benchmark \
   --manifest "$BENCH_MANIFEST" \
-  --input-root /home/trentn/src/cuphoton-papers/papers \
+  --input-root "$INPUT_ROOT" \
   --provider-spec "$HOSTED_SCRATCH/plan/provider-spec.json" \
   --dest-dir "$HOSTED_SCRATCH/run" \
   --allow-external \

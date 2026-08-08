@@ -3,6 +3,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import shlex
+import subprocess
 import sys
 import textwrap
 import time
@@ -20,6 +23,21 @@ EXACT_OUTPUT = "Table 6\nreal page prose\n"
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _json_sha256(value) -> str:
+    return _sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+
+
+def _synthetic_credential_sentinel() -> str:
+    return "-".join(("synthetic", "test", "credential", "sentinel"))
 
 
 def _write_json(path: Path, value) -> None:
@@ -44,6 +62,31 @@ def _read_jsonl(path: Path) -> list[dict]:
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def _run_test_git(path: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=path,
+        env={"PATH": os.defpath},
+        check=True,
+        capture_output=True,
+    )
+
+
+def _init_git_repository(path: Path) -> None:
+    path.mkdir(parents=True)
+    for args in (
+        ("init", "--quiet"),
+        ("config", "user.name", "OCR Benchmark Test"),
+        ("config", "user.email", "ocr-benchmark@example.invalid"),
+    ):
+        _run_test_git(path, *args)
+    tracked = path / "src" / "tracked.py"
+    tracked.parent.mkdir()
+    tracked.write_text("initial\n", encoding="utf-8")
+    _run_test_git(path, "add", "src/tracked.py")
+    _run_test_git(path, "commit", "--quiet", "-m", "initial")
 
 
 def _case_record(stem: str = "paper/page-01") -> dict:
@@ -475,6 +518,70 @@ def test_load_provider_spec_rejects_invalid_environment_entries(
         load_provider_spec(spec_path)
 
 
+@pytest.mark.parametrize("surface", ("argv", "env"))
+def test_load_provider_spec_rejects_credential_shaped_values(
+    tmp_path,
+    surface,
+):
+    from sneeze.tpn.ocr_benchmark import BenchmarkError, load_provider_spec
+
+    spec_path, provider_path = _write_provider_spec(tmp_path)
+    record = _provider_record(provider_path)
+    synthetic_value = "hf_" + "x" * 20
+    if surface == "argv":
+        record["argv"].append(synthetic_value)
+    else:
+        record["env"] = {"CONFIG_VALUE": synthetic_value}
+    _write_json(spec_path, record)
+
+    with pytest.raises(BenchmarkError, match="credential-like") as exc_info:
+        load_provider_spec(spec_path)
+    assert synthetic_value not in str(exc_info.value)
+
+
+def test_benchmark_inputs_reject_duplicate_json_fields(tmp_path):
+    from sneeze.tpn.ocr_benchmark import (
+        BenchmarkError,
+        load_manifest,
+        load_provider_spec,
+    )
+
+    manifest_path, _input_root, _case = _write_manifest(tmp_path)
+    manifest_payload = manifest_path.read_text(encoding="utf-8").replace(
+        '"schema_version": 1',
+        '"schema_version": 1, "schema_version": 1',
+        1,
+    )
+    manifest_path.write_text(manifest_payload, encoding="utf-8")
+    with pytest.raises(BenchmarkError, match="duplicate JSON field"):
+        load_manifest(manifest_path)
+
+    spec_path, _provider_path = _write_provider_spec(tmp_path)
+    spec_payload = spec_path.read_text(encoding="utf-8").replace(
+        '"schema_version": 1,',
+        '"schema_version": 1,\n  "schema_version": 1,',
+        1,
+    )
+    spec_path.write_text(spec_payload, encoding="utf-8")
+    with pytest.raises(BenchmarkError, match="duplicate JSON field"):
+        load_provider_spec(spec_path)
+
+
+def test_manifest_rejects_overflowed_exponent_assertion_bound(tmp_path):
+    from sneeze.tpn.ocr_benchmark import BenchmarkError, load_manifest
+
+    manifest_path, _input_root, _case = _write_manifest(tmp_path)
+    payload = manifest_path.read_text(encoding="utf-8").replace(
+        '"min": 1',
+        '"min": 1e400',
+        1,
+    )
+    manifest_path.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(BenchmarkError, match="non-finite JSON number"):
+        load_manifest(manifest_path)
+
+
 @pytest.mark.parametrize("missing_source", ("manifest", "provider spec"))
 def test_run_benchmark_wraps_missing_source_errors(
     tmp_path,
@@ -520,11 +627,376 @@ def test_manifest_and_provider_reject_unsafe_output_components(tmp_path):
         load_provider_spec(str(spec_path))
 
 
+def test_git_provenance_rejects_unrelated_parent_repository(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.ocr_benchmark as benchmark
+
+    outer = tmp_path / "outer-repository"
+    _init_git_repository(outer)
+    sensitive_name = "private-credential-do-not-record.txt"
+    (outer / sensitive_name).write_text(
+        "unrelated private material\n",
+        encoding="utf-8",
+    )
+    export = outer / "source-export"
+    export.mkdir()
+
+    calls = []
+    real_run = subprocess.run
+
+    def recording_run(argv, *args, **kwargs):
+        calls.append(tuple(argv))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(benchmark.subprocess, "run", recording_run)
+    context = benchmark._git_repository_context(export)
+    metadata = benchmark._git_metadata(export, context=context)
+    evidence_root = tmp_path / "evidence"
+    diff = benchmark._snapshot_git_diff(evidence_root, context=context)
+
+    assert len(calls) == 1
+    assert calls[0][-2:] == ("rev-parse", "--show-toplevel")
+    assert "status" not in calls[0]
+    assert "diff" not in calls[0]
+    assert metadata == {
+        "available": False,
+        "unavailable_reason": "git_toplevel_mismatch",
+        "sha": None,
+        "branch": None,
+        "status": None,
+    }
+    assert diff["available"] is False
+    assert diff["unavailable_reason"] == "git_toplevel_mismatch"
+    assert diff["returncode"] is None
+    diff_path = evidence_root / diff["evidence_path"]
+    assert diff_path.read_bytes() == b""
+    assert diff["size_bytes"] == 0
+    recorded = json.dumps({"repository": metadata, "git_diff": diff})
+    assert sensitive_name not in recorded
+
+
+def test_git_provenance_handles_missing_git_without_leaking_error(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.ocr_benchmark as benchmark
+
+    source_export = tmp_path / "source-export"
+    source_export.mkdir()
+    sensitive_detail = "private-parent-repository-name"
+
+    def missing_git(*_args, **_kwargs):
+        raise FileNotFoundError(sensitive_detail)
+
+    monkeypatch.setattr(benchmark.subprocess, "run", missing_git)
+    context = benchmark._git_repository_context(source_export)
+    metadata = benchmark._git_metadata(source_export, context=context)
+    evidence_root = tmp_path / "evidence"
+    diff = benchmark._snapshot_git_diff(evidence_root, context=context)
+
+    assert context["available"] is False
+    assert context["unavailable_reason"] == "git_probe_launch_failed"
+    assert metadata == {
+        "available": False,
+        "unavailable_reason": "git_probe_launch_failed",
+        "sha": None,
+        "branch": None,
+        "status": None,
+    }
+    assert diff["available"] is False
+    assert diff["unavailable_reason"] == "git_probe_launch_failed"
+    assert diff["returncode"] is None
+    recorded = json.dumps({"repository": metadata, "git_diff": diff})
+    assert sensitive_detail not in recorded
+
+
+def test_later_git_launch_error_is_a_detail_free_benchmark_error(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.ocr_benchmark as benchmark
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    sensitive_detail = "private-parent-repository-name"
+    calls = 0
+
+    def disappearing_git(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(
+                args=["git"],
+                returncode=0,
+                stdout=f"{repository}\n",
+                stderr="",
+            )
+        raise FileNotFoundError(sensitive_detail)
+
+    monkeypatch.setattr(benchmark.subprocess, "run", disappearing_git)
+    context = benchmark._git_repository_context(repository)
+
+    with pytest.raises(
+        benchmark.BenchmarkError,
+        match="Git provenance probe could not be launched",
+    ) as exc_info:
+        benchmark._git_metadata(repository, context=context)
+
+    assert sensitive_detail not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+def test_git_provenance_avoids_worktree_status_and_diff(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.ocr_benchmark as benchmark
+
+    repository = tmp_path / "exact-repository"
+    _init_git_repository(repository)
+    (repository / "src" / "tracked.py").write_text(
+        "changed in public source\n",
+        encoding="utf-8",
+    )
+    sensitive_name = "private-credential-do-not-record.txt"
+    (repository / sensitive_name).write_text(
+        "unrelated private material\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "ambient-control.git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "ambient-work-tree"))
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-test-value")
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("LC_ALL", "ambient-locale")
+    monkeypatch.setenv("TZ", "ambient-timezone")
+    calls = []
+    real_run = subprocess.run
+
+    def recording_run(argv, *args, **kwargs):
+        calls.append(tuple(argv))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(benchmark.subprocess, "run", recording_run)
+
+    context = benchmark._git_repository_context(repository)
+    assert context["environment"] == {
+        "PATH": os.defpath,
+        "LC_ALL": "C",
+        "TZ": "UTC",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    metadata = benchmark._git_metadata(repository, context=context)
+    evidence_root = tmp_path / "evidence"
+    diff = benchmark._snapshot_git_diff(evidence_root, context=context)
+
+    assert metadata["available"] is True
+    assert metadata["unavailable_reason"] is None
+    assert metadata["sha"]
+    assert isinstance(metadata["branch"], str)
+    assert metadata["status"] is None
+    assert diff["available"] is False
+    assert diff["unavailable_reason"] == "working_tree_git_diff_disabled"
+    assert diff["returncode"] is None
+    assert (evidence_root / diff["evidence_path"]).read_bytes() == b""
+    assert all("status" not in call for call in calls)
+    assert all("diff" not in call for call in calls)
+    assert sensitive_name not in json.dumps(
+        {"repository": metadata, "git_diff": diff}
+    )
+
+
+def test_git_provenance_does_not_invoke_repository_clean_filter(tmp_path):
+    import sneeze.tpn.ocr_benchmark as benchmark
+
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+    marker = tmp_path / "clean-filter-ran"
+    filter_script = tmp_path / "clean-filter.py"
+    filter_script.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "Path(sys.argv[1]).write_text('ran', encoding='utf-8')\n"
+        "sys.stdout.buffer.write(sys.stdin.buffer.read())\n",
+        encoding="utf-8",
+    )
+    command = " ".join(
+        shlex.quote(value)
+        for value in (sys.executable, str(filter_script), str(marker))
+    )
+    _run_test_git(repository, "config", "filter.unsafe.clean", command)
+    (repository / ".gitattributes").write_text(
+        "src/tracked.py filter=unsafe\n",
+        encoding="utf-8",
+    )
+    tracked = repository / "src" / "tracked.py"
+    tracked.write_text("dirty raw source\n", encoding="utf-8")
+
+    context = benchmark._git_repository_context(repository)
+    metadata = benchmark._git_metadata(repository, context=context)
+    evidence_root = tmp_path / "evidence"
+    diff = benchmark._snapshot_git_diff(evidence_root, context=context)
+    source_tree = benchmark._snapshot_source_tree(repository, evidence_root)
+
+    assert metadata["available"] is True
+    assert metadata["status"] is None
+    assert diff["available"] is False
+    assert diff["unavailable_reason"] == "working_tree_git_diff_disabled"
+    assert marker.exists() is False
+    source_record = next(
+        record
+        for record in source_tree["files"]
+        if record["path"] == "src/tracked.py"
+    )
+    assert (evidence_root / source_record["evidence_path"]).read_bytes() == (
+        b"dirty raw source\n"
+    )
+
+
+def test_experiment_identity_binds_changed_git_head(tmp_path):
+    import sneeze.tpn.ocr_benchmark as benchmark
+
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+
+    def identity(evidence_name: str) -> tuple[dict, str]:
+        context = benchmark._git_repository_context(repository)
+        metadata = benchmark._git_metadata(repository, context=context)
+        evidence_root = tmp_path / evidence_name
+        diff = benchmark._snapshot_git_diff(evidence_root, context=context)
+        payload = benchmark._experiment_identity_payload(
+            manifest_file_sha256="1" * 64,
+            provider_spec_file_sha256="2" * 64,
+            environment={},
+            argv_files=[
+                {
+                    "argv_index": 0,
+                    "path": "/usr/bin/python",
+                    "size_bytes": 1,
+                    "sha256": "3" * 64,
+                }
+            ],
+            harness_files=[{"sha256": "4" * 64}],
+            git_metadata=metadata,
+            git_diff=diff,
+            source_tree_sha256="5" * 64,
+            external_identity=None,
+        )
+        return payload, _json_sha256(payload)
+
+    first_payload, first_digest = identity("first-evidence")
+    marker = repository / "release-marker.txt"
+    marker.write_text("new commit outside source scope\n", encoding="utf-8")
+    _run_test_git(repository, "add", "release-marker.txt")
+    _run_test_git(repository, "commit", "--quiet", "-m", "new head")
+    second_payload, second_digest = identity("second-evidence")
+
+    assert first_payload["repository"]["sha"] != second_payload[
+        "repository"
+    ]["sha"]
+    assert first_payload["git_diff_sha256"] == second_payload[
+        "git_diff_sha256"
+    ]
+    assert first_payload["source_tree_sha256"] == second_payload[
+        "source_tree_sha256"
+    ]
+    assert first_digest != second_digest
+
+
+def test_source_tree_snapshots_and_binds_untracked_source(tmp_path):
+    import sneeze.tpn.ocr_benchmark as benchmark
+
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+    untracked = repository / "src" / "untracked.py"
+    untracked.write_text("first untracked source\n", encoding="utf-8")
+    cache = repository / "src" / "__pycache__"
+    cache.mkdir()
+    (cache / "ignored.pyc").write_bytes(b"generated cache")
+
+    first_root = tmp_path / "first-evidence"
+    first_root.mkdir()
+    first = benchmark._snapshot_source_tree(repository, first_root)
+    records = {record["path"]: record for record in first["files"]}
+    assert set(records) == {"src/tracked.py", "src/untracked.py"}
+    untracked_record = records["src/untracked.py"]
+    copied = first_root / untracked_record["evidence_path"]
+    assert copied.read_bytes() == untracked.read_bytes()
+    assert untracked_record["sha256"] == _sha256(untracked.read_bytes())
+    assert first["aggregate_sha256"] == _json_sha256(
+        {
+            key: first[key]
+            for key in (
+                "schema_version",
+                "scope_paths",
+                "excluded_directory_names",
+                "excluded_file_suffixes",
+                "file_count",
+                "files",
+            )
+        }
+    )
+
+    untracked.write_text("second untracked source\n", encoding="utf-8")
+    second_root = tmp_path / "second-evidence"
+    second_root.mkdir()
+    second = benchmark._snapshot_source_tree(repository, second_root)
+    assert first["aggregate_sha256"] != second["aggregate_sha256"]
+
+    common = {
+        "manifest_file_sha256": "1" * 64,
+        "provider_spec_file_sha256": "2" * 64,
+        "environment": {},
+        "argv_files": [],
+        "harness_files": [],
+        "git_metadata": {
+            "available": False,
+            "unavailable_reason": "git_toplevel_unavailable",
+            "sha": None,
+        },
+        "git_diff": {
+            "available": False,
+            "unavailable_reason": "git_toplevel_unavailable",
+            "returncode": None,
+            "sha256": "3" * 64,
+        },
+        "external_identity": None,
+    }
+    first_identity = benchmark._experiment_identity_payload(
+        **common,
+        source_tree_sha256=first["aggregate_sha256"],
+    )
+    second_identity = benchmark._experiment_identity_payload(
+        **common,
+        source_tree_sha256=second["aggregate_sha256"],
+    )
+    assert _json_sha256(first_identity) != _json_sha256(second_identity)
+
+
+def test_source_tree_rejects_unsafe_symlink(tmp_path):
+    import sneeze.tpn.ocr_benchmark as benchmark
+
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+    outside = tmp_path / "outside-private-source.py"
+    outside.write_text("must not be followed\n", encoding="utf-8")
+    (repository / "src" / "unsafe.py").symlink_to(outside)
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+
+    with pytest.raises(benchmark.BenchmarkError, match="unsafe symlink"):
+        benchmark._snapshot_source_tree(repository, evidence_root)
+
+
 def test_run_benchmark_isolates_lanes_and_preserves_evidence(
     tmp_path,
     monkeypatch,
 ):
-    from sneeze.tpn.ocr_benchmark import run_benchmark
+    import sneeze.tpn.ocr_benchmark as benchmark
 
     manifest_path, input_root, case = _write_manifest(tmp_path)
     spec_path, _provider_path = _write_provider_spec(tmp_path)
@@ -539,7 +1011,7 @@ def test_run_benchmark_isolates_lanes_and_preserves_evidence(
     monkeypatch.setenv("TORCH_LOGS", "must-be-scrubbed")
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-recorded")
 
-    summary = run_benchmark(
+    summary = benchmark.run_benchmark(
         manifest_path=str(manifest_path),
         input_root=str(input_root),
         provider_spec_path=str(spec_path),
@@ -555,9 +1027,15 @@ def test_run_benchmark_isolates_lanes_and_preserves_evidence(
     assert run_record["repository"]["root"] == str(
         Path(__file__).resolve().parents[1]
     )
+    assert run_record["repository"]["available"] is True
+    assert run_record["repository"]["unavailable_reason"] is None
     assert run_record["repository"]["sha"]
     assert isinstance(run_record["repository"]["branch"], str)
-    assert run_record["repository"]["status"]
+    assert run_record["repository"]["status"] is None
+    assert run_record["evidence"]["git_diff"]["available"] is False
+    assert run_record["evidence"]["git_diff"]["unavailable_reason"] == (
+        "working_tree_git_diff_disabled"
+    )
     assert run_record["provider"]["environment"][
         "VLLM_ATTENTION_BACKEND"
     ] == "FLASH_ATTN"
@@ -580,6 +1058,58 @@ def test_run_benchmark_isolates_lanes_and_preserves_evidence(
     assert (evidence_root / "provider-spec.json").read_bytes() == (
         spec_path.read_bytes()
     )
+    source_tree = run_record["evidence"]["source_tree"]
+    assert source_tree["file_count"] == len(source_tree["files"])
+    assert source_tree["scope_paths"] == list(
+        benchmark._GIT_PROVENANCE_PATHS
+    )
+    assert source_tree["aggregate_sha256"] == _json_sha256(
+        {
+            key: source_tree[key]
+            for key in (
+                "schema_version",
+                "scope_paths",
+                "excluded_directory_names",
+                "excluded_file_suffixes",
+                "file_count",
+                "files",
+            )
+        }
+    )
+    inventory_path = evidence_root / source_tree["inventory_evidence_path"]
+    assert _sha256(inventory_path.read_bytes()) == source_tree[
+        "inventory_file_sha256"
+    ]
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    assert inventory == {
+        key: value
+        for key, value in source_tree.items()
+        if key not in {"inventory_evidence_path", "inventory_file_sha256"}
+    }
+    source_records = {
+        record["path"]: record for record in source_tree["files"]
+    }
+    benchmark_record = source_records["src/sneeze/tpn/ocr_benchmark.py"]
+    benchmark_copy = evidence_root / benchmark_record["evidence_path"]
+    assert _sha256(benchmark_copy.read_bytes()) == benchmark_record["sha256"]
+    experiment_identity = benchmark._experiment_identity_payload(
+        manifest_file_sha256=run_record["harness"][
+            "manifest_file_sha256"
+        ],
+        provider_spec_file_sha256=run_record["harness"][
+            "provider_spec_file_sha256"
+        ],
+        environment=run_record["provider"]["environment"],
+        argv_files=run_record["evidence"]["argv_files"],
+        harness_files=run_record["evidence"]["harness_files"],
+        git_metadata=run_record["repository"],
+        git_diff=run_record["evidence"]["git_diff"],
+        source_tree_sha256=source_tree["aggregate_sha256"],
+        external_identity=None,
+    )
+    assert _json_sha256(experiment_identity) == run_record["harness"][
+        "experiment_sha256"
+    ]
     adapter_snapshot = next((evidence_root / "provider").iterdir())
     adapter_bytes = adapter_snapshot.read_bytes()
     _provider_path.write_text("mutated after run", encoding="utf-8")
@@ -636,6 +1166,76 @@ def test_run_benchmark_isolates_lanes_and_preserves_evidence(
             )
             output_path = repeat_dir / "outputs" / f"{case['case_id']}.md"
             assert output_path.read_text(encoding="utf-8") == EXACT_OUTPUT
+
+
+def test_run_benchmark_rejects_caller_bound_provider_spec_drift_before_exec(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.ocr_benchmark as benchmark
+
+    manifest_path, input_root, _case = _write_manifest(tmp_path)
+    spec_path, _provider_path = _write_provider_spec(tmp_path)
+    expected = _sha256(spec_path.read_bytes())
+    spec_path.write_text(
+        spec_path.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+
+    def unexpected_popen(*_args, **_kwargs):
+        raise AssertionError("provider must not execute after spec drift")
+
+    monkeypatch.setattr(subprocess, "Popen", unexpected_popen)
+    destination = tmp_path / "benchmark-run"
+    with pytest.raises(
+        benchmark.BenchmarkError,
+        match="caller-bound SHA-256",
+    ):
+        benchmark.run_benchmark(
+            manifest_path=manifest_path,
+            input_root=input_root,
+            provider_spec_path=spec_path,
+            expected_provider_spec_file_sha256=expected,
+            dest_dir=destination,
+            lanes=("best",),
+            repeats=1,
+        )
+    assert not destination.exists()
+
+
+def test_run_benchmark_rejects_cross_user_writable_destination(tmp_path):
+    from sneeze.tpn.ocr_benchmark import BenchmarkError, run_benchmark
+
+    manifest_path, input_root, _case = _write_manifest(tmp_path)
+    spec_path, _provider_path = _write_provider_spec(tmp_path)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o775)
+
+    with pytest.raises(BenchmarkError, match="writable by group"):
+        run_benchmark(
+            manifest_path=manifest_path,
+            input_root=input_root,
+            provider_spec_path=spec_path,
+            dest_dir=shared / "benchmark-run",
+            lanes=("best",),
+            repeats=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+        pytest.param(10**10000, id="huge-integer"),
+    ),
+)
+def test_benchmark_usage_validator_rejects_nonfinite_numbers(value):
+    from sneeze.tpn.ocr_benchmark import _is_nonnegative_number
+
+    assert _is_nonnegative_number(value) is False
 
 
 def test_experiment_identity_includes_provider_argv_file_bytes(tmp_path):
@@ -790,6 +1390,16 @@ def test_provider_source_drift_stops_repeats(tmp_path):
             "'{not-json'",
             "Invalid JSON",
         ),
+        (
+            '"wall_seconds": 0.01,',
+            '"wall_seconds": float("inf"),',
+            "non-finite JSON number",
+        ),
+        (
+            '"wall_seconds": 0.01,',
+            '"wall_seconds": 1e400,',
+            "non-finite JSON number",
+        ),
     ],
 )
 def test_malformed_provider_responses_become_durable_errors(
@@ -869,6 +1479,76 @@ def test_provider_timeout_terminates_descendant_process(tmp_path):
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline and Path(f"/proc/{child_pid}").exists():
         time.sleep(0.05)
+    assert not Path(f"/proc/{child_pid}").exists()
+
+
+def test_provider_interrupt_terminates_descendant_and_reaps_provider(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn import ocr_benchmark
+
+    provider_path = tmp_path / "interrupted_provider.py"
+    process_ids_path = tmp_path / "process-ids"
+    provider_path.write_text(
+        textwrap.dedent(
+            f"""
+            import os
+            import subprocess
+            import sys
+            import time
+            from pathlib import Path
+
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"]
+            )
+            Path({str(process_ids_path)!r}).write_text(
+                f"{{os.getpid()}} {{child.pid}}"
+            )
+            time.sleep(60)
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    original_wait = subprocess.Popen.wait
+    interrupted = False
+
+    def interrupt_first_wait(process, timeout=None):
+        nonlocal interrupted
+        if not interrupted:
+            deadline = time.monotonic() + 2
+            while (
+                time.monotonic() < deadline and not process_ids_path.is_file()
+            ):
+                time.sleep(0.01)
+            assert process_ids_path.is_file()
+            interrupted = True
+            raise KeyboardInterrupt
+        return original_wait(process, timeout=timeout)
+
+    monkeypatch.setattr(
+        ocr_benchmark.subprocess.Popen,
+        "wait",
+        interrupt_first_wait,
+    )
+    with open(os.devnull, "wb") as output:
+        with pytest.raises(KeyboardInterrupt):
+            ocr_benchmark._run_provider_process(
+                [sys.executable, str(provider_path)],
+                cwd=str(tmp_path),
+                environment=dict(os.environ),
+                stdout_handle=output,
+                stderr_handle=output,
+                timeout_seconds=30,
+            )
+
+    provider_pid, child_pid = (
+        int(value) for value in process_ids_path.read_text().split()
+    )
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and Path(f"/proc/{child_pid}").exists():
+        time.sleep(0.05)
+    assert not Path(f"/proc/{provider_pid}").exists()
     assert not Path(f"/proc/{child_pid}").exists()
 
 
@@ -994,7 +1674,7 @@ def test_provider_spec_rejects_unsafe_external_configuration(
 ):
     from sneeze.tpn.ocr_benchmark import load_provider_spec
 
-    sentinel = "synthetic-test-credential-sentinel"
+    sentinel = _synthetic_credential_sentinel()
     provider_path = _write_fake_provider(tmp_path)
     egress = "none" if mutation == "local_secret" else "external"
     spec = _provider_record(provider_path, egress=egress)
@@ -1039,7 +1719,7 @@ def test_external_provider_receives_only_allowlisted_environment(
     )
     from sneeze.tpn.ocr_external_setup import build_external_provider_spec
 
-    sentinel = "synthetic-test-credential-sentinel"
+    sentinel = _synthetic_credential_sentinel()
     spec = build_external_provider_spec(
         profile_id="openai-responses-gpt-5.6-sol",
         python_executable=Path(sys.executable).resolve(),
@@ -1083,7 +1763,7 @@ def test_external_provider_credential_leaks_are_redacted_and_fail(
 ):
     from sneeze.tpn.ocr_benchmark import run_benchmark
 
-    sentinel = "synthetic-test-credential-sentinel"
+    sentinel = _synthetic_credential_sentinel()
     encoded_sentinel = base64.urlsafe_b64encode(
         sentinel.encode("utf-8")
     ).decode("ascii")
@@ -1225,7 +1905,7 @@ def test_external_provider_requires_bound_plan_and_separate_approval(
     )
     monkeypatch.setenv(
         "OPENAI_API_KEY",
-        "synthetic-test-credential-sentinel",
+        _synthetic_credential_sentinel(),
     )
     summary = run_benchmark(
         manifest_path=str(manifest_path),
@@ -1248,7 +1928,7 @@ def test_external_provider_requires_bound_plan_and_separate_approval(
     ):
         assert argument in captured["argv"]
     assert captured["environment"]["OPENAI_API_KEY"] == (
-        "synthetic-test-credential-sentinel"
+        _synthetic_credential_sentinel()
     )
     run_record = json.loads(
         (tmp_path / "benchmark-run-authorized" / "run.json").read_text()
@@ -1363,6 +2043,79 @@ def test_evaluate_assertions_catches_exact_regressions():
         False,
         False,
     ]
+
+
+def test_run_benchmark_rejects_boolean_repeat_count(tmp_path):
+    from sneeze.tpn.ocr_benchmark import BenchmarkError, run_benchmark
+
+    with pytest.raises(BenchmarkError, match="positive integer"):
+        run_benchmark(
+            manifest_path=tmp_path / "missing-manifest.jsonl",
+            input_root=tmp_path / "missing-inputs",
+            provider_spec_path=tmp_path / "missing-provider.json",
+            dest_dir=tmp_path / "missing-output",
+            repeats=True,
+        )
+
+
+def test_assertions_can_be_scoped_to_provider_lanes(tmp_path):
+    from sneeze.tpn.ocr_benchmark import evaluate_assertions, load_manifest
+
+    quality = {
+        "status": "pass",
+        "table_completion": {"raw_token_multiset_recall": 0.4},
+    }
+    assertions = [
+        {"type": "quality_status", "value": "pass"},
+        {
+            "type": "metric_range",
+            "path": "quality.table_completion.raw_token_multiset_recall",
+            "min": 0.8,
+            "lanes": ["best", "parity"],
+        },
+    ]
+    grounded = evaluate_assertions(
+        "complete grounded OCR",
+        quality,
+        assertions,
+        lane="grounded_ocr",
+    )
+    markdown = evaluate_assertions(
+        "truncated markdown",
+        quality,
+        assertions,
+        lane="best",
+    )
+    assert [item["passed"] for item in grounded] == [True]
+    assert [item["passed"] for item in markdown] == [True, False]
+
+    manifest_path, _input_root, case = _write_manifest(tmp_path)
+    case["assertions"][0]["lanes"] = ["best", "best"]
+    _write_jsonl(manifest_path, [case])
+    with pytest.raises(ValueError, match="nonempty unique list"):
+        load_manifest(manifest_path)
+
+
+def test_benchmark_does_not_vacuously_pass_uncovered_lane(tmp_path):
+    from sneeze.tpn.ocr_benchmark import run_benchmark
+
+    manifest_path, input_root, case = _write_manifest(tmp_path)
+    for assertion in case["assertions"]:
+        assertion["lanes"] = ["parity"]
+    _write_jsonl(manifest_path, [case])
+    spec_path, _provider_path = _write_provider_spec(tmp_path)
+
+    summary = run_benchmark(
+        manifest_path=manifest_path,
+        input_root=input_root,
+        provider_spec_path=spec_path,
+        dest_dir=tmp_path / "uncovered-lane-run",
+        lanes=("best",),
+        repeats=1,
+    )
+
+    assert summary["all_pass"] is False
+    assert summary["passed_attempt_count"] == 0
 
 
 def test_summarize_results_quantifies_nondeterminism():
