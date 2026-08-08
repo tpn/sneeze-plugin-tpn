@@ -87,6 +87,7 @@ def _tier_stage(stage_id, budget, tier):
             "memory_budget_bytes": budget,
             "memory_tier": tier,
             "mm_encoder_attn_backend": "auto",
+            "moe_backend": "triton",
             "ngram_size": 10,
             "temperature": 0.0,
             "window_size": 50,
@@ -322,6 +323,50 @@ def test_profile_hash_is_canonical_and_detects_mutation():
         match="does not match profile content",
     ):
         validate_execution_profile(profile)
+
+
+def test_known_legacy_implementation_profile_without_moe_is_readable():
+    from sneeze.tpn.ocr_profiles import seal_execution_profile
+
+    legacy = _profile_payload()
+    legacy["stages"]["grounded_ocr"]["runtime_selector"][
+        "implementation_sha256"
+    ] = (
+        "1572663ce37a0735db51abb66454a0b1c5cbd8db7dc8bb96153698342f2e58be"
+    )
+    for tier in legacy["memory_tiers"].values():
+        if tier["supported"]:
+            tier["stages"]["grounded_ocr"]["settings"].pop(
+                "moe_backend"
+            )
+
+    assert seal_execution_profile(legacy)["profile_sha256"]
+
+
+def test_profile_requires_triton_moe_for_runtime_control_aware_source():
+    from sneeze.tpn.ocr_profiles import (
+        OcrProfileError,
+        seal_execution_profile,
+    )
+
+    missing = _profile_payload()
+    missing["stages"]["grounded_ocr"]["runtime_selector"][
+        "implementation_sha256"
+    ] = _digest("runtime-control-aware-deepseek")
+    for tier in missing["memory_tiers"].values():
+        if not tier["supported"]:
+            continue
+        settings = tier["stages"]["grounded_ocr"]["settings"]
+        settings.pop("moe_backend")
+    with pytest.raises(OcrProfileError, match="missing moe_backend"):
+        seal_execution_profile(missing)
+
+    invalid = _profile_payload()
+    invalid["memory_tiers"]["max"]["stages"]["grounded_ocr"][
+        "settings"
+    ]["moe_backend"] = "auto"
+    with pytest.raises(OcrProfileError, match="moe_backend must be triton"):
+        seal_execution_profile(invalid)
 
 
 @pytest.mark.parametrize(

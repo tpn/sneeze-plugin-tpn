@@ -26,6 +26,11 @@ from .ocr_path_security import (
     prepare_private_output_path,
     validate_trusted_file,
 )
+from .ocr_vllm import (
+    QUALIFIED_DEEPSEEK_MOE_BACKEND,
+    deepseek_jit_environment,
+    validate_deepseek_moe_backend,
+)
 
 SCHEMA_VERSION = 1
 MEMORY_TIERS = ("25", "50", "max")
@@ -564,6 +569,7 @@ def _candidate_settings(
     batch_size: int,
     total_memory_bytes: int,
     attention_backend: str,
+    moe_backend: str = QUALIFIED_DEEPSEEK_MOE_BACKEND,
     engine_overhead_headroom_bytes: int | None = None,
 ) -> dict[str, Any]:
     budget_bytes = int(budget["budget_bytes"])
@@ -597,6 +603,7 @@ def _candidate_settings(
         ),
         "attention_backend": attention_backend,
         "mm_encoder_attn_backend": "auto",
+        "moe_backend": moe_backend,
         "enable_chunked_prefill": True,
         "max_tokens": 8192,
         "ngram_size": 10,
@@ -622,6 +629,7 @@ def build_tuning_plan(
     deepseek_engine_overhead_headroom_bytes: Sequence[int] = (
         DEFAULT_DEEPSEEK_ENGINE_OVERHEAD_HEADROOM_BYTES
     ),
+    deepseek_moe_backend: str = QUALIFIED_DEEPSEEK_MOE_BACKEND,
 ) -> dict[str, Any]:
     """Build a deterministic, secret-free tuning-session plan."""
 
@@ -670,6 +678,16 @@ def build_tuning_plan(
     headrooms = tuple(
         dict.fromkeys(deepseek_engine_overhead_headroom_bytes)
     )
+    try:
+        moe_backend = validate_deepseek_moe_backend(
+            str(deepseek_moe_backend).strip().lower()
+        )
+    except ValueError as exc:
+        raise TuningError(str(exc)) from exc
+    if moe_backend != QUALIFIED_DEEPSEEK_MOE_BACKEND:
+        raise TuningError(
+            "DeepSeek profile tuning requires moe_backend=triton"
+        )
     if not headrooms or any(
         not isinstance(value, int)
         or isinstance(value, bool)
@@ -725,6 +743,7 @@ def build_tuning_plan(
                         batch_size=batch_size,
                         total_memory_bytes=utilization_total,
                         attention_backend=binding["attention_backend"],
+                        moe_backend=moe_backend,
                         engine_overhead_headroom_bytes=headroom,
                     )
                     identity = {
@@ -782,6 +801,7 @@ def build_tuning_plan(
             "memory_tiers": list(tiers),
             "batch_sizes": list(batches),
             "deepseek_engine_overhead_headroom_bytes": list(headrooms),
+            "deepseek_moe_backend": moe_backend,
             "batch_bounds": {
                 "manifest_case_count": manifest_case_count,
                 "page_batch_max_size": manifest_case_count,
@@ -875,6 +895,11 @@ def build_candidate_provider_spec(
             "HF_HUB_CACHE": binding["cache_dir"],
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
+            **(
+                deepseek_jit_environment()
+                if backend_id == "deepseek-vllm"
+                else {}
+            ),
         },
     }
 
@@ -958,6 +983,7 @@ def _generation_settings_evidence(
                 "gpu_memory_utilization",
                 "max_num_batched_tokens",
                 "max_num_seqs",
+                "moe_backend",
             ):
                 if engine_kwargs.get(key) != normalized[key]:
                     reasons.append("effective_engine_settings_mismatch")
@@ -991,6 +1017,7 @@ def _generation_settings_evidence(
                         "max_num_batched_tokens",
                         "max_num_seqs",
                         "mm_encoder_attn_backend",
+                        "moe_backend",
                     )
                 },
                 "sampling_settings": {

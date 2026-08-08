@@ -23,10 +23,13 @@ from sneeze.invariant import (
 )
 
 from .ocr_vllm import (
+    DEFAULT_DEEPSEEK_MOE_BACKEND,
     DEFAULT_MARKDOWN_WINDOW_SIZE,
     DEFAULT_OCR_MODEL,
     DEFAULT_OCR_MODEL_REVISION,
     DEFAULT_OCR_WINDOW_SIZE,
+    QUALIFIED_DEEPSEEK_MOE_BACKEND,
+    validate_deepseek_moe_backend,
 )
 
 DEFAULT_OCR_ENV_NAME = "sneeze-ocr-vllm"
@@ -613,6 +616,16 @@ class OcrPdfPages(InvariantAwareCommand):
         _help = "vLLM multimodal encoder attention backend override."
         _mandatory = False
 
+    moe_backend = None
+    _moe_backend = None
+
+    class MoeBackendArg(StringInvariant):
+        _help = (
+            "vLLM MoE backend: auto or triton. [default: %default]"
+        )
+        _mandatory = False
+        _default = DEFAULT_DEEPSEEK_MOE_BACKEND
+
     scheduler_delay_factor = None
     _scheduler_delay_factor = None
 
@@ -912,6 +925,14 @@ class OcrPdfPages(InvariantAwareCommand):
                     window_size,
                     DEFAULT_MARKDOWN_WINDOW_SIZE,
                 )
+            moe_backend = validate_deepseek_moe_backend(
+                grounded_settings.get(
+                    "moe_backend",
+                    _option_value(
+                        self, "moe_backend", DEFAULT_DEEPSEEK_MOE_BACKEND
+                    ),
+                ).strip().lower()
+            )
             if structured is not None:
                 deepseek_installation = structured["installations"][
                     "deepseek-vllm"
@@ -976,6 +997,7 @@ class OcrPdfPages(InvariantAwareCommand):
                         _option_value(self, "mm_encoder_attn_backend"),
                     )
                 ),
+                moe_backend=moe_backend,
                 scheduler_delay_factor=grounded_settings.get(
                     "scheduler_delay_factor", scheduler_delay_factor
                 ),
@@ -1003,7 +1025,7 @@ class OcrPdfPages(InvariantAwareCommand):
                 )
             else:
                 processor.run(tasks)
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             raise CommandError(str(exc)) from exc
         finally:
             if structured_environment is not None:
@@ -1242,6 +1264,11 @@ class OcrPdfPages(InvariantAwareCommand):
             ("max_tokens", 8192, "--max-tokens"),
             ("ngram_size", 10, "--ngram-size"),
             ("window_size", DEFAULT_OCR_WINDOW_SIZE, "--window-size"),
+            (
+                "moe_backend",
+                DEFAULT_DEEPSEEK_MOE_BACKEND,
+                "--moe-backend",
+            ),
         )
         for name, expected, option in exact_defaults:
             value = _option_value(self, name, expected)
@@ -1442,6 +1469,9 @@ class OcrPdfPages(InvariantAwareCommand):
                     deepseek_installation = execution_plan["installations"][
                         "deepseek-vllm"
                     ]
+                    execution_settings = execution_plan.get("tier", {}).get(
+                        "stages", {}
+                    ).get("grounded_ocr", {}).get("settings")
                     mismatches = deepseek_engine_identity_mismatches(
                         execution_plan["profile"],
                         installation=deepseek_installation,
@@ -1450,6 +1480,7 @@ class OcrPdfPages(InvariantAwareCommand):
                             "_engine_metadata",
                             {},
                         ),
+                        execution_settings=execution_settings,
                     )
                     if mismatches:
                         raise RuntimeError(
@@ -2969,6 +3000,17 @@ class OcrProfileTune(InvariantAwareCommand):
         )
         _mandatory = False
 
+    deepseek_moe_backend = None
+    _deepseek_moe_backend = None
+
+    class DeepseekMoeBackendArg(StringInvariant):
+        _help = (
+            "DeepSeek MoE backend to qualify; must be triton. "
+            "[default: %default]"
+        )
+        _mandatory = False
+        _default = QUALIFIED_DEEPSEEK_MOE_BACKEND
+
     mineru_attention_backend = None
     _mineru_attention_backend = None
 
@@ -3303,6 +3345,11 @@ class OcrProfileTune(InvariantAwareCommand):
                 discovery_repeats=self._discovery_repeats or 1,
                 confirmation_repeats=self._confirmation_repeats or 5,
                 timeout_seconds=self._timeout_seconds or 3600,
+                deepseek_moe_backend=_option_value(
+                    self,
+                    "deepseek_moe_backend",
+                    QUALIFIED_DEEPSEEK_MOE_BACKEND,
+                ),
             )
             if self.dry_run:
                 self._out(

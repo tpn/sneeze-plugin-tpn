@@ -104,6 +104,7 @@ def _qualified_profile() -> dict:
         "memory_budget_bytes": budget,
         "memory_tier": "max",
         "mm_encoder_attn_backend": "auto",
+        "moe_backend": "triton",
         "ngram_size": 10,
         "temperature": 0.0,
         "window_size": 50,
@@ -764,6 +765,7 @@ def test_selected_profile_drives_exact_deepseek_processor_arguments(
         "memory_budget_bytes": 20 * GIB,
         "memory_tier": "50",
         "mm_encoder_attn_backend": "auto",
+        "moe_backend": "triton",
         "ngram_size": 10,
         "temperature": 0.0,
         "window_size": 50,
@@ -859,6 +861,7 @@ def test_selected_profile_drives_exact_deepseek_processor_arguments(
     assert kwargs["max_num_seqs"] == 3
     assert kwargs["attention_backend"] == "FLASH_ATTN"
     assert kwargs["mm_encoder_attn_backend"] is None
+    assert kwargs["moe_backend"] == "triton"
     assert kwargs["gpu_memory_utilization"] == 0.4
     assert kwargs["temperature"] == 0.0
     assert kwargs["max_tokens"] == 8192

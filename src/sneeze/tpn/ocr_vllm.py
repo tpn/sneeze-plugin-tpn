@@ -22,6 +22,12 @@ DEFAULT_OCR_MODEL = "deepseek-ai/DeepSeek-OCR"
 DEFAULT_OCR_MODEL_REVISION = "9f30c71f441d010e5429c532364a86705536c53a"
 DEFAULT_OCR_WINDOW_SIZE = 50
 DEFAULT_MARKDOWN_WINDOW_SIZE = 128
+DEFAULT_DEEPSEEK_MOE_BACKEND = "auto"
+QUALIFIED_DEEPSEEK_MOE_BACKEND = "triton"
+DEEPSEEK_MOE_BACKENDS = frozenset({"auto", "triton"})
+DEEPSEEK_MAX_JOBS = 1
+DEEPSEEK_FLASHINFER_NVCC_THREADS = 1
+DEEPSEEK_JIT_ENV_NAMES = ("MAX_JOBS", "FLASHINFER_NVCC_THREADS")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _STRUCTURED_EXECUTION_RECEIPT_KEYS = frozenset(
     {
@@ -45,6 +51,30 @@ _STRUCTURED_EXECUTION_RECEIPT_KEYS = frozenset(
         "receipt_sha256",
     }
 )
+
+
+def validate_deepseek_moe_backend(moe_backend: object) -> str:
+    """Validate the modeled vLLM MoE implementation selector."""
+
+    if not isinstance(moe_backend, str) or (
+        moe_backend not in DEEPSEEK_MOE_BACKENDS
+    ):
+        raise ValueError(
+            "DeepSeek moe_backend must be one of: "
+            + ", ".join(sorted(DEEPSEEK_MOE_BACKENDS))
+        )
+    return moe_backend
+
+
+def deepseek_jit_environment() -> dict[str, str]:
+    """Return the fixed implementation-bound JIT environment."""
+
+    return {
+        "MAX_JOBS": str(DEEPSEEK_MAX_JOBS),
+        "FLASHINFER_NVCC_THREADS": str(
+            DEEPSEEK_FLASHINFER_NVCC_THREADS
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -1341,6 +1371,7 @@ def engine_metadata(
     model_revision: str | None,
     requested_attention_backend: str | None,
     requested_mm_encoder_attn_backend: str | None,
+    requested_moe_backend: str,
     startup_installed_distributions: dict[str, object],
     engine_init_kwargs: dict | None = None,
 ) -> dict:
@@ -1354,6 +1385,7 @@ def engine_metadata(
         vllm = None
     configured_backend = None
     configured_dtype = None
+    configured_moe_backend = None
     try:
         vllm_config = llm.llm_engine.vllm_config
         configured_backend = vllm_config.attention_config.backend
@@ -1366,6 +1398,17 @@ def engine_metadata(
     except Exception:
         configured_backend = None
         configured_dtype = None
+    try:
+        configured_moe_backend = (
+            llm.llm_engine.vllm_config.kernel_config.moe_backend
+        )
+        configured_moe_backend = getattr(
+            configured_moe_backend,
+            "value",
+            configured_moe_backend,
+        )
+    except Exception:
+        configured_moe_backend = None
     return {
         "model": resolve_model_metadata(model, model_revision),
         "runtime": {
@@ -1389,6 +1432,11 @@ def engine_metadata(
             "mm_encoder_attention_backend_requested": (
                 requested_mm_encoder_attn_backend
             ),
+            "moe_backend_requested": requested_moe_backend,
+            "moe_backend_configured": configured_moe_backend,
+            "jit_environment": {
+                name: os.environ.get(name) for name in DEEPSEEK_JIT_ENV_NAMES
+            },
             "vllm_batch_invariant": os.environ.get(
                 "VLLM_BATCH_INVARIANT",
                 "0",
@@ -1631,6 +1679,7 @@ class DeepSeekOcrOfflineProcessor:
         max_num_seqs: int | None = None,
         attention_backend: str | None = None,
         mm_encoder_attn_backend: str | None = None,
+        moe_backend: str = DEFAULT_DEEPSEEK_MOE_BACKEND,
         scheduler_delay_factor: float | None = None,
         tensor_parallel_size: int | None = None,
         gpu_memory_utilization: float | None = None,
@@ -1666,6 +1715,7 @@ class DeepSeekOcrOfflineProcessor:
         self.max_num_seqs = max_num_seqs
         self.attention_backend = attention_backend
         self.mm_encoder_attn_backend = mm_encoder_attn_backend
+        self.moe_backend = validate_deepseek_moe_backend(moe_backend)
         self.scheduler_delay_factor = scheduler_delay_factor
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
@@ -1680,6 +1730,7 @@ class DeepSeekOcrOfflineProcessor:
         self._tqdm = None
         self.generation_metadata: dict[str, dict] = {}
         self._engine_metadata: dict = {}
+        self._jit_environment_previous: dict[str, str | None] | None = None
 
     def prepare_engine(self):
         return self._build_llm_and_params()
@@ -1746,6 +1797,14 @@ class DeepSeekOcrOfflineProcessor:
         self._tqdm = None
 
     def _build_llm_and_params(self):
+        self._activate_jit_environment()
+        try:
+            return self._build_llm_and_params_with_jit_environment()
+        except BaseException:
+            self._restore_jit_environment()
+            raise
+
+    def _build_llm_and_params_with_jit_environment(self):
         prepare_vllm_process_env(verbose=self._verbose)
         try:
             from vllm import LLM, SamplingParams
@@ -1769,6 +1828,7 @@ class DeepSeekOcrOfflineProcessor:
             "disable_mm_preprocessor_cache": True,
             "logits_processors": [NGramPerReqLogitsProcessor],
             "trust_remote_code": True,
+            "moe_backend": self.moe_backend,
         }
         self._maybe_add(llm_kwargs, "revision", self.model_revision)
         self._maybe_add(
@@ -1838,6 +1898,7 @@ class DeepSeekOcrOfflineProcessor:
             requested_mm_encoder_attn_backend=(
                 self.mm_encoder_attn_backend
             ),
+            requested_moe_backend=self.moe_backend,
             startup_installed_distributions=(
                 self._startup_installed_distributions
             ),
@@ -2120,8 +2181,18 @@ class DeepSeekOcrOfflineProcessor:
                 from vllm import LLM
             except Exception:
                 return kwargs
-            return self._filter_kwargs(LLM.__init__, kwargs)
-        return self._filter_kwargs(EngineArgs.__init__, kwargs)
+            filtered = self._filter_kwargs(LLM.__init__, kwargs)
+        else:
+            filtered = self._filter_kwargs(EngineArgs.__init__, kwargs)
+        if (
+            self.moe_backend != DEFAULT_DEEPSEEK_MOE_BACKEND
+            and "moe_backend" not in filtered
+        ):
+            raise RuntimeError(
+                "the installed vLLM does not support explicit "
+                f"moe_backend={self.moe_backend}"
+            )
+        return filtered
 
     def _maybe_add(self, kwargs: dict, key: str, value) -> None:
         if value is not None:
@@ -2168,7 +2239,32 @@ class DeepSeekOcrOfflineProcessor:
         message = str(exc).strip()
         return message or exc.__class__.__name__
 
+    def _activate_jit_environment(self) -> None:
+        if self._jit_environment_previous is not None:
+            raise RuntimeError("DeepSeek engine lifecycle is already active")
+        self._jit_environment_previous = {
+            name: os.environ.get(name) for name in DEEPSEEK_JIT_ENV_NAMES
+        }
+        os.environ.update(deepseek_jit_environment())
+
+    def _restore_jit_environment(self) -> None:
+        previous = self._jit_environment_previous
+        if previous is None:
+            return
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        self._jit_environment_previous = None
+
     def shutdown_engine(self, llm) -> None:
+        try:
+            self._shutdown_engine(llm)
+        finally:
+            self._restore_jit_environment()
+
+    def _shutdown_engine(self, llm) -> None:
         if llm is None:
             return
         llm_engine = getattr(llm, "llm_engine", None)

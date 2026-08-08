@@ -161,7 +161,7 @@ _TIER_STAGE_KEYS = frozenset(
         "confirmed_pages_per_second",
     }
 )
-_DEEPSEEK_TIER_SETTING_KEYS = frozenset(
+_DEEPSEEK_LEGACY_TIER_SETTING_KEYS = frozenset(
     {
         "attention_backend",
         "batch_size",
@@ -179,6 +179,14 @@ _DEEPSEEK_TIER_SETTING_KEYS = frozenset(
         "temperature",
         "window_size",
     }
+)
+_DEEPSEEK_RUNTIME_CONTROL_KEYS = frozenset({"moe_backend"})
+_DEEPSEEK_TIER_SETTING_KEYS = (
+    _DEEPSEEK_LEGACY_TIER_SETTING_KEYS | _DEEPSEEK_RUNTIME_CONTROL_KEYS
+)
+_QUALIFIED_DEEPSEEK_MOE_BACKEND = "triton"
+_DEEPSEEK_LEGACY_IMPLEMENTATION_SHA256 = (
+    "1572663ce37a0735db51abb66454a0b1c5cbd8db7dc8bb96153698342f2e58be"
 )
 _MINERU_TIER_SETTING_KEYS = frozenset(
     {
@@ -681,6 +689,7 @@ def _validate_tier_stage(
     label: str,
     *,
     backend_id: str,
+    implementation_sha256: str,
     memory_tier: str,
     budget_bytes: int,
     total_memory_bytes: int,
@@ -696,7 +705,19 @@ def _validate_tier_stage(
         raise OcrProfileError(
             f"{label} has no validated settings schema for {backend_id}"
         )
-    _require_exact_keys(settings, expected_keys, f"{label}.settings")
+    legacy_deepseek_settings = (
+        backend_id == "deepseek-vllm"
+        and set(settings) == _DEEPSEEK_LEGACY_TIER_SETTING_KEYS
+        and implementation_sha256
+        == _DEEPSEEK_LEGACY_IMPLEMENTATION_SHA256
+    )
+    if legacy_deepseek_settings:
+        # Existing sealed profiles remain readable. Their implementation
+        # selector prevents reuse with runtime-control-aware source until
+        # the GPU is requalified and a new profile is trusted.
+        pass
+    else:
+        _require_exact_keys(settings, expected_keys, f"{label}.settings")
     batch_size = settings.get("batch_size")
     _require_positive_integer(batch_size, f"{label}.settings.batch_size")
     if settings["memory_tier"] != memory_tier:
@@ -762,6 +783,15 @@ def _validate_tier_stage(
             )
         for key in ("attention_backend", "mm_encoder_attn_backend"):
             _require_text(settings[key], f"{label}.settings.{key}")
+        if set(settings) == _DEEPSEEK_TIER_SETTING_KEYS:
+            moe_backend = _require_text(
+                settings["moe_backend"],
+                f"{label}.settings.moe_backend",
+            )
+            if moe_backend != _QUALIFIED_DEEPSEEK_MOE_BACKEND:
+                raise OcrProfileError(
+                    f"{label}.settings.moe_backend must be triton"
+                )
         if (
             settings["max_tokens"] != 8192
             or settings["ngram_size"] != 10
@@ -808,6 +838,7 @@ def _validate_memory_tiers(
     memory_model: str,
     total_memory_bytes: int,
     pipeline_stages: Mapping[str, Mapping[str, Any]],
+    profile_stages: Mapping[str, Mapping[str, Any]],
 ) -> set[str]:
     tiers = _require_mapping(value, "memory_tiers")
     if set(tiers) != set(MEMORY_TIERS):
@@ -889,6 +920,9 @@ def _validate_memory_tiers(
                     stage_settings[stage_id],
                     f"{label}.stages.{stage_id}",
                     backend_id=pipeline_stages[stage_id]["backend_id"],
+                    implementation_sha256=profile_stages[stage_id][
+                        "runtime_selector"
+                    ]["implementation_sha256"],
                     memory_tier=tier_name,
                     budget_bytes=budget,
                     total_memory_bytes=total_memory_bytes,
@@ -1042,6 +1076,7 @@ def _validate_profile_payload(
         memory_model=selector["memory_model"],
         total_memory_bytes=selector["total_memory_bytes"],
         pipeline_stages=pipeline_stages,
+        profile_stages=profile["stages"],
     )
     _validate_qualification(
         profile["qualification"], supported_tiers=supported_tiers

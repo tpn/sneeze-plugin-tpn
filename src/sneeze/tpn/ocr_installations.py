@@ -72,6 +72,19 @@ print(json.dumps(
     separators=(",", ":"),
 ))
 """.strip()
+_RUNTIME_PACKAGE_PROBE_CODE = r"""
+import json
+import sys
+from importlib.metadata import PackageNotFoundError, version
+
+packages = {}
+for name in sys.argv[1:]:
+    try:
+        packages[name] = version(name)
+    except PackageNotFoundError:
+        packages[name] = None
+print(json.dumps(packages, sort_keys=True, separators=(",", ":")))
+""".strip()
 
 
 class InstallationRegistryError(ValueError):
@@ -134,6 +147,7 @@ def build_backend_installation(
     backend = _resolve_backend(backend_id)
     python_path = _require_executable(python_executable)
     _validate_python_environment_tree(python_path)
+    _validate_qualified_runtime_packages(backend, python_path)
     cache_path = _require_directory(hf_cache, "Hugging Face cache")
     visible = _single_gpu_visible_device(
         cuda_visible_devices,
@@ -1061,14 +1075,7 @@ def _validate_pth_import_roots(environment_root: Path) -> None:
                 )
 
 
-def _probe_installed_distributions(python_path: Path) -> dict[str, Any]:
-    """Return the complete installed-distribution identity for one Python."""
-
-    from .ocr_execution import (
-        OcrExecutionError,
-        _run_bounded_runtime_probe,
-    )
-
+def _isolated_python_probe_environment() -> dict[str, str]:
     environment = {
         name: value
         for name, value in os.environ.items()
@@ -1077,6 +1084,97 @@ def _probe_installed_distributions(python_path: Path) -> dict[str, Any]:
         and "\x00" not in value
     }
     environment["PYTHONNOUSERSITE"] = "1"
+    return environment
+
+
+def _probe_runtime_packages(
+    python_path: Path,
+    names: tuple[str, ...],
+    *,
+    runner: Any = subprocess.run,
+) -> dict[str, str | None]:
+    """Probe exact distribution metadata versions in an isolated child."""
+
+    from .ocr_execution import (
+        OcrExecutionError,
+        _run_bounded_runtime_probe,
+    )
+
+    try:
+        completed = _run_bounded_runtime_probe(
+            [
+                str(python_path),
+                "-I",
+                "-B",
+                "-c",
+                _RUNTIME_PACKAGE_PROBE_CODE,
+                *names,
+            ],
+            environment=_isolated_python_probe_environment(),
+            timeout_seconds=60,
+            runner=runner,
+        )
+    except OcrExecutionError as exc:
+        raise InstallationRegistryError(
+            "could not inspect runtime package versions: "
+            f"{type(exc).__name__}"
+        ) from exc
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    try:
+        value = json.loads(lines[-1]) if lines else None
+    except json.JSONDecodeError as exc:
+        raise InstallationRegistryError(
+            "runtime package probe returned invalid JSON"
+        ) from exc
+    if (
+        completed.returncode != 0
+        or not isinstance(value, Mapping)
+        or set(value) != set(names)
+        or any(
+            item is not None and not isinstance(item, str)
+            for item in value.values()
+        )
+    ):
+        raise InstallationRegistryError("runtime package probe failed")
+    return dict(value)
+
+
+def _validate_qualified_runtime_packages(
+    backend: Any,
+    python_path: Path,
+    *,
+    runner: Any = subprocess.run,
+) -> None:
+    expected = dict(backend.runtime_packages)
+    observed = _probe_runtime_packages(
+        python_path,
+        tuple(expected),
+        runner=runner,
+    )
+    mismatches = [
+        (name, expected_version, observed.get(name))
+        for name, expected_version in expected.items()
+        if observed.get(name) != expected_version
+    ]
+    if mismatches:
+        details = "; ".join(
+            f"{name}: expected {expected_version!r}, observed {actual!r}"
+            for name, expected_version, actual in mismatches
+        )
+        raise InstallationRegistryError(
+            f"runtime packages are not qualified for {backend.backend_id}: "
+            f"{details}"
+        )
+
+
+def _probe_installed_distributions(python_path: Path) -> dict[str, Any]:
+    """Return the complete installed-distribution identity for one Python."""
+
+    from .ocr_execution import (
+        OcrExecutionError,
+        _run_bounded_runtime_probe,
+    )
+
     try:
         completed = _run_bounded_runtime_probe(
             [
@@ -1086,7 +1184,7 @@ def _probe_installed_distributions(python_path: Path) -> dict[str, Any]:
                 "-c",
                 _DISTRIBUTION_PROBE_CODE,
             ],
-            environment=environment,
+            environment=_isolated_python_probe_environment(),
             timeout_seconds=60,
             runner=subprocess.run,
         )

@@ -291,6 +291,7 @@ def _benchmark_evidence(
                     "max_num_batched_tokens",
                     "max_num_seqs",
                     "mm_encoder_attn_backend",
+                    "moe_backend",
                 )
             },
             "sampling_params": {
@@ -496,6 +497,7 @@ def test_tuning_plan_has_stage_specific_memory_candidates(tmp_path):
         1024**3
     )
     assert deepseek["settings"]["max_tokens"] == 8192
+    assert deepseek["settings"]["moe_backend"] == "triton"
     assert {
         candidate["settings"]["batch_size"]
         for candidate in plan["candidates"]
@@ -520,6 +522,24 @@ def test_tuning_plan_has_stage_specific_memory_candidates(tmp_path):
         )
         spec = build_candidate_provider_spec(plan, candidate)
         assert spec["argv"][1:3] == ["-I", "-B"]
+        if backend_id == "deepseek-vllm":
+            assert spec["env"]["MAX_JOBS"] == "1"
+            assert spec["env"]["FLASHINFER_NVCC_THREADS"] == "1"
+
+
+def test_tuning_plan_rejects_auto_moe_backend(tmp_path):
+    from sneeze.tpn.ocr_tuning import TuningError, build_tuning_plan
+
+    manifest, inputs, installations = _files(tmp_path)
+    with pytest.raises(TuningError, match="requires moe_backend=triton"):
+        build_tuning_plan(
+            pipeline_id="local-mineru25",
+            hardware=_hardware(),
+            installations=installations,
+            manifest_path=manifest,
+            input_root=inputs,
+            deepseek_moe_backend="auto",
+        )
 
 
 @pytest.mark.parametrize(

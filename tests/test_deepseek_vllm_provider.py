@@ -145,6 +145,7 @@ def _settings(**updates) -> dict:
         "memory_budget_bytes": 500,
         "memory_tier": "50",
         "mm_encoder_attn_backend": None,
+        "moe_backend": "triton",
         **adapter.FIXED_QUALITY_SETTINGS,
     }
     settings.update(updates)
@@ -272,6 +273,15 @@ class FakeProcessor:
                     "attention_backend_requested": "FLASH_ATTN",
                     "attention_backend_selected": "FLASH_ATTN",
                     "mm_encoder_attention_backend_requested": None,
+                    "moe_backend_requested": "triton",
+                    "moe_backend_configured": "triton",
+                    "jit_environment": {
+                        "MAX_JOBS": "1",
+                        "FLASHINFER_NVCC_THREADS": "1",
+                    },
+                    "engine_init_kwargs": {
+                        "moe_backend": "triton",
+                    },
                 },
                 "sampling_params": {
                     "max_tokens": 8192,
@@ -507,6 +517,8 @@ def test_provider_reuses_one_engine_and_records_complete_telemetry(
         "installed_distributions_identity",
         installed_distributions_identity,
     )
+    monkeypatch.setenv("MAX_JOBS", "1")
+    monkeypatch.setenv("FLASHINFER_NVCC_THREADS", "1")
 
     adapter.run_provider(
         requests_path=requests_path,
@@ -545,6 +557,7 @@ def test_provider_reuses_one_engine_and_records_complete_telemetry(
     assert processor.kwargs["attention_backend"] == "FLASH_ATTN"
     assert processor.kwargs["mm_encoder_attn_backend"] is None
     assert processor.kwargs["enable_chunked_prefill"] is False
+    assert processor.kwargs["moe_backend"] == "triton"
     assert processor.kwargs["max_tokens"] == 8192
     assert processor.kwargs["ngram_size"] == 10
     assert processor.kwargs["window_size"] == 50
@@ -601,6 +614,10 @@ def test_provider_reuses_one_engine_and_records_complete_telemetry(
             adapter.FIXED_QUALITY_SETTINGS
         )
         assert params["execution_settings"]["memory_tier"] == "50"
+        assert response["runtime"]["jit_environment"] == {
+            "MAX_JOBS": "1",
+            "FLASHINFER_NVCC_THREADS": "1",
+        }
         assert params["execution_settings"]["memory_budget_fraction"] == 0.5
         assert (
             params["execution_settings"]["engine_overhead_headroom_bytes"]
@@ -757,6 +774,8 @@ def test_unified_summary_records_linux_cgroup_and_aggregate_rss_deltas():
         ({"gpu_memory_utilization": 0}, "greater than zero"),
         ({"memory_tier": "75"}, "must be 25, 50, or max"),
         ({"attention_backend": "arbitrary"}, "not allowlisted"),
+        ({"moe_backend": "arbitrary"}, "moe_backend must be one of"),
+        ({"moe_backend": "auto"}, "requires moe_backend=triton"),
         ({"enable_chunked_prefill": 1}, "must be boolean"),
     ],
 )

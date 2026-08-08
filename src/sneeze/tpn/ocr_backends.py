@@ -36,10 +36,10 @@ MINERU_WEIGHTS_SHA256 = (
 # focused unit suite and GPU qualification.  The placeholders are replaced at
 # the end of a source-changing qualification cycle.
 DEEPSEEK_IMPLEMENTATION_SHA256 = (
-    "1289f449747f8cee57f07b66947a785422de3cf46fad4a2354a43b28ec93fdb8"
+    "9a586ef334cef8e2737a73949e7724520eeb15d865f706741a223a6ea36ba7dc"
 )
 MINERU_IMPLEMENTATION_SHA256 = (
-    "ce8b6c5507a86e68470e4d608ea2927d4ee8532dae231a233491fe4ca4c2ad66"
+    "b625af25938a2ef7cb185e914e999cea9f07d2ae58afc68f3483aa164b4321d0"
 )
 
 _REVISION_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")

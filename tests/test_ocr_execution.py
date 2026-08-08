@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -105,6 +106,7 @@ def _profile(*, provisional=False):
         "gpu_memory_utilization_denominator_bytes": 48 * GIB,
         "attention_backend": "auto",
         "mm_encoder_attn_backend": "auto",
+        "moe_backend": "triton",
         "enable_chunked_prefill": True,
         "max_tokens": 8192,
         "ngram_size": 10,
@@ -628,6 +630,8 @@ def test_engine_metadata_records_startup_distribution_identity(monkeypatch):
         "selected_attention_backend",
         lambda _llm: "FLASH_ATTN",
     )
+    for name, value in ocr_vllm.deepseek_jit_environment().items():
+        monkeypatch.setenv(name, value)
 
     metadata = ocr_vllm.engine_metadata(
         object(),
@@ -635,6 +639,7 @@ def test_engine_metadata_records_startup_distribution_identity(monkeypatch):
         model_revision="9f30c71f441d010e5429c532364a86705536c53a",
         requested_attention_backend="FLASH_ATTN",
         requested_mm_encoder_attn_backend=None,
+        requested_moe_backend="auto",
         startup_installed_distributions={
             "count": identity["count"],
             "sha256": identity["sha256"],
@@ -645,6 +650,9 @@ def test_engine_metadata_records_startup_distribution_identity(monkeypatch):
     assert metadata["runtime"]["installed_distributions_sha256"] == identity[
         "sha256"
     ]
+    assert metadata["runtime"][
+        "jit_environment"
+    ] == ocr_vllm.deepseek_jit_environment()
 
 
 def test_processor_captures_distribution_identity_before_engine(monkeypatch):
@@ -670,6 +678,120 @@ def test_processor_captures_distribution_identity_before_engine(monkeypatch):
         "count": identity["count"],
         "sha256": identity["sha256"],
     }
+
+
+@pytest.mark.parametrize(
+    ("moe_backend", "fails"),
+    (("auto", False), ("triton", True)),
+)
+def test_processor_rejects_explicit_moe_backend_dropped_by_old_vllm(
+    monkeypatch,
+    moe_backend,
+    fails,
+):
+    from sneeze.tpn import ocr_vllm
+
+    class OldEngineArgs:
+        def __init__(self, model):
+            self.model = model
+
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "vllm.engine", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.engine.arg_utils",
+        SimpleNamespace(EngineArgs=OldEngineArgs),
+    )
+    processor = ocr_vllm.DeepSeekOcrOfflineProcessor(
+        model="deepseek-ai/DeepSeek-OCR",
+        output_format="txt",
+        moe_backend=moe_backend,
+    )
+    kwargs = {"model": processor.model, "moe_backend": moe_backend}
+
+    if fails:
+        with pytest.raises(
+            RuntimeError,
+            match="does not support explicit moe_backend=triton",
+        ):
+            processor._filter_llm_kwargs(kwargs)
+    else:
+        assert processor._filter_llm_kwargs(kwargs) == {
+            "model": processor.model
+        }
+
+
+def test_processor_restores_fixed_jit_environment_after_prepare_failure(
+    monkeypatch,
+):
+    from sneeze.tpn import ocr_vllm
+
+    monkeypatch.setenv("MAX_JOBS", "17")
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    processor = ocr_vllm.DeepSeekOcrOfflineProcessor(
+        model="deepseek-ai/DeepSeek-OCR",
+        output_format="txt",
+    )
+
+    def fail_prepare():
+        assert {
+            name: os.environ.get(name)
+            for name in ocr_vllm.DEEPSEEK_JIT_ENV_NAMES
+        } == ocr_vllm.deepseek_jit_environment()
+        raise RuntimeError("synthetic prepare failure")
+
+    monkeypatch.setattr(
+        processor,
+        "_build_llm_and_params_with_jit_environment",
+        fail_prepare,
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic prepare failure"):
+        processor.prepare_engine()
+
+    assert os.environ["MAX_JOBS"] == "17"
+    assert "FLASHINFER_NVCC_THREADS" not in os.environ
+
+
+@pytest.mark.parametrize("shutdown_fails", (False, True))
+def test_processor_restores_fixed_jit_environment_after_shutdown(
+    monkeypatch,
+    shutdown_fails,
+):
+    from sneeze.tpn import ocr_vllm
+
+    monkeypatch.setenv("MAX_JOBS", "17")
+    monkeypatch.setenv("FLASHINFER_NVCC_THREADS", "19")
+    processor = ocr_vllm.DeepSeekOcrOfflineProcessor(
+        model="deepseek-ai/DeepSeek-OCR",
+        output_format="txt",
+    )
+    shutdown_environments = []
+
+    def shutdown():
+        shutdown_environments.append(
+            {
+                name: os.environ.get(name)
+                for name in ocr_vllm.DEEPSEEK_JIT_ENV_NAMES
+            }
+        )
+        if shutdown_fails:
+            raise RuntimeError("synthetic shutdown failure")
+
+    llm = SimpleNamespace(shutdown=shutdown, llm_engine=None)
+    monkeypatch.setattr(
+        processor,
+        "_build_llm_and_params_with_jit_environment",
+        lambda: (llm, object()),
+    )
+
+    prepared_llm, _params = processor.prepare_engine()
+    assert prepared_llm is llm
+    processor.shutdown_engine(prepared_llm)
+
+    assert shutdown_environments == [ocr_vllm.deepseek_jit_environment()]
+    assert os.environ["MAX_JOBS"] == "17"
+    assert os.environ["FLASHINFER_NVCC_THREADS"] == "19"
 
 
 def test_stage_model_mismatches_rejects_provider_model_drift():
@@ -734,6 +856,46 @@ def test_deepseek_engine_identity_binds_actual_loaded_engine(tmp_path):
         installation=installation,
         engine_metadata=metadata,
     ) == []
+
+    controlled_metadata = copy.deepcopy(metadata)
+    controlled_metadata["runtime"].update(
+        {
+            "moe_backend_requested": "triton",
+            "moe_backend_configured": "triton",
+            "jit_environment": {
+                "MAX_JOBS": "1",
+                "FLASHINFER_NVCC_THREADS": "1",
+            },
+        }
+    )
+    assert deepseek_engine_identity_mismatches(
+        profile,
+        installation=installation,
+        engine_metadata=controlled_metadata,
+        execution_settings={"moe_backend": "triton"},
+    ) == []
+
+    wrong_controls = copy.deepcopy(controlled_metadata)
+    wrong_controls["runtime"].update(
+        {
+            "moe_backend_requested": "auto",
+            "moe_backend_configured": "auto",
+            "jit_environment": {
+                "MAX_JOBS": "2",
+                "FLASHINFER_NVCC_THREADS": "1",
+            },
+        }
+    )
+    assert deepseek_engine_identity_mismatches(
+        profile,
+        installation=installation,
+        engine_metadata=wrong_controls,
+        execution_settings={"moe_backend": "triton"},
+    ) == [
+        "engine.runtime.moe_backend_requested differs from profile",
+        "engine.runtime.moe_backend_configured differs from profile",
+        "engine.runtime.jit_environment differs from implementation",
+    ]
 
     wrong_backend = copy.deepcopy(metadata)
     wrong_backend["runtime"]["attention_backend_selected"] = "TORCH_SDPA"
@@ -1096,8 +1258,25 @@ def test_bundled_profile_stages_match_backend_qualification_pins():
     from sneeze.tpn.ocr_backends import get_backend
     from sneeze.tpn.ocr_execution import validate_bundled_profile_registry
 
+    retained_legacy_profile = {
+        "profile_sha256": (
+            "0b15775d6931f451b4efa9bb77a38ca2c546a707932e4ddee33da11955ac7f58"
+        ),
+        "implementations": {
+            "deepseek-vllm": (
+                "1572663ce37a0735db51abb66454a0b1c5cbd8db7dc8bb96153698342f2e58be"
+            ),
+            "mineru25-pro-2605": (
+                "c0fc973d6d3314e83d6acb28884f983721f29af4da53218c1ba0ca38e021e779"
+            ),
+        },
+    }
     for profile in validate_bundled_profile_registry():
-        for stage in profile["stages"].values():
+        is_retained_legacy = (
+            profile["profile_sha256"]
+            == retained_legacy_profile["profile_sha256"]
+        )
+        for stage_id, stage in profile["stages"].items():
             backend = get_backend(stage["backend_id"])
             model = stage["model"]
             runtime = stage["runtime_selector"]
@@ -1111,10 +1290,22 @@ def test_bundled_profile_stages_match_backend_qualification_pins():
                     == backend.snapshot_identity_sha256
                 )
 
-            assert (
-                runtime["implementation_sha256"]
-                == backend.qualified_implementation_sha256
+            expected_implementation = (
+                retained_legacy_profile["implementations"][
+                    backend.backend_id
+                ]
+                if is_retained_legacy
+                else backend.qualified_implementation_sha256
             )
+            assert runtime["implementation_sha256"] == (
+                expected_implementation
+            )
+            if is_retained_legacy and stage_id == "grounded_ocr":
+                for tier in profile["memory_tiers"].values():
+                    if tier["supported"]:
+                        assert "moe_backend" not in tier["stages"][stage_id][
+                            "settings"
+                        ]
             assert runtime["python"] == backend.default_python
             assert runtime["engine"] == backend.runtime_engine
             assert (

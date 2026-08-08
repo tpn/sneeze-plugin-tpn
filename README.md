@@ -238,7 +238,11 @@ sne ocr-installation-list
 
 Registration validates and hashes the executable, pinned snapshot, adapter,
 reviewed implementation bundle, CUDA selection, and complete normalized Python
-distribution manifest, including transitive packages. A tuning plan binds the
+distribution manifest, including transitive packages. Before enrollment it
+also probes every modeled runtime distribution through the selected Python and
+requires its exact pinned version. This catches stale CUDA-wheel metadata (for
+example, `torch==2.11.0` where the backend requires
+`torch==2.11.0+cu130`) before an expensive GPU sweep. A tuning plan binds the
 installation record SHA-256 plus the executable, cache, snapshot, weights,
 adapter, and implementation identities. A resume accepts only that exact plan
 and its matching artifacts; reusing the same path with changed bytes is
@@ -287,6 +291,7 @@ sne ocr-profile-tune \
   --dest-dir /absolute/scratch/local-mineru25-tuning \
   --memory-tiers 25,50,max \
   --batch-sizes 1,2,4,8 \
+  --deepseek-moe-backend triton \
   --discovery-repeats 1 \
   --confirmation-repeats 5 \
   --timeout-seconds 3600 \
@@ -302,6 +307,16 @@ output-limit, and memory failures, selects the fastest eligible batch per tier,
 then confirms the selection with repeated cold runs. Interrupted sessions can
 resume only when their exact installation-bound plan and artifacts still
 match.
+
+Qualified DeepSeek tuning explicitly uses vLLM's Triton fused-MoE backend and
+records both the requested and configured value. `auto` is intentionally not
+eligible for a profile because its kernel choice can change with hardware,
+runtime, or cache state. During each DeepSeek engine lifetime the plugin also
+fixes and records `MAX_JOBS=1` and `FLASHINFER_NVCC_THREADS=1`, then restores
+the caller's prior environment during cleanup. These are implementation safety
+controls, not tuning knobs: they bound cold extension compilation on
+unified-memory systems such as GB10 while the selected Triton path avoids the
+problematic FlashInfer MoE JIT entirely.
 
 For DeepSeek, every tier/batch candidate is swept with 1, 2, and 4 GiB of
 explicit vLLM engine-overhead headroom (omitting a headroom that cannot fit the
@@ -465,6 +480,9 @@ your OS package manager or conda/mamba.
 
 Calling `ocr-pdf-pages` without `--pipeline` preserves the legacy manual
 DeepSeek/vLLM interface. It remains useful for grounded OCR and controlled
-experiments, but raw engine flags are intentionally outside the structured,
-GPU-profiled path. The lower-level local provider-spec and benchmark workflow
-is documented in [`benchmarks/ocr/README.md`](benchmarks/ocr/README.md).
+experiments. Raw mode accepts `--moe-backend auto|triton` and defaults to
+`auto`; an explicit `triton` request fails fast when the installed vLLM does
+not support that modeled engine argument. Raw engine flags remain outside the
+structured, GPU-profiled path. The lower-level local provider-spec and
+benchmark workflow is documented in
+[`benchmarks/ocr/README.md`](benchmarks/ocr/README.md).

@@ -123,6 +123,7 @@ def _sealed_profile(tmp_path, *, state="provisional"):
         "memory_budget_bytes": budget,
         "memory_tier": "max",
         "mm_encoder_attn_backend": "auto",
+        "moe_backend": "triton",
         "ngram_size": 10,
         "temperature": 0.0,
         "window_size": 50,

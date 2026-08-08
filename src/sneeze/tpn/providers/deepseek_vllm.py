@@ -145,6 +145,11 @@ DEFAULT_OCR_MODEL_REVISION = _ocr_vllm.DEFAULT_OCR_MODEL_REVISION
 DeepSeekOcrOfflineProcessor = _ocr_vllm.DeepSeekOcrOfflineProcessor
 OcrPageTask = _ocr_vllm.OcrPageTask
 ocr_image_dims = _ocr_vllm.ocr_image_dims
+deepseek_jit_environment = _ocr_vllm.deepseek_jit_environment
+QUALIFIED_DEEPSEEK_MOE_BACKEND = (
+    _ocr_vllm.QUALIFIED_DEEPSEEK_MOE_BACKEND
+)
+validate_deepseek_moe_backend = _ocr_vllm.validate_deepseek_moe_backend
 
 FIXED_INSTRUCTION = "Free OCR."
 FIXED_QUALITY_SETTINGS = {
@@ -166,6 +171,7 @@ EXECUTION_SETTING_KEYS = frozenset(
         "memory_budget_bytes",
         "memory_tier",
         "mm_encoder_attn_backend",
+        "moe_backend",
     }
 )
 REQUEST_SETTING_KEYS = EXECUTION_SETTING_KEYS | frozenset(
@@ -443,6 +449,16 @@ def validate_tuning_settings(settings: Any) -> dict[str, Any]:
     if not isinstance(settings["enable_chunked_prefill"], bool):
         raise DeepSeekBenchmarkAdapterError(
             "request tuning enable_chunked_prefill must be boolean"
+        )
+    try:
+        normalized["moe_backend"] = validate_deepseek_moe_backend(
+            settings["moe_backend"]
+        )
+    except ValueError as exc:
+        raise DeepSeekBenchmarkAdapterError(str(exc)) from exc
+    if normalized["moe_backend"] != QUALIFIED_DEEPSEEK_MOE_BACKEND:
+        raise DeepSeekBenchmarkAdapterError(
+            "DeepSeek profile tuning requires moe_backend=triton"
         )
     for key, expected in FIXED_QUALITY_SETTINGS.items():
         value = settings[key]
@@ -1125,6 +1141,20 @@ def _runtime_record(
             "vLLM runtime did not report the effective model dtype"
         )
     dtype = dtype.removeprefix("torch.")
+    requested_moe_backend = native_runtime.get("moe_backend_requested")
+    configured_moe_backend = native_runtime.get("moe_backend_configured")
+    if (
+        requested_moe_backend != effective_settings["moe_backend"]
+        or configured_moe_backend != effective_settings["moe_backend"]
+    ):
+        raise DeepSeekBenchmarkAdapterError(
+            "vLLM runtime did not attest the requested moe_backend"
+        )
+    expected_jit_environment = deepseek_jit_environment()
+    if native_runtime.get("jit_environment") != expected_jit_environment:
+        raise DeepSeekBenchmarkAdapterError(
+            "vLLM runtime did not attest the configured JIT environment"
+        )
     return {
         "python": platform.python_version(),
         "python_executable": sys.executable,
@@ -1147,6 +1177,9 @@ def _runtime_record(
         "mm_encoder_attention_backend": native_runtime.get(
             "mm_encoder_attention_backend_requested"
         ),
+        "moe_backend_requested": requested_moe_backend,
+        "moe_backend_configured": configured_moe_backend,
+        "jit_environment": expected_jit_environment,
         "torch_cuda": str(
             getattr(getattr(torch_module, "version", None), "cuda", None)
         ),
@@ -1448,6 +1481,16 @@ def run_provider(
             "device_total_memory_bytes"
         ]
         effective_settings = enforce_memory_budget(settings, total_memory)
+        expected_jit_environment = deepseek_jit_environment()
+        observed_jit_environment = {
+            name: os.environ.get(name) for name in expected_jit_environment
+        }
+        if observed_jit_environment != expected_jit_environment:
+            raise DeepSeekBenchmarkAdapterError(
+                "DeepSeek tuning requires provider-spec JIT controls; "
+                "MAX_JOBS and FLASHINFER_NVCC_THREADS must match the "
+                "fixed implementation values"
+            )
         snapshot = snapshot_resolver(model_id, revision)
         snapshot_record = snapshot_identity(snapshot, revision)
         processor = processor_class(
@@ -1471,6 +1514,7 @@ def run_provider(
             mm_encoder_attn_backend=effective_settings[
                 "mm_encoder_attn_backend"
             ],
+            moe_backend=effective_settings["moe_backend"],
             gpu_memory_utilization=effective_settings[
                 "gpu_memory_utilization"
             ],

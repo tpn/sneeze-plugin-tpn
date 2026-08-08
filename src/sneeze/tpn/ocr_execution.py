@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .ocr_process_lifecycle import isolated_subprocess_signal_guard
+from .ocr_vllm import deepseek_jit_environment
 
 SCHEMA_VERSION = 1
 _MAX_PROBE_OUTPUT_BYTES = 64 * 1024
@@ -745,6 +746,7 @@ def deepseek_engine_identity_mismatches(
     *,
     installation: Mapping[str, Any],
     engine_metadata: Mapping[str, Any],
+    execution_settings: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """Compare the loaded DeepSeek engine with its sealed identities.
 
@@ -900,6 +902,16 @@ def deepseek_engine_identity_mismatches(
             "engine.runtime.attention_backend_selected differs from "
             "installation"
         )
+    if execution_settings is not None:
+        expected_moe = execution_settings.get("moe_backend", "auto")
+        for key in ("moe_backend_requested", "moe_backend_configured"):
+            if loaded_runtime.get(key) != expected_moe:
+                reasons.append(f"engine.runtime.{key} differs from profile")
+        expected_jit = deepseek_jit_environment()
+        if loaded_runtime.get("jit_environment") != expected_jit:
+            reasons.append(
+                "engine.runtime.jit_environment differs from implementation"
+            )
     return list(dict.fromkeys(reasons))
 
 

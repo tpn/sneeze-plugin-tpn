@@ -27,6 +27,19 @@ def _stub_distribution_probe(monkeypatch):
     return original
 
 
+@pytest.fixture(autouse=True)
+def _stub_runtime_package_probe(monkeypatch):
+    from sneeze.tpn import ocr_installations
+
+    original = ocr_installations._validate_qualified_runtime_packages
+    monkeypatch.setattr(
+        ocr_installations,
+        "_validate_qualified_runtime_packages",
+        lambda _backend, _python: None,
+    )
+    return original
+
+
 def _make_executable(tmp_path, name="python"):
     executable = tmp_path / f"{name}-environment" / "bin" / name
     executable.parent.mkdir(parents=True)
@@ -355,6 +368,68 @@ def test_distribution_probe_routes_through_bounded_subprocess(
     assert captured["kwargs"]["environment"]["PYTHONNOUSERSITE"] == "1"
 
 
+def test_runtime_package_probe_accepts_the_exact_qualified_tuple(
+    tmp_path,
+    _stub_runtime_package_probe,
+):
+    from sneeze.tpn.ocr_backends import get_backend
+
+    backend = get_backend("deepseek-vllm")
+    expected = dict(backend.runtime_packages)
+    captured = {}
+
+    def runner(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(expected) + "\n",
+            stderr="",
+        )
+
+    executable = _make_executable(tmp_path)
+    _stub_runtime_package_probe(backend, executable, runner=runner)
+
+    assert captured["argv"][-len(expected) :] == list(expected)
+    assert captured["kwargs"]["env"]["PYTHONNOUSERSITE"] == "1"
+
+
+def test_runtime_package_probe_rejects_each_named_version_mismatch(
+    tmp_path,
+    _stub_runtime_package_probe,
+):
+    from sneeze.tpn.ocr_backends import get_backend
+    from sneeze.tpn.ocr_installations import InstallationRegistryError
+
+    backend = get_backend("deepseek-vllm")
+    observed = dict(backend.runtime_packages)
+    observed["torch"] = "2.11.0"
+    observed["torchvision"] = "0.26.0"
+
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(observed) + "\n",
+            stderr="",
+        )
+
+    with pytest.raises(InstallationRegistryError) as caught:
+        _stub_runtime_package_probe(
+            backend,
+            _make_executable(tmp_path),
+            runner=runner,
+        )
+
+    message = str(caught.value)
+    assert "torch: expected '2.11.0+cu130', observed '2.11.0'" in message
+    assert (
+        "torchvision: expected '0.26.0+cu130', observed '0.26.0'"
+        in message
+    )
+
+
 def _make_snapshot(tmp_path, backend, *, cache_name="hub"):
     from sneeze.tpn.ocr_backend_setup import expected_snapshot_path
 
@@ -435,12 +510,21 @@ def test_default_registry_path_obeys_xdg_and_home():
 
 
 def test_build_records_exact_machine_artifacts(tmp_path, monkeypatch):
+    from sneeze.tpn import ocr_installations
     from sneeze.tpn.ocr_backend_setup import file_sha256, sha256_json
     from sneeze.tpn.ocr_installations import build_backend_installation
 
     backend, _ = _install_unqualified_backends(monkeypatch)
     executable = _make_executable(tmp_path)
     cache, snapshot = _make_snapshot(tmp_path, backend)
+    runtime_probes = []
+    monkeypatch.setattr(
+        ocr_installations,
+        "_validate_qualified_runtime_packages",
+        lambda probed_backend, python_path: runtime_probes.append(
+            (probed_backend.backend_id, python_path)
+        ),
+    )
     record = build_backend_installation(
         "deepseek",
         python_executable=executable,
@@ -451,6 +535,7 @@ def test_build_records_exact_machine_artifacts(tmp_path, monkeypatch):
     )
 
     assert record["backend_id"] == backend.backend_id
+    assert runtime_probes == [(backend.backend_id, executable)]
     assert record["model"] == {
         "id": backend.model_id,
         "revision": backend.model_revision,
