@@ -145,6 +145,10 @@ class _IsolatedSubprocessSignalGuard:
         try:
             for signum in self._managed:
                 self._previous[signum] = signal.getsignal(signum)
+                if self._previous[signum] is None:
+                    raise IsolatedSubprocessLifecycleError(
+                        "cannot safely preserve a non-Python signal handler"
+                    )
                 if self._previous[signum] == signal.SIG_IGN:
                     continue
                 signal.signal(signum, self._handle)

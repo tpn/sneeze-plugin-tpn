@@ -321,8 +321,9 @@ class OcrPdfPages(InvariantAwareCommand):
     Recommended: select `--pipeline local-mineru25` to run registered
     DeepSeek grounded OCR plus MinerU structured Markdown with an exact GPU
     execution profile. The pipeline implies `--execution-profile auto`; use
-    `--memory-tier 25`, `50`, or `max` (the default) to select a qualified
-    tier. Inspect setup with `sne ocr-backend-list`, registrations with
+    `--memory-tier 25`, `50`, or `max` to select a qualified tier, or omit it
+    to use the profile's highest supported tier. Inspect setup with
+    `sne ocr-backend-list`, registrations with
     `sne ocr-installation-list`, and profiles with `sne ocr-profile-list`.
 
     Pass `--pdf-to-pages` to render PDFs from `--source-dir` before OCR. The
@@ -453,7 +454,7 @@ class OcrPdfPages(InvariantAwareCommand):
         _arg = "--memory-tier"
         _help = (
             "Structured profile memory tier: 25, 50, or max. "
-            "[default in structured mode: max]"
+            "Defaults to the highest supported tier."
         )
         _mandatory = False
 
@@ -1083,8 +1084,11 @@ class OcrPdfPages(InvariantAwareCommand):
         )
         from .ocr_profiles import OcrProfileError, load_execution_profile
 
-        memory_tier = (_option_value(self, "memory_tier", "max")).lower()
-        if memory_tier not in {"25", "50", "max"}:
+        raw_memory_tier = _option_value(self, "memory_tier")
+        memory_tier = (
+            raw_memory_tier.lower() if raw_memory_tier is not None else None
+        )
+        if memory_tier is not None and memory_tier not in {"25", "50", "max"}:
             raise CommandError("--memory-tier must be 25, 50, or max")
         try:
             if profile_selection and profile_selection != "auto":
@@ -1158,6 +1162,7 @@ class OcrPdfPages(InvariantAwareCommand):
                 ),
                 allow_provisional=bool(self.allow_provisional_profile),
             )
+            memory_tier = resolved["memory_tier"]
             profile = resolved["profile"]
             tier = profile["memory_tiers"][memory_tier]
             grounded_settings = tier["stages"]["grounded_ocr"]["settings"]
@@ -1469,9 +1474,9 @@ class OcrPdfPages(InvariantAwareCommand):
                     deepseek_installation = execution_plan["installations"][
                         "deepseek-vllm"
                     ]
-                    execution_settings = execution_plan.get("tier", {}).get(
-                        "stages", {}
-                    ).get("grounded_ocr", {}).get("settings")
+                    execution_settings = execution_plan["tier"]["stages"][
+                        "grounded_ocr"
+                    ]["settings"]
                     mismatches = deepseek_engine_identity_mismatches(
                         execution_plan["profile"],
                         installation=deepseek_installation,
@@ -1500,11 +1505,18 @@ class OcrPdfPages(InvariantAwareCommand):
                         grounded_run_tasks,
                         grounded_candidates,
                     ) = _stage_grounded_ocr_tasks(ocr_tasks)
-                processor.run(
-                    grounded_run_tasks,
-                    llm=llm,
-                    sampling_params=sampling_params,
-                )
+                try:
+                    processor.run(
+                        grounded_run_tasks,
+                        llm=llm,
+                        sampling_params=sampling_params,
+                    )
+                except BaseException as exc:
+                    _discard_grounded_ocr_candidates(
+                        grounded_candidates,
+                        original_error=exc,
+                    )
+                    raise
                 if grounded_candidates:
                     _finalize_grounded_ocr_candidates(
                         processor,
@@ -2841,7 +2853,10 @@ class OcrHardwareProbe(InvariantAwareCommand):
     _torch_python = None
 
     class TorchPythonArg(StringInvariant):
-        _help = "Optional backend Python used for an isolated Torch probe."
+        _help = (
+            "Backend Python used for an isolated memory-topology probe; "
+            "without it tier budgets remain unavailable."
+        )
         _mandatory = False
 
     cuda_visible_devices = None
@@ -2866,12 +2881,29 @@ class OcrHardwareProbe(InvariantAwareCommand):
             make_hardware_receipt,
             probe_nvidia_hardware,
         )
+        from .ocr_path_security import (
+            TrustedPathError,
+            prepare_trusted_directory,
+            reject_protected_corpus_overlap,
+        )
 
         visible_devices = _option_value(
             self,
             "cuda_visible_devices",
         )
         try:
+            output = _option_value(self, "output")
+            output_path = Path(output).expanduser() if output else None
+            if output_path is not None:
+                reject_protected_corpus_overlap(
+                    output_path,
+                    label="hardware probe output",
+                )
+                output_parent = prepare_trusted_directory(
+                    output_path.parent,
+                    label="hardware probe output parent",
+                )
+                output_path = output_parent / output_path.name
             observation = probe_nvidia_hardware(
                 torch_python=_option_value(self, "torch_python"),
                 visible_devices=visible_devices,
@@ -2884,13 +2916,17 @@ class OcrHardwareProbe(InvariantAwareCommand):
                 observation,
                 memory_budgets=budgets,
             )
-            output = _option_value(self, "output")
-            if output:
+            if output_path is not None:
                 _atomic_write_new_bytes(
-                    Path(output).expanduser(),
+                    output_path,
                     json_bytes(receipt, pretty=True),
                 )
-        except (OSError, ValueError, HardwareProbeError) as exc:
+        except (
+            OSError,
+            ValueError,
+            HardwareProbeError,
+            TrustedPathError,
+        ) as exc:
             raise CommandError(str(exc)) from exc
         self._out(json_bytes(receipt, pretty=True).decode("utf-8").rstrip())
 
@@ -4158,6 +4194,18 @@ def _preflight_markdown_provider_run_dir(
                 "Markdown provider evidence directory must be "
                 f"separate from the OCR {label} directory"
             )
+    from .ocr_path_security import (
+        TrustedPathError,
+        reject_protected_corpus_overlap,
+    )
+
+    try:
+        reject_protected_corpus_overlap(
+            resolved,
+            label="Markdown provider evidence directory",
+        )
+    except TrustedPathError as exc:
+        raise CommandError(str(exc)) from exc
     return resolved
 
 
@@ -4217,14 +4265,33 @@ def _stage_grounded_ocr_tasks(tasks):
                     text_source_path=task.text_source_path,
                 )
             )
-    except BaseException:
-        for candidate in candidates.values():
-            try:
-                os.unlink(candidate)
-            except FileNotFoundError:
-                pass
+    except BaseException as exc:
+        _discard_grounded_ocr_candidates(
+            candidates,
+            original_error=exc,
+        )
         raise
     return staged, candidates
+
+
+def _discard_grounded_ocr_candidates(
+    candidates,
+    *,
+    original_error: BaseException | None = None,
+) -> None:
+    """Remove unowned staged OCR files after an interrupted generation."""
+
+    for candidate in candidates.values():
+        try:
+            os.unlink(candidate)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            if original_error is not None:
+                original_error.add_note(
+                    "could not remove staged OCR candidate "
+                    f"{os.path.basename(candidate)}: {exc}"
+                )
 
 
 def _finalize_grounded_ocr_candidates(processor, candidates) -> None:

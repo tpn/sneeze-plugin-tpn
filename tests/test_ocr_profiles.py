@@ -325,8 +325,11 @@ def test_profile_hash_is_canonical_and_detects_mutation():
         validate_execution_profile(profile)
 
 
-def test_known_legacy_implementation_profile_without_moe_is_readable():
-    from sneeze.tpn.ocr_profiles import seal_execution_profile
+def test_known_legacy_implementation_profile_without_moe_is_rejected():
+    from sneeze.tpn.ocr_profiles import (
+        OcrProfileError,
+        seal_execution_profile,
+    )
 
     legacy = _profile_payload()
     legacy["stages"]["grounded_ocr"]["runtime_selector"][
@@ -340,7 +343,8 @@ def test_known_legacy_implementation_profile_without_moe_is_readable():
                 "moe_backend"
             )
 
-    assert seal_execution_profile(legacy)["profile_sha256"]
+    with pytest.raises(OcrProfileError, match="missing moe_backend"):
+        seal_execution_profile(legacy)
 
 
 def test_profile_requires_triton_moe_for_runtime_control_aware_source():
@@ -505,6 +509,17 @@ def test_memory_tiers_are_exact_and_may_be_unsupported():
     with pytest.raises(OcrProfileError, match="budget_fraction must be 0.75"):
         seal_execution_profile(wrong_unified_max)
 
+    below_reserve = _profile_payload(
+        memory_model="unified",
+        supported=(),
+    )
+    below_reserve["hardware_selector"]["total_memory_bytes"] = 8 * GIB
+    for tier in below_reserve["memory_tiers"].values():
+        tier["budget_bytes"] = 0
+        tier["reserve_bytes"] = 16 * GIB
+    with pytest.raises(OcrProfileError, match="at least one memory tier"):
+        seal_execution_profile(below_reserve)
+
     bad_unsupported = _profile_payload(supported=("50", "max"))
     bad_unsupported["memory_tiers"]["25"]["stages"] = {
         "markdown": _tier_stage("markdown", TOTAL_MEMORY // 4, "25")
@@ -663,6 +678,40 @@ def test_exact_matching_ignores_host_uuid_and_observed_runtime_extras():
     )
 
 
+def test_unified_matching_uses_selected_tier_capacity_not_exact_total():
+    from sneeze.tpn.ocr_profiles import profile_match_report
+
+    profile = _profile(
+        memory_model="unified",
+        supported=("50", "max"),
+    )
+    observation = _observation(profile)
+    observation["hardware"]["selector"]["total_memory_bytes"] = 44 * GIB
+    observation["hardware"]["memory"] = {
+        "total_memory_bytes": 44 * GIB
+    }
+
+    report = profile_match_report(
+        profile,
+        observation,
+        memory_tier="50",
+        trusted_qualified_profile_sha256s=(profile["profile_sha256"],),
+    )
+
+    assert report["matched"] is True
+    observation["hardware"]["memory"]["total_memory_bytes"] = 39 * GIB
+    report = profile_match_report(
+        profile,
+        observation,
+        memory_tier="50",
+        trusted_qualified_profile_sha256s=(profile["profile_sha256"],),
+    )
+    assert report["matched"] is False
+    assert report["reasons"] == [
+        "hardware.total_memory_bytes is below selected tier requirement"
+    ]
+
+
 def test_selection_fails_closed_for_provisional_and_unsupported_tiers():
     from sneeze.tpn.ocr_profiles import (
         auto_select_execution_profile,
@@ -745,6 +794,8 @@ def test_trial_mode_never_trusts_a_self_declared_qualified_profile():
 
 def test_auto_select_reports_onboarding_and_ambiguity():
     from sneeze.tpn.ocr_profiles import (
+        OcrProfileAmbiguityError,
+        OcrProfileNoMatchError,
         OcrProfileSelectionError,
         auto_select_execution_profile,
         seal_execution_profile,
@@ -756,7 +807,7 @@ def test_auto_select_reports_onboarding_and_ambiguity():
     wrong_hardware["hardware"]["selector"]["product_name"] = (
         "NVIDIA RTX A6000"
     )
-    with pytest.raises(OcrProfileSelectionError, match="tuning workflow"):
+    with pytest.raises(OcrProfileNoMatchError, match="tuning workflow"):
         auto_select_execution_profile(
             [profile],
             wrong_hardware,
@@ -770,7 +821,7 @@ def test_auto_select_reports_onboarding_and_ambiguity():
     duplicate_payload.pop("profile_sha256")
     duplicate_payload["profile_id"] = "rtx-pro-6000-local-mineru25-copy"
     duplicate = seal_execution_profile(duplicate_payload)
-    with pytest.raises(OcrProfileSelectionError, match="multiple"):
+    with pytest.raises(OcrProfileAmbiguityError, match="multiple"):
         auto_select_execution_profile(
             [profile, duplicate],
             observation,
@@ -780,6 +831,9 @@ def test_auto_select_reports_onboarding_and_ambiguity():
                 duplicate["profile_sha256"],
             ),
         )
+
+    assert issubclass(OcrProfileNoMatchError, OcrProfileSelectionError)
+    assert issubclass(OcrProfileAmbiguityError, OcrProfileSelectionError)
 
 
 def test_profile_write_load_list_show_and_no_replace(tmp_path):
@@ -810,6 +864,110 @@ def test_profile_write_load_list_show_and_no_replace(tmp_path):
     with pytest.raises(OcrProfileError, match="output must be absolute"):
         write_execution_profile(profile, "relative-profile.json")
     assert list_execution_profiles([profile, profile]) == (profile,)
+
+
+def test_profile_write_rejects_untrusted_output_parent(tmp_path):
+    from sneeze.tpn.ocr_profiles import (
+        OcrProfileError,
+        write_execution_profile,
+    )
+
+    parent = tmp_path / "shared"
+    parent.mkdir(mode=0o770)
+    parent.chmod(0o770)
+
+    with pytest.raises(
+        OcrProfileError,
+        match="must not be writable by group or other users",
+    ):
+        write_execution_profile(_profile(), parent / "profile.json")
+
+
+def test_profile_write_rejects_protected_corpus_before_first_write(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn.ocr_profiles import (
+        OcrProfileError,
+        write_execution_profile,
+    )
+
+    protected = tmp_path / "canonical" / "papers"
+    protected.mkdir(parents=True)
+    config_home = tmp_path / "config"
+    policy = config_home / "sneeze" / "tpn" / "ocr-protected-roots"
+    policy.parent.mkdir(parents=True)
+    policy.write_text(f"{protected}\n", encoding="utf-8")
+    policy.chmod(0o600)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    destination = protected / "profiles" / "profile.json"
+
+    with pytest.raises(OcrProfileError, match="protected corpora"):
+        write_execution_profile(_profile(), destination)
+
+    assert not destination.parent.exists()
+
+
+def test_profile_write_keeps_symlinked_parent_fail_closed(tmp_path):
+    from sneeze.tpn.ocr_profiles import (
+        OcrProfileError,
+        write_execution_profile,
+    )
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    alias = tmp_path / "parent-alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(OcrProfileError, match="must not traverse symlinks"):
+        write_execution_profile(_profile(), alias / "profile.json")
+
+    assert list(real_parent.iterdir()) == []
+
+
+def test_profile_write_normalizes_link_failure_and_cleans_candidate(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn import ocr_profiles
+    from sneeze.tpn.ocr_profiles import OcrProfileError
+
+    destination = tmp_path / "profile.json"
+
+    def fail_link(_source, _destination):
+        raise OSError("synthetic link failure")
+
+    monkeypatch.setattr(ocr_profiles.os, "link", fail_link)
+    with pytest.raises(OcrProfileError, match="could not write"):
+        ocr_profiles.write_execution_profile(_profile(), destination)
+
+    assert not destination.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_profile_write_reports_cleanup_failure_inside_unrelated_handler(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn import ocr_profiles
+    from sneeze.tpn.ocr_profiles import OcrProfileError
+
+    destination = tmp_path / "profile.json"
+    original_unlink = ocr_profiles.Path.unlink
+
+    def fail_candidate_unlink(path, *args, **kwargs):
+        if path.name.endswith(".candidate"):
+            raise OSError("synthetic candidate cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(ocr_profiles.Path, "unlink", fail_candidate_unlink)
+    try:
+        raise RuntimeError("unrelated handled failure")
+    except RuntimeError:
+        with pytest.raises(OcrProfileError, match="could not clean up"):
+            ocr_profiles.write_execution_profile(_profile(), destination)
+
+    assert destination.is_file()
 
 
 def test_profile_file_rejects_duplicate_json_fields_at_any_depth(tmp_path):

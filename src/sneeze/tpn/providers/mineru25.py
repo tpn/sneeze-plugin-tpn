@@ -48,6 +48,7 @@ _IMPLEMENTATION_COMPONENT_PATHS = (
     "ocr_hardware.py",
     "ocr_implementation.py",
     "ocr_installations.py",
+    "ocr_memory.py",
     "ocr_path_security.py",
     "ocr_process_lifecycle.py",
     "ocr_profiles.py",
@@ -458,8 +459,17 @@ def load_profile_settings(
     if source.stat().st_size > _PROFILE_MAX_BYTES:
         raise ValueError("execution profile exceeds the size limit")
     try:
-        profile = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        profile = json.loads(
+            source.read_text(encoding="utf-8"),
+            object_pairs_hook=_strict_json_object,
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError("could not read execution profile") from exc
+    except ValueError as exc:
+        raise ValueError(
+            "execution profile contains a duplicate JSON object key"
+        ) from exc
+    except (OSError, UnicodeError) as exc:
         raise ValueError("could not read execution profile") from exc
     if not isinstance(profile, dict):
         raise ValueError("execution profile must be a JSON object")
@@ -691,47 +701,114 @@ def _cgroup_v2_memory(
         "available": False,
         "memory_max_bytes": None,
         "memory_max_is_unlimited": None,
+        "memory_available_bytes": None,
         "memory_current_bytes": None,
         "memory_peak_bytes": None,
     }
     directory = _cgroup_v2_directory(membership_path, cgroup_root)
     if directory is None:
         return result
-    try:
-        raw_maximum = (
-            (directory / "memory.max").read_text(encoding="utf-8").strip()
-        )
-    except (OSError, UnicodeError):
-        raw_maximum = None
-    if raw_maximum == "max":
-        result["memory_max_is_unlimited"] = True
-        result["available"] = True
-    elif (
-        isinstance(raw_maximum, str)
-        and len(raw_maximum) <= 64
-        and raw_maximum.isdecimal()
-    ):
+    directories = []
+    candidate = directory
+    while True:
+        directories.append(candidate)
+        if candidate == cgroup_root:
+            break
+        candidate = candidate.parent
+        if candidate != cgroup_root and cgroup_root not in candidate.parents:
+            return result
+    records: list[dict[str, int | str | None]] = []
+    for candidate in directories:
         try:
-            result["memory_max_bytes"] = int(raw_maximum)
-        except ValueError:
-            pass
+            raw_maximum = (
+                (candidate / "memory.max")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+        except (OSError, UnicodeError):
+            maximum: int | str | None = None
         else:
-            result["memory_max_is_unlimited"] = False
-            result["available"] = True
-    for filename, key in (
-        ("memory.current", "memory_current_bytes"),
-        ("memory.peak", "memory_peak_bytes"),
-    ):
-        value = _nonnegative_decimal_file(directory / filename)
-        if value is not None:
-            result[key] = value
-            result["available"] = True
+            maximum = (
+                raw_maximum
+                if raw_maximum == "max"
+                else (
+                    int(raw_maximum)
+                    if len(raw_maximum) <= 64
+                    and raw_maximum.isdecimal()
+                    else None
+                )
+            )
+        records.append(
+            {
+                "maximum": maximum,
+                "current": _nonnegative_decimal_file(
+                    candidate / "memory.current"
+                ),
+                "peak": _nonnegative_decimal_file(
+                    candidate / "memory.peak"
+                ),
+            }
+        )
+    maximums = [
+        record["maximum"]
+        for record in records
+        if isinstance(record["maximum"], int)
+        or record["maximum"] == "max"
+    ]
+    finite_maximums = [
+        value for value in maximums if isinstance(value, int)
+    ]
+    if maximums:
+        result["memory_max_bytes"] = (
+            min(finite_maximums) if finite_maximums else None
+        )
+        result["memory_max_is_unlimited"] = not finite_maximums
+        result["available"] = True
+    finite_records = [
+        record
+        for record in records
+        if isinstance(record["maximum"], int)
+    ]
+    headrooms = (
+        [
+            max(0, record["maximum"] - record["current"])
+            for record in finite_records
+        ]
+        if finite_records
+        and all(
+            isinstance(record["current"], int)
+            for record in finite_records
+        )
+        else []
+    )
+    if headrooms:
+        result["memory_available_bytes"] = min(headrooms)
+        result["available"] = True
+    if records:
+        nearest = records[0]
+        for source, key in (
+            ("current", "memory_current_bytes"),
+            ("peak", "memory_peak_bytes"),
+        ):
+            value = nearest[source]
+            if isinstance(value, int):
+                result[key] = value
+                result["available"] = True
     return result
 
 
 def _peak_process_rss_bytes() -> int:
     # Linux reports ru_maxrss in KiB. The adapter is Linux/CUDA-only.
     return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+
+
+def _cuda_integrated_property(properties) -> bool | None:
+    value = getattr(
+        properties,
+        "is_integrated",
+        getattr(properties, "integrated", None),
+    )
+    return bool(value) if value is not None else None
 
 
 class CudaMemoryTracker:
@@ -741,9 +818,7 @@ class CudaMemoryTracker:
         self.torch = torch
         self.device = device
         self.properties = torch.cuda.get_device_properties(device)
-        self.integrated = bool(
-            getattr(self.properties, "is_integrated", False)
-        )
+        self.integrated = _cuda_integrated_property(self.properties)
         self.samples: list[dict[str, Any]] = []
         torch.cuda.reset_peak_memory_stats(device)
         self.sample("before_model_load")
@@ -808,9 +883,11 @@ class CudaMemoryTracker:
             else None
         )
         return {
-            "memory_kind": (
-                "unified_system" if self.integrated else "dedicated_vram"
-            ),
+            "memory_kind": {
+                True: "unified_system",
+                False: "dedicated_vram",
+                None: "unknown",
+            }[self.integrated],
             "device_total_bytes": int(self.properties.total_memory),
             "baseline_cuda_free_bytes": baseline_free,
             "minimum_cuda_free_bytes": minimum_free,
@@ -834,8 +911,12 @@ class CudaMemoryTracker:
             "samples": list(self.samples),
             "authoritative_capacity_source": (
                 "linux_mem_available"
-                if self.integrated
-                else "cuda_device_total"
+                if self.integrated is True
+                else (
+                    "cuda_device_total"
+                    if self.integrated is False
+                    else "unknown"
+                )
             ),
         }
 
@@ -900,16 +981,16 @@ def _cgroup_v2_memory_summary(
         if baseline_peak is not None and maximum_peak is not None
         else None
     )
-    baseline_headroom = (
-        max(0, capacity - baseline_current)
-        if capacity is not None and baseline_current is not None
-        else None
-    )
-    minimum_headroom = (
-        max(0, capacity - maximum_current)
-        if capacity is not None and maximum_current is not None
-        else None
-    )
+    headroom_values = [
+        record["memory_available_bytes"]
+        for record in records
+        if isinstance(record.get("memory_available_bytes"), int)
+        and record["memory_available_bytes"] >= 0
+    ]
+    baseline_headroom = baseline_record.get("memory_available_bytes")
+    if not isinstance(baseline_headroom, int) or baseline_headroom < 0:
+        baseline_headroom = headroom_values[0] if headroom_values else None
+    minimum_headroom = min(headroom_values) if headroom_values else None
     headroom_delta = (
         max(0, baseline_headroom - minimum_headroom)
         if baseline_headroom is not None and minimum_headroom is not None
@@ -1021,9 +1102,7 @@ def runtime_metadata(
         "cuda_device": properties.name,
         "cuda_capability": list(torch.cuda.get_device_capability(device)),
         "cuda_total_memory_bytes": properties.total_memory,
-        "cuda_is_integrated": bool(
-            getattr(properties, "is_integrated", False)
-        ),
+        "cuda_is_integrated": _cuda_integrated_property(properties),
         "gpu_memory": (
             memory_tracker.as_dict() if memory_tracker is not None else None
         ),
@@ -1319,6 +1398,16 @@ def main() -> None:
                 ],
                 use_tqdm=False,
             )
+            runtime_record = runtime_metadata(
+                model,
+                processor,
+                memory_tracker=None,
+                memory_budget=memory_budget,
+                execution_profile=execution_profile,
+                startup_installed_distributions=(
+                    startup_installed_distributions
+                ),
+            )
             pipeline_record = pipeline_configuration(client, model)
         except Exception as exc:
             traceback_text = traceback.format_exc()
@@ -1382,16 +1471,10 @@ def main() -> None:
                     model_id=args.model_id,
                     revision=args.revision,
                     snapshot_record=snapshot_record,
-                    runtime_record=runtime_metadata(
-                        model,
-                        processor,
-                        memory_tracker=memory_tracker,
-                        memory_budget=memory_budget,
-                        execution_profile=execution_profile,
-                        startup_installed_distributions=(
-                            startup_installed_distributions
-                        ),
-                    ),
+                    runtime_record={
+                        **runtime_record,
+                        "gpu_memory": memory_tracker.as_dict(),
+                    },
                     pipeline_record=pipeline_record,
                 )
                 response = {

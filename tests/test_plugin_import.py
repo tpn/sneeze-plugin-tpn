@@ -556,6 +556,38 @@ def test_ocr_full_collection_skips_only_complete_bundles(tmp_path):
     assert items[0].need_json is True
 
 
+def test_complete_ocr_bundle_skips_image_hashing(tmp_path, monkeypatch):
+    import sneeze.tpn.ocr_vllm as ocr_vllm
+
+    image_path = tmp_path / "page-1.png"
+    image_path.write_bytes(VALID_PNG_BYTES)
+    for suffix, content in (
+        ("ocr", "grounded OCR"),
+        ("md", "markdown"),
+        ("json", '{"markdown_quality":{"status":"pass"}}'),
+    ):
+        (tmp_path / f"page-1.{suffix}").write_text(
+            content,
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        ocr_vllm,
+        "file_sha256",
+        lambda _path: pytest.fail("complete bundles must not hash the PNG"),
+    )
+
+    item = ocr_vllm.ocr_full_item_from_candidate(
+        ocr_vllm.OcrScanCandidate(
+            image_path=str(image_path),
+            base="page-1",
+        ),
+        str(tmp_path),
+        force=False,
+    )
+
+    assert item is None
+
+
 def test_ocr_full_collection_refreshes_rendered_image_bundle(tmp_path):
     from sneeze.tpn.ocr_vllm import collect_ocr_full_items
 
@@ -1985,6 +2017,47 @@ def test_markdown_provider_preparation_resolves_spec(
     )
     assert provider["spec_path"] == str(spec_path.resolve())
 
+
+def test_provider_evidence_and_profile_runtime_reject_protected_corpora(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.command import CommandError
+
+    from sneeze.tpn.commands import (
+        _create_profile_runtime_root,
+        _preflight_markdown_provider_run_dir,
+    )
+
+    protected = tmp_path / "canonical" / "papers"
+    protected.mkdir(parents=True)
+    config_home = tmp_path / "config"
+    policy = config_home / "sneeze" / "tpn" / "ocr-protected-roots"
+    policy.parent.mkdir(parents=True)
+    policy.write_text(f"{protected}\n", encoding="utf-8")
+    policy.chmod(0o600)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+
+    source_dir = str(tmp_path / "source")
+    dest_dir = str(tmp_path / "dest")
+    evidence = protected / "evidence"
+    with pytest.raises(CommandError, match="protected corpora"):
+        _preflight_markdown_provider_run_dir(
+            evidence,
+            source_dir=source_dir,
+            dest_dir=dest_dir,
+        )
+    assert not evidence.exists()
+
+    with pytest.raises(CommandError, match="protected corpora"):
+        _create_profile_runtime_root(
+            protected,
+            source_dir=source_dir,
+            dest_dir=dest_dir,
+        )
+    assert list(protected.glob(".sneeze-ocr-profile-*")) == []
+
+
 def test_structured_ocr_rejects_provider_lane_before_runtime_side_effects(
     tmp_path,
     monkeypatch,
@@ -2127,13 +2200,13 @@ def test_ocr_pdf_pages_help_leads_with_structured_pipeline(capsys):
     assert exc_info.value.code == 0
     help_text = " ".join(capsys.readouterr().out.split())
     assert "Recommended: select `--pipeline local-mineru25`" in help_text
-    assert "the default" in help_text
+    assert "highest supported tier" in help_text
     assert "Legacy manual mode" in help_text
     assert (
         "Comma-separated absolute profile JSON files or directories."
         in help_text
     )
-    assert "[default in structured mode: max]" in help_text
+    assert "Defaults to the highest supported tier." in help_text
     assert (
         "Legacy manual mode only: DeepSeek OCR model name or local path; "
         "structured pipelines pin the model." in help_text
@@ -2300,7 +2373,7 @@ def test_markdown_quality_accepts_supported_repetition():
     assert quality["flags"] == []
 
 
-def test_grounded_recall_ignores_layout_boxes_but_keeps_table_numbers():
+def test_grounded_recall_ignores_layout_markers_but_keeps_table_numbers():
     from sneeze.tpn.ocr_vllm import table_completion_metrics
 
     reference = """\
@@ -2325,7 +2398,7 @@ Table 9
     )
     metrics = table_completion_metrics(missing_layout_block, None, reference)
 
-    assert metrics["grounded_ocr_token_multiset_recall"] < 1.0
+    assert metrics["grounded_ocr_token_multiset_recall"] == 1.0
 
     missing_table_value = candidate.replace("value 519", "value 518")
     metrics = table_completion_metrics(missing_table_value, None, reference)

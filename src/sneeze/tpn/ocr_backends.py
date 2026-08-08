@@ -17,13 +17,41 @@ SCHEMA_VERSION = 1
 DEEPSEEK_BACKEND_ID = "deepseek-vllm"
 DEEPSEEK_MODEL_ID = "deepseek-ai/DeepSeek-OCR"
 DEEPSEEK_MODEL_REVISION = "9f30c71f441d010e5429c532364a86705536c53a"
+DEEPSEEK_SNAPSHOT_IDENTITY_SHA256 = (
+    "d3441a0d86320dbaaf7d3fce072e0f7be2f698975de42974fe987a320f3ef9d2"
+)
+DEEPSEEK_SNAPSHOT_REQUIRED_FILES = (
+    "config.json",
+    "configuration_deepseek_v2.py",
+    "conversation.py",
+    "deepencoder.py",
+    "model-00001-of-000001.safetensors",
+    "model.safetensors.index.json",
+    "modeling_deepseekocr.py",
+    "modeling_deepseekv2.py",
+    "processor_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+)
+DEEPSEEK_SNAPSHOT_IGNORED_FILES = (
+    ".gitattributes",
+    ".ipynb_checkpoints/README-checkpoint.md",
+    "LICENSE",
+    "README.md",
+    "assets/fig1.png",
+    "assets/show1.jpg",
+    "assets/show2.jpg",
+    "assets/show3.jpg",
+    "assets/show4.jpg",
+)
 
 MINERU_BACKEND_ID = "mineru25-pro-2605"
 MINERU_MODEL_ID = "opendatalab/MinerU2.5-Pro-2605-1.2B"
 MINERU_MODEL_REVISION = "bff20d4ae2bf202df9f45284b4d43681555a97ed"
 MINERU_PROVIDER_ID = "mineru2.5-pro-2605-transformers"
 MINERU_ADAPTER_SHA256 = (
-    "8cc54b6d009d4e9971f8aa712a7dd1963e4148c5851c8d30de513b12b894cafa"
+    "0e64a995532b598315a82b711cf739af46ae64131dd9654e4730af3ba6ef2696"
 )
 MINERU_SNAPSHOT_IDENTITY_SHA256 = (
     "d817d96ca8d0fda357b67054840c86664e5c26bbbfa9eedc05387978d3a157ef"
@@ -36,10 +64,10 @@ MINERU_WEIGHTS_SHA256 = (
 # focused unit suite and GPU qualification.  The placeholders are replaced at
 # the end of a source-changing qualification cycle.
 DEEPSEEK_IMPLEMENTATION_SHA256 = (
-    "9a586ef334cef8e2737a73949e7724520eeb15d865f706741a223a6ea36ba7dc"
+    "57a50cdd0812a0ad1f406d11200850ed69e05a4df1d22f5b2f6164904cd34aac"
 )
 MINERU_IMPLEMENTATION_SHA256 = (
-    "b625af25938a2ef7cb185e914e999cea9f07d2ae58afc68f3483aa164b4321d0"
+    "688020ba33a8f381ea63fc8f9a9c7bac2bc81dd2c093b8836c6b2464850e887e"
 )
 
 _REVISION_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -104,6 +132,8 @@ class OcrBackendDefinition:
     qualified_implementation_sha256: str | None = None
     qualified_adapter_sha256: str | None = None
     snapshot_identity_sha256: str | None = None
+    snapshot_required_files: tuple[str, ...] = ()
+    snapshot_ignored_files: tuple[str, ...] = ()
     weights_sha256: str | None = None
     default_timeout_seconds: int = 3600
     default_device: str = "cuda:0"
@@ -126,6 +156,36 @@ class OcrBackendDefinition:
         if not _REVISION_RE.fullmatch(self.model_revision):
             raise BackendRegistryError(
                 "backend model revision must be an immutable SHA"
+            )
+        for label, paths in (
+            ("required", self.snapshot_required_files),
+            ("ignored", self.snapshot_ignored_files),
+        ):
+            if (
+                not isinstance(paths, tuple)
+                or len(set(paths)) != len(paths)
+                or tuple(sorted(paths)) != paths
+            ):
+                raise BackendRegistryError(
+                    f"snapshot {label} files must be a sorted unique tuple"
+                )
+            for relative in paths:
+                path = PurePosixPath(relative)
+                if (
+                    not relative
+                    or path.is_absolute()
+                    or str(path) != relative
+                    or any(part in {".", ".."} for part in path.parts)
+                ):
+                    raise BackendRegistryError(
+                        f"snapshot {label} files must be canonical relative "
+                        "paths"
+                    )
+        if set(self.snapshot_required_files) & set(
+            self.snapshot_ignored_files
+        ):
+            raise BackendRegistryError(
+                "snapshot required and ignored files must be disjoint"
             )
         if not self.default_env_name or not self.default_python:
             raise BackendRegistryError(
@@ -266,6 +326,12 @@ class OcrBackendDefinition:
                 "snapshot_identity_sha256": (
                     self.snapshot_identity_sha256
                 ),
+                "snapshot_required_files": list(
+                    self.snapshot_required_files
+                ),
+                "snapshot_ignored_files": list(
+                    self.snapshot_ignored_files
+                ),
                 "weights_sha256": self.weights_sha256,
             },
         }
@@ -306,6 +372,7 @@ _BACKENDS = (
             "ocr_hardware.py",
             "ocr_implementation.py",
             "ocr_installations.py",
+            "ocr_memory.py",
             "ocr_path_security.py",
             "ocr_process_lifecycle.py",
             "ocr_profiles.py",
@@ -317,6 +384,9 @@ _BACKENDS = (
         qualified_implementation_sha256=(
             DEEPSEEK_IMPLEMENTATION_SHA256
         ),
+        snapshot_identity_sha256=DEEPSEEK_SNAPSHOT_IDENTITY_SHA256,
+        snapshot_required_files=DEEPSEEK_SNAPSHOT_REQUIRED_FILES,
+        snapshot_ignored_files=DEEPSEEK_SNAPSHOT_IGNORED_FILES,
         capabilities=(
             CapabilityQualification(
                 capability="grounded_ocr",
@@ -397,6 +467,7 @@ _BACKENDS = (
             "ocr_hardware.py",
             "ocr_implementation.py",
             "ocr_installations.py",
+            "ocr_memory.py",
             "ocr_path_security.py",
             "ocr_process_lifecycle.py",
             "ocr_profiles.py",

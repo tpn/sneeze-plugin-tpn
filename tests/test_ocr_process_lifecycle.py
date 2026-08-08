@@ -67,6 +67,28 @@ def test_guard_restores_callable_and_preserves_ignored_signal():
         signal.signal(signal.SIGHUP, previous_hup)
 
 
+def test_guard_rejects_unrestorable_non_python_handler(monkeypatch):
+    from sneeze.tpn.ocr_process_lifecycle import (
+        IsolatedSubprocessLifecycleError,
+        isolated_subprocess_signal_guard,
+    )
+
+    real_getsignal = signal.getsignal
+
+    def fake_getsignal(signum):
+        if signum == signal.SIGTERM:
+            return None
+        return real_getsignal(signum)
+
+    monkeypatch.setattr(signal, "getsignal", fake_getsignal)
+    with pytest.raises(
+        IsolatedSubprocessLifecycleError,
+        match="cannot safely preserve",
+    ):
+        with isolated_subprocess_signal_guard():
+            pytest.fail("guard body must not run")
+
+
 def test_guard_rejects_nested_process_global_handler_ownership():
     from sneeze.tpn.ocr_process_lifecycle import (
         IsolatedSubprocessLifecycleError,

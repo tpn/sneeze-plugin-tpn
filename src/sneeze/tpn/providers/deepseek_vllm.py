@@ -17,6 +17,7 @@ import os
 import platform
 import re
 import resource
+import stat
 import sys
 import time
 import traceback
@@ -193,7 +194,7 @@ MM_ENCODER_ATTENTION_BACKENDS = frozenset(
     {None, "auto", "FLASH_ATTN", "TORCH_SDPA", "XFORMERS"}
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
-_REVISION_RE = re.compile(r"[0-9a-f]{40,64}")
+_REVISION_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _LINUX_MEMORY_KEYS = frozenset(
     {
         "MemTotal",
@@ -607,18 +608,69 @@ def resolve_snapshot(model_id: str, revision: str) -> Path:
     return snapshot
 
 
+def _reject_snapshot_directory_symlinks(snapshot: Path) -> None:
+    """Reject directory links without following them during snapshot scans."""
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    try:
+        for directory, directory_names, file_names in os.walk(
+            snapshot,
+            followlinks=False,
+            onerror=raise_walk_error,
+        ):
+            root = Path(directory)
+            for name in (*directory_names, *file_names):
+                candidate = root / name
+                if not stat.S_ISLNK(candidate.lstat().st_mode):
+                    continue
+                if stat.S_ISDIR(candidate.stat().st_mode):
+                    raise DeepSeekBenchmarkAdapterError(
+                        "model snapshot contains a directory symlink"
+                    )
+    except DeepSeekBenchmarkAdapterError:
+        raise
+    except OSError as exc:
+        raise DeepSeekBenchmarkAdapterError(
+            "could not inspect model snapshot directory tree"
+        ) from exc
+
+
 def snapshot_identity(snapshot: Path, revision: str) -> dict[str, Any]:
+    from sneeze.tpn.ocr_backends import get_backend
+
+    _reject_snapshot_directory_symlinks(snapshot)
+    backend = get_backend("deepseek-vllm")
+    required_files = backend.snapshot_required_files
+    ignored_files = backend.snapshot_ignored_files
+    materialized_files = {
+        candidate.relative_to(snapshot).as_posix()
+        for candidate in snapshot.rglob("*")
+        if candidate.is_file()
+    }
+    missing = [
+        relative
+        for relative in required_files
+        if relative not in materialized_files
+    ]
+    if missing:
+        raise DeepSeekBenchmarkAdapterError(
+            "resolved model snapshot is missing required files: "
+            + ", ".join(missing)
+        )
+    unexpected = materialized_files - set(required_files) - set(
+        ignored_files
+    )
+    if unexpected:
+        raise DeepSeekBenchmarkAdapterError(
+            "resolved model snapshot contains files outside the reviewed "
+            "identity scope"
+        )
     files = {}
     total_size = 0
-    for path in sorted(
-        (
-            candidate
-            for candidate in snapshot.rglob("*")
-            if candidate.is_file()
-        ),
-        key=lambda candidate: candidate.relative_to(snapshot).as_posix(),
-    ):
-        relative = path.relative_to(snapshot).as_posix()
+    for relative in required_files:
+        path = snapshot / relative
         resolved = path.resolve(strict=True)
         before = resolved.stat()
         digest = sha256_path(resolved)
@@ -718,41 +770,99 @@ def cgroup_v2_memory_telemetry(
         "available": False,
         "memory_max_bytes": None,
         "memory_max_is_unlimited": None,
+        "memory_available_bytes": None,
         "memory_current_bytes": None,
         "memory_peak_bytes": None,
     }
     directory = _cgroup_v2_directory(membership_path, cgroup_root)
     if directory is None:
         return result
-    try:
-        raw_maximum = (
-            (directory / "memory.max").read_text(encoding="utf-8").strip()
-        )
-    except (OSError, UnicodeError):
-        raw_maximum = None
-    if raw_maximum == "max":
-        result["memory_max_is_unlimited"] = True
-        result["available"] = True
-    elif (
-        isinstance(raw_maximum, str)
-        and len(raw_maximum) <= 64
-        and raw_maximum.isdecimal()
-    ):
+    directories = []
+    candidate = directory
+    while True:
+        directories.append(candidate)
+        if candidate == cgroup_root:
+            break
+        candidate = candidate.parent
+        if candidate != cgroup_root and cgroup_root not in candidate.parents:
+            return result
+    records: list[dict[str, int | str | None]] = []
+    for candidate in directories:
         try:
-            result["memory_max_bytes"] = int(raw_maximum)
-        except ValueError:
-            pass
+            raw_maximum = (
+                (candidate / "memory.max")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+        except (OSError, UnicodeError):
+            maximum: int | str | None = None
         else:
-            result["memory_max_is_unlimited"] = False
-            result["available"] = True
-    for filename, key in (
-        ("memory.current", "memory_current_bytes"),
-        ("memory.peak", "memory_peak_bytes"),
-    ):
-        value = _nonnegative_decimal_file(directory / filename)
-        if value is not None:
-            result[key] = value
-            result["available"] = True
+            maximum = (
+                raw_maximum
+                if raw_maximum == "max"
+                else (
+                    int(raw_maximum)
+                    if len(raw_maximum) <= 64
+                    and raw_maximum.isdecimal()
+                    else None
+                )
+            )
+        records.append(
+            {
+                "maximum": maximum,
+                "current": _nonnegative_decimal_file(
+                    candidate / "memory.current"
+                ),
+                "peak": _nonnegative_decimal_file(
+                    candidate / "memory.peak"
+                ),
+            }
+        )
+    maximums = [
+        record["maximum"]
+        for record in records
+        if isinstance(record["maximum"], int)
+        or record["maximum"] == "max"
+    ]
+    finite_maximums = [
+        value for value in maximums if isinstance(value, int)
+    ]
+    if maximums:
+        result["memory_max_bytes"] = (
+            min(finite_maximums) if finite_maximums else None
+        )
+        result["memory_max_is_unlimited"] = not finite_maximums
+        result["available"] = True
+    finite_records = [
+        record
+        for record in records
+        if isinstance(record["maximum"], int)
+    ]
+    headrooms = (
+        [
+            max(0, record["maximum"] - record["current"])
+            for record in finite_records
+        ]
+        if finite_records
+        and all(
+            isinstance(record["current"], int)
+            for record in finite_records
+        )
+        else []
+    )
+    if headrooms:
+        result["memory_available_bytes"] = min(headrooms)
+        result["available"] = True
+    if records:
+        nearest = records[0]
+        for source, key in (
+            ("current", "memory_current_bytes"),
+            ("peak", "memory_peak_bytes"),
+        ):
+            value = nearest[source]
+            if isinstance(value, int):
+                result[key] = value
+                result["available"] = True
     return result
 
 
@@ -777,7 +887,11 @@ def cuda_memory_telemetry(torch_module) -> dict[str, Any]:
     device = cuda.current_device()
     properties = cuda.get_device_properties(device)
     free_bytes, total_bytes = cuda.mem_get_info(device)
-    integrated = getattr(properties, "is_integrated", None)
+    integrated = getattr(
+        properties,
+        "is_integrated",
+        getattr(properties, "integrated", None),
+    )
     if integrated is not None and bool(integrated):
         memory_topology = "unified"
     elif integrated is not None:
@@ -938,16 +1052,16 @@ def _cgroup_v2_memory_summary(
         if baseline_peak is not None and maximum_peak is not None
         else None
     )
-    baseline_headroom = (
-        max(0, capacity - baseline_current)
-        if capacity is not None and baseline_current is not None
-        else None
-    )
-    minimum_headroom = (
-        max(0, capacity - maximum_current)
-        if capacity is not None and maximum_current is not None
-        else None
-    )
+    headroom_values = [
+        record["memory_available_bytes"]
+        for record in records
+        if isinstance(record.get("memory_available_bytes"), int)
+        and record["memory_available_bytes"] >= 0
+    ]
+    baseline_headroom = baseline_record.get("memory_available_bytes")
+    if not isinstance(baseline_headroom, int) or baseline_headroom < 0:
+        baseline_headroom = headroom_values[0] if headroom_values else None
+    minimum_headroom = min(headroom_values) if headroom_values else None
     headroom_delta = (
         max(0, baseline_headroom - minimum_headroom)
         if baseline_headroom is not None and minimum_headroom is not None

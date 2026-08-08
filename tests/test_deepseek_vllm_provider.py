@@ -132,6 +132,15 @@ def test_read_jsonl_rejects_duplicate_object_keys(tmp_path):
         adapter.read_jsonl(requests_path)
 
 
+@pytest.mark.parametrize("length", (41, 63))
+def test_snapshot_revision_rejects_noncanonical_hash_lengths(length):
+    with pytest.raises(
+        adapter.DeepSeekBenchmarkAdapterError,
+        match="immutable commit hash",
+    ):
+        adapter.resolve_snapshot(adapter.DEFAULT_OCR_MODEL, "a" * length)
+
+
 def _settings(**updates) -> dict:
     settings = {
         "attention_backend": "FLASH_ATTN",
@@ -313,10 +322,14 @@ def _reset_fake_processor():
 
 
 def _snapshot(tmp_path: Path) -> Path:
+    from sneeze.tpn.ocr_backends import get_backend
+
     snapshot = tmp_path / REVISION
     snapshot.mkdir()
-    (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
-    (snapshot / "model.safetensors").write_bytes(b"synthetic weights")
+    for relative in get_backend("deepseek-vllm").snapshot_required_files:
+        destination = snapshot / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(f"synthetic {relative}\n".encode())
     return snapshot
 
 
@@ -410,6 +423,7 @@ def test_success_response_preserves_explicit_non_eos_stop(
 def test_snapshot_identity_matches_installation_hash_for_hf_symlinks(
     tmp_path,
 ):
+    from sneeze.tpn.ocr_backends import get_backend
     from sneeze.tpn.ocr_installations import _snapshot_record
 
     cache = (tmp_path / "hub").resolve()
@@ -418,13 +432,28 @@ def test_snapshot_identity_matches_installation_hash_for_hf_symlinks(
     blobs = model_root / "blobs"
     snapshot.mkdir(parents=True)
     blobs.mkdir()
-    blob = blobs / "synthetic-blob"
-    blob.write_bytes(b"resolved model bytes")
-    (snapshot / "config.json").symlink_to(blob)
-    (snapshot / "tokenizer.json").write_text("{}\n", encoding="utf-8")
+    backend = get_backend("deepseek-vllm")
+    required_files = backend.snapshot_required_files
+    for index, relative in enumerate(required_files):
+        destination = snapshot / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if relative == "config.json":
+            blob = blobs / "synthetic-blob"
+            blob.write_bytes(b"resolved model bytes")
+            destination.symlink_to(blob)
+        else:
+            destination.write_text(f"synthetic {index}\n", encoding="utf-8")
+    (snapshot / "README.md").write_text(
+        "irrelevant snapshot metadata\n", encoding="utf-8"
+    )
 
     provider = adapter.snapshot_identity(snapshot, REVISION)
-    installation = _snapshot_record(snapshot, cache)
+    installation = _snapshot_record(
+        snapshot,
+        cache,
+        required_files=required_files,
+        ignored_files=backend.snapshot_ignored_files,
+    )
 
     assert provider["files_sha256"] == installation["files_sha256"]
     assert provider["file_count"] == installation["file_count"]
@@ -433,6 +462,56 @@ def test_snapshot_identity_matches_installation_hash_for_hf_symlinks(
         "sha256",
         "size_bytes",
     }
+    assert "README.md" not in provider["files"]
+
+
+def test_snapshot_identity_rejects_unreviewed_extra_file(tmp_path):
+    snapshot = _snapshot(tmp_path)
+    (snapshot / "unexpected_runtime.py").write_text(
+        "raise RuntimeError\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        adapter.DeepSeekBenchmarkAdapterError,
+        match="outside the reviewed identity scope",
+    ):
+        adapter.snapshot_identity(snapshot, REVISION)
+
+
+def test_snapshot_identity_rejects_in_snapshot_directory_symlink(tmp_path):
+    snapshot = _snapshot(tmp_path)
+    assets = snapshot / "assets"
+    assets.mkdir()
+    (assets / "show1.jpg").write_bytes(b"ignored model asset")
+    (snapshot / "linked-assets").symlink_to(
+        assets,
+        target_is_directory=True,
+    )
+
+    with pytest.raises(
+        adapter.DeepSeekBenchmarkAdapterError,
+        match="model snapshot contains a directory symlink",
+    ):
+        adapter.snapshot_identity(snapshot, REVISION)
+
+
+def test_snapshot_identity_rejects_missing_required_file(tmp_path):
+    from sneeze.tpn.ocr_backends import get_backend
+
+    snapshot = tmp_path / REVISION
+    snapshot.mkdir()
+    required_files = get_backend("deepseek-vllm").snapshot_required_files
+    for relative in required_files[:-1]:
+        destination = snapshot / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"model content")
+
+    with pytest.raises(
+        adapter.DeepSeekBenchmarkAdapterError,
+        match="missing required files",
+    ):
+        adapter.snapshot_identity(snapshot, REVISION)
 
 
 def _memory_snapshot(
@@ -463,6 +542,7 @@ def _memory_snapshot(
             "available": True,
             "memory_max_bytes": 1000,
             "memory_max_is_unlimited": False,
+            "memory_available_bytes": 1000 - cgroup_current_bytes,
             "memory_current_bytes": cgroup_current_bytes,
             "memory_peak_bytes": cgroup_peak_bytes,
         },
@@ -667,6 +747,27 @@ def test_unified_memory_is_distinguished_from_dedicated_memory():
     assert telemetry["cuda_total_memory_bytes"] == 1000
 
 
+def test_memory_topology_accepts_legacy_integrated_property():
+    torch = _fake_torch()
+    del torch.cuda.properties.is_integrated
+    torch.cuda.properties.integrated = 1
+
+    telemetry = adapter.cuda_memory_telemetry(torch)
+
+    assert telemetry["memory_topology"] == "unified"
+    assert telemetry["is_integrated"] == 1
+
+
+def test_memory_topology_preserves_unknown_property():
+    torch = _fake_torch()
+    del torch.cuda.properties.is_integrated
+
+    telemetry = adapter.cuda_memory_telemetry(torch)
+
+    assert telemetry["memory_topology"] == "unknown"
+    assert telemetry["is_integrated"] is None
+
+
 def test_cgroup_v2_memory_sampling_does_not_treat_max_as_capacity(tmp_path):
     membership = tmp_path / "self.cgroup"
     membership.write_text("0::/workload\n", encoding="utf-8")
@@ -685,10 +786,59 @@ def test_cgroup_v2_memory_sampling_does_not_treat_max_as_capacity(tmp_path):
         "available": True,
         "memory_max_bytes": None,
         "memory_max_is_unlimited": True,
+        "memory_available_bytes": None,
         "memory_current_bytes": 123,
         "memory_peak_bytes": 456,
     }
     assert str(tmp_path) not in json.dumps(telemetry)
+
+
+def test_cgroup_v2_memory_sampling_uses_tightest_ancestor(tmp_path):
+    membership = tmp_path / "self.cgroup"
+    membership.write_text("0::/parent/workload\n", encoding="utf-8")
+    parent = tmp_path / "parent"
+    workload = parent / "workload"
+    workload.mkdir(parents=True)
+    (workload / "memory.max").write_text("max\n", encoding="utf-8")
+    (workload / "memory.current").write_text("123\n", encoding="utf-8")
+    (workload / "memory.peak").write_text("456\n", encoding="utf-8")
+    (parent / "memory.max").write_text("800\n", encoding="utf-8")
+    (parent / "memory.current").write_text("300\n", encoding="utf-8")
+    (tmp_path / "memory.max").write_text("900\n", encoding="utf-8")
+    (tmp_path / "memory.current").write_text("850\n", encoding="utf-8")
+
+    telemetry = adapter.cgroup_v2_memory_telemetry(
+        membership_path=membership,
+        cgroup_root=tmp_path,
+    )
+
+    assert telemetry == {
+        "available": True,
+        "memory_max_bytes": 800,
+        "memory_max_is_unlimited": False,
+        "memory_available_bytes": 50,
+        "memory_current_bytes": 123,
+        "memory_peak_bytes": 456,
+    }
+
+
+def test_cgroup_v2_memory_sampling_requires_every_finite_current(tmp_path):
+    membership = tmp_path / "self.cgroup"
+    membership.write_text("0::/parent/workload\n", encoding="utf-8")
+    parent = tmp_path / "parent"
+    workload = parent / "workload"
+    workload.mkdir(parents=True)
+    (workload / "memory.max").write_text("max\n", encoding="utf-8")
+    (workload / "memory.current").write_text("123\n", encoding="utf-8")
+    (parent / "memory.max").write_text("800\n", encoding="utf-8")
+
+    telemetry = adapter.cgroup_v2_memory_telemetry(
+        membership_path=membership,
+        cgroup_root=tmp_path,
+    )
+
+    assert telemetry["memory_max_bytes"] == 800
+    assert telemetry["memory_available_bytes"] is None
 
 
 def test_unified_summary_records_linux_cgroup_and_aggregate_rss_deltas():

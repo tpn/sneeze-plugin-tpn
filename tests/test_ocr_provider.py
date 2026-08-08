@@ -661,6 +661,80 @@ def test_local_provider_rejects_credential_like_environment_evidence(
     assert not run_dir.exists()
 
 
+@pytest.mark.parametrize(
+    "name",
+    (
+        "PATH",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONEXECUTABLE",
+        "PYTHONINSPECT",
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "LD_LIBRARY_PATH",
+        "LD_DEBUG_OUTPUT",
+        "DYLD_INSERT_LIBRARIES",
+        "GCONV_PATH",
+        "GLIBC_TUNABLES",
+    ),
+)
+def test_local_provider_rejects_execution_environment_overrides(
+    tmp_path,
+    name,
+):
+    from sneeze.tpn.ocr_provider import (
+        ProviderError,
+        load_local_provider_spec,
+    )
+
+    spec_path = _write_provider_spec(tmp_path)
+    spec = json.loads(spec_path.read_text())
+    spec["env"][name] = "/example/override"
+    _write_json(spec_path, spec)
+
+    with pytest.raises(
+        ProviderError,
+        match=f"cannot override execution variable {name}",
+    ) as exc_info:
+        load_local_provider_spec(spec_path)
+
+    assert "/example/override" not in str(exc_info.value)
+
+
+def test_local_provider_accepts_exact_forced_isolation_environment(tmp_path):
+    from sneeze.tpn.ocr_provider import load_local_provider_spec
+
+    spec_path = _write_provider_spec(tmp_path)
+    spec = json.loads(spec_path.read_text())
+    spec["env"]["PYTHONNOUSERSITE"] = "1"
+    _write_json(spec_path, spec)
+
+    loaded = load_local_provider_spec(spec_path)
+
+    assert loaded["env"]["PYTHONNOUSERSITE"] == "1"
+
+
+def test_local_provider_rejects_changed_forced_isolation_environment(
+    tmp_path,
+):
+    from sneeze.tpn.ocr_provider import (
+        ProviderError,
+        load_local_provider_spec,
+    )
+
+    spec_path = _write_provider_spec(tmp_path)
+    spec = json.loads(spec_path.read_text())
+    spec["env"]["PYTHONNOUSERSITE"] = "0"
+    _write_json(spec_path, spec)
+
+    with pytest.raises(
+        ProviderError,
+        match="local-only provider env requires PYTHONNOUSERSITE=1",
+    ):
+        load_local_provider_spec(spec_path)
+
+
 def test_validate_provider_run_dir_requires_absolute_empty_path(tmp_path):
     from sneeze.tpn.ocr_provider import (
         ProviderError,
@@ -676,6 +750,31 @@ def test_validate_provider_run_dir_requires_absolute_empty_path(tmp_path):
         validate_provider_run_dir(created)
     with pytest.raises(ProviderError, match="absolute"):
         validate_provider_run_dir("relative-run")
+
+
+def test_validate_provider_run_dir_rejects_protected_corpus_before_write(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn.ocr_provider import (
+        ProviderError,
+        validate_provider_run_dir,
+    )
+
+    protected = tmp_path / "canonical" / "papers"
+    protected.mkdir(parents=True)
+    config_home = tmp_path / "config"
+    policy = config_home / "sneeze" / "tpn" / "ocr-protected-roots"
+    policy.parent.mkdir(parents=True)
+    policy.write_text(f"{protected}\n", encoding="utf-8")
+    policy.chmod(0o600)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    run_dir = protected / "provider-evidence"
+
+    with pytest.raises(ProviderError, match="protected corpora"):
+        validate_provider_run_dir(run_dir)
+
+    assert not run_dir.exists()
 
 
 def test_validate_provider_run_dir_rejects_final_symlink(tmp_path):

@@ -69,14 +69,17 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 sne ocr-pdf-pages \
   --pdf-dpi 400 \
   --pipeline local-mineru25 \
   --execution-profile auto \
-  --memory-tier max
+  --memory-tier 50
 ```
 
 `--pipeline local-mineru25` already implies `--execution-profile auto`; it is
 shown explicitly above to make selection clear. `auto` requires one unique
 qualified profile matching the observed GPU, both stage runtimes, and the
-requested memory tier; the tier defaults to `max`. Select an exact profile by
-portable ID or absolute JSON path when needed:
+requested memory tier. When the tier is omitted, resolution tries `max`, then
+`50`, then `25`, and selects the highest supported match. The bundled A6000
+profile supports `25`, `50`, and `max`; the RTX PRO 6000 Blackwell profile
+supports `25` and `50`. Select an exact profile by portable ID or absolute JSON
+path when needed:
 
 ```bash
 sne ocr-pdf-pages \
@@ -265,6 +268,10 @@ sne ocr-hardware-probe \
   --output /absolute/scratch/hardware-receipt.json
 ```
 
+The isolated Torch probe is required to classify dedicated versus unified
+memory. Without `--torch-python`, hardware identity is still reported but
+memory topology and tier budgets remain unavailable.
+
 The probe calculates each tier capacity as
 `min(floor(total_bytes * fraction), total_bytes - reserve_bytes)`:
 
@@ -410,6 +417,17 @@ sne ocr-pdf-pages \
 Do not use `--force`, a canonical corpus, or a destination containing prior
 artifacts for this smoke.
 
+Machines with canonical corpora should list them in the private policy file
+`$XDG_CONFIG_HOME/sneeze/tpn/ocr-protected-roots` (falling back to
+`$HOME/.config/sneeze/tpn/ocr-protected-roots`). The file must have mode
+`0600` and contain one existing canonical absolute directory per line, for
+example `/absolute/path/to/canonical-corpus`. Benchmark, tuning, provider
+evidence, installation-registry, hardware-receipt, and generated-profile
+preflights reject destinations that overlap a configured root before creating
+files. Keep this policy machine-local; its contents are not copied
+automatically into profiles or evidence receipts. Normal provenance still
+records paths explicitly supplied as benchmark or tuning inputs.
+
 Inspect available profiles and their qualification state:
 
 ```bash
@@ -433,39 +451,47 @@ launcher identity is independently recorded and reviewed.
 
 ## Current qualification status
 
-The plugin bundles one trusted execution profile:
+The plugin bundles two trusted execution profiles:
 
 - `local-mineru25-nvidia-rtx-a6000-sm86-48gb`, profile SHA-256
-  `0b15775d6931f451b4efa9bb77a38ca2c546a707932e4ddee33da11955ac7f58`,
+  `e3e1df959942b96141d0dbbfa65b47ded5bedede446a141461d0d77ef15b3aef`,
   covers the NVIDIA RTX A6000 (SM86, 51,527,024,640 bytes) at the 25%, 50%,
-  and maximum-safe tiers. DeepSeek uses batch 3 with 1, 2, and 1 GiB of engine
-  headroom at 25%, 50%, and max respectively. MinerU uses batch 2 at every
-  tier.
-- Its formal onboarding sweep executed 39 discovery candidates. Thirty-seven
-  were eligible; the two rejected candidates were over-constrained DeepSeek
-  25% configurations. All six selected stage/tier configurations then passed
-  five repeats of all three regression pages with complete provenance and no
-  max-token termination. Manual review covered all 25 distinct output hashes
-  across the 90 confirmation artifacts. `--execution-profile auto` can select
-  this profile only when the live GPU and both registered runtime identities
-  match it.
+  and maximum-safe tiers. DeepSeek uses Triton MoE and batch 3 with 2, 1, and
+  1 GiB of engine headroom at 25%, 50%, and max respectively. MinerU uses
+  batch 2, 2, and 4 at those tiers.
+- The selected A6000 settings were reconfirmed against the final source with
+  one focused discovery and five cold repeats of all three regression pages
+  for each of the six stage/tier configurations. All 90 confirmation outputs
+  passed with complete provenance and EOS termination. `--execution-profile
+  auto` can select this profile only when the live GPU and both registered
+  runtime identities match it.
+- `local-mineru25-nvidia-rtx-pro-6000-blackwell-sm120-96gb`, profile SHA-256
+  `368531b003418d2cb0749949e8e842a6db929d8bb7e71b62ddaac0e3d2af2c51`,
+  covers the NVIDIA RTX PRO 6000 Blackwell (SM120, 102,641,958,912 bytes) at
+  the 25% and 50% tiers. At 25%, DeepSeek uses Triton MoE, batch 1, and 4 GiB
+  of headroom while MinerU uses batch 2. At 50%, DeepSeek uses batch 3 with
+  the same headroom and MinerU uses batch 4. Every stage/tier configuration
+  passed five repeats of all three pages. The maximum tier was not tuned in
+  the final source-bound qualification run.
 
-The retained GB10 run remains diagnostic rather than qualification:
+GB10 hardware discovery and unified-memory controls remain available, but no
+GB10 profile is bundled or trusted. Two final source-bound qualification
+attempts failed closed during the first DeepSeek cold start when the unchanged
+PSI pressure watchdog tripped; neither attempt completed a provider call or
+produced OCR-quality evidence. The 50% settings therefore remain unqualified
+rather than being published from older runtime evidence.
 
-- GB10: MinerU passed all three pages in the 25%, 50%, and max exploratory
-  arms, but DeepSeek failed quality on all three tiers. That arm also used an
-  OCI-derived environment with vLLM 0.20.0 rather than the pinned 0.21.1
-  development build. It therefore cannot produce a qualified profile, even
-  aside from the current lack of OCI-launcher attestation.
+Automatic profile selection always requires the live GPU and both registered
+runtime identities to match the reviewed profile exactly.
 
 Portable profiles bind the GPU class, model bytes, Python distributions,
 Torch/CUDA runtime tuple, attention implementation, and reviewed plugin code;
-they do not currently bind an NVIDIA driver version or an ambient
-`LD_LIBRARY_PATH`. The A6000 evidence used driver `580.95.05` and a clean
-environment with no loader-path override. Treat a driver or dynamic-loader
-change as an unqualified runtime change: re-register the installations and run
-the three-page scratch smoke before production, requalifying when runtime or
-output evidence differs.
+they do not currently bind an NVIDIA driver version or ambient dynamic-loader
+state. The final A6000 evidence used driver `580.95.05`; it did not independently
+attest loader-path absence. Treat a driver or dynamic-loader change as an
+unqualified runtime change: re-register the installations and run the
+three-page scratch smoke before production, requalifying when runtime or output
+evidence differs.
 
 ## Lower-level commands
 

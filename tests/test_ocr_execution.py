@@ -721,6 +721,34 @@ def test_processor_rejects_explicit_moe_backend_dropped_by_old_vllm(
         }
 
 
+def test_processor_rejects_explicit_moe_when_engine_args_is_unavailable(
+    monkeypatch,
+):
+    from sneeze.tpn import ocr_vllm
+
+    class LegacyLlm:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=LegacyLlm))
+    monkeypatch.setitem(sys.modules, "vllm.engine", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.engine.arg_utils",
+        SimpleNamespace(),
+    )
+    processor = ocr_vllm.DeepSeekOcrOfflineProcessor(
+        model="deepseek-ai/DeepSeek-OCR",
+        output_format="txt",
+        moe_backend="triton",
+    )
+
+    with pytest.raises(RuntimeError, match="cannot verify support"):
+        processor._filter_llm_kwargs(
+            {"model": processor.model, "moe_backend": "triton"}
+        )
+
+
 def test_processor_restores_fixed_jit_environment_after_prepare_failure(
     monkeypatch,
 ):
@@ -848,34 +876,37 @@ def test_deepseek_engine_identity_binds_actual_loaded_engine(tmp_path):
             ],
             "dtype": "torch.bfloat16",
             "attention_backend_selected": "FLASH_ATTN",
-        },
-    }
-
-    assert deepseek_engine_identity_mismatches(
-        profile,
-        installation=installation,
-        engine_metadata=metadata,
-    ) == []
-
-    controlled_metadata = copy.deepcopy(metadata)
-    controlled_metadata["runtime"].update(
-        {
             "moe_backend_requested": "triton",
             "moe_backend_configured": "triton",
             "jit_environment": {
                 "MAX_JOBS": "1",
                 "FLASHINFER_NVCC_THREADS": "1",
             },
-        }
-    )
+        },
+    }
+    execution_settings = {"moe_backend": "triton"}
+
     assert deepseek_engine_identity_mismatches(
         profile,
         installation=installation,
-        engine_metadata=controlled_metadata,
-        execution_settings={"moe_backend": "triton"},
+        engine_metadata=metadata,
+        execution_settings=execution_settings,
     ) == []
 
-    wrong_controls = copy.deepcopy(controlled_metadata)
+    assert deepseek_engine_identity_mismatches(
+        profile,
+        installation=installation,
+        engine_metadata=metadata,
+        execution_settings=None,
+    ) == ["execution settings are missing"]
+    assert deepseek_engine_identity_mismatches(
+        profile,
+        installation=installation,
+        engine_metadata=metadata,
+        execution_settings={},
+    ) == ["execution settings moe_backend is missing"]
+
+    wrong_controls = copy.deepcopy(metadata)
     wrong_controls["runtime"].update(
         {
             "moe_backend_requested": "auto",
@@ -890,7 +921,7 @@ def test_deepseek_engine_identity_binds_actual_loaded_engine(tmp_path):
         profile,
         installation=installation,
         engine_metadata=wrong_controls,
-        execution_settings={"moe_backend": "triton"},
+        execution_settings=execution_settings,
     ) == [
         "engine.runtime.moe_backend_requested differs from profile",
         "engine.runtime.moe_backend_configured differs from profile",
@@ -903,6 +934,7 @@ def test_deepseek_engine_identity_binds_actual_loaded_engine(tmp_path):
         profile,
         installation=installation,
         engine_metadata=wrong_backend,
+        execution_settings=execution_settings,
     ) == [
         "engine.runtime.attention_backend_selected differs from profile"
     ]
@@ -914,6 +946,7 @@ def test_deepseek_engine_identity_binds_actual_loaded_engine(tmp_path):
         profile,
         installation=installation,
         engine_metadata=wrong_snapshot,
+        execution_settings=execution_settings,
     ) == [
         "engine.model.resolved_path differs from installation",
         "engine.model.snapshot differs from profile",
@@ -925,7 +958,17 @@ def test_deepseek_engine_identity_binds_actual_loaded_engine(tmp_path):
         profile,
         installation=installation,
         engine_metadata=wrong_runtime,
+        execution_settings=execution_settings,
     ) == ["engine.runtime.vllm differs from profile"]
+
+    missing_dtype = copy.deepcopy(metadata)
+    missing_dtype["runtime"]["dtype"] = None
+    assert deepseek_engine_identity_mismatches(
+        profile,
+        installation=installation,
+        engine_metadata=missing_dtype,
+        execution_settings=execution_settings,
+    ) == ["engine.runtime.dtype is missing"]
 
     wrong_distributions = copy.deepcopy(metadata)
     wrong_distributions["runtime"]["installed_distributions_sha256"] = (
@@ -935,6 +978,7 @@ def test_deepseek_engine_identity_binds_actual_loaded_engine(tmp_path):
         profile,
         installation=installation,
         engine_metadata=wrong_distributions,
+        execution_settings=execution_settings,
     ) == [
         "engine.runtime.installed_distributions_sha256 differs from profile"
     ]
@@ -973,6 +1017,12 @@ def test_deepseek_engine_identity_checks_explicit_installation_backend(
             ],
             "dtype": runtime["dtype"],
             "attention_backend_selected": "TORCH_SDPA",
+            "moe_backend_requested": "triton",
+            "moe_backend_configured": "triton",
+            "jit_environment": {
+                "MAX_JOBS": "1",
+                "FLASHINFER_NVCC_THREADS": "1",
+            },
         },
     }
 
@@ -980,6 +1030,7 @@ def test_deepseek_engine_identity_checks_explicit_installation_backend(
         profile,
         installation=installation,
         engine_metadata=metadata,
+        execution_settings={"moe_backend": "triton"},
     )
 
     assert reasons == [
@@ -1043,6 +1094,116 @@ def test_profile_resolution_supports_path_id_auto_and_provisional(tmp_path):
         search_paths=[provisional_dir],
         allow_provisional=True,
     )["match"]["matched"]
+
+
+@pytest.mark.parametrize("selection", ("path", "auto"))
+def test_profile_resolution_uses_highest_supported_tier_when_omitted(
+    tmp_path,
+    monkeypatch,
+    selection,
+):
+    from sneeze.tpn import ocr_execution
+    from sneeze.tpn.ocr_profiles import (
+        seal_execution_profile,
+        write_execution_profile,
+    )
+
+    profile = copy.deepcopy(_profile(provisional=True))
+    profile.pop("profile_sha256")
+    budget = 24 * GIB
+    stages = copy.deepcopy(profile["memory_tiers"]["max"]["stages"])
+    for stage_id, stage in stages.items():
+        settings = stage["settings"]
+        settings["memory_tier"] = "50"
+        settings["memory_budget_bytes"] = budget
+        if stage_id == "grounded_ocr":
+            settings["gpu_memory_utilization"] = round(
+                (
+                    budget
+                    - settings["engine_overhead_headroom_bytes"]
+                )
+                / (48 * GIB),
+                8,
+            )
+    profile["memory_tiers"]["50"] = {
+        "supported": True,
+        "reason": None,
+        "budget_fraction": 0.5,
+        "budget_bytes": budget,
+        "reserve_bytes": 2 * GIB,
+        "stages": stages,
+    }
+    profile["memory_tiers"]["max"].update(
+        supported=False,
+        reason="not qualified",
+        stages={},
+    )
+    profile = seal_execution_profile(profile)
+    path = tmp_path / "profile.json"
+    write_execution_profile(profile, path)
+    monkeypatch.setattr(
+        ocr_execution,
+        "validate_bundled_profile_registry",
+        lambda: (),
+    )
+
+    resolved = ocr_execution.resolve_execution_profile(
+        str(path) if selection == "path" else "auto",
+        pipeline_id="local-mineru25",
+        memory_tier=None,
+        observation=_observation(profile),
+        search_paths=[tmp_path],
+        allow_provisional=True,
+    )
+
+    assert resolved["profile"]["profile_sha256"] == profile["profile_sha256"]
+    assert resolved["memory_tier"] == "50"
+    assert resolved["match"]["matched"] is True
+
+
+def test_profile_resolution_does_not_fall_back_from_ambiguous_tier(
+    monkeypatch,
+):
+    from sneeze.tpn import ocr_execution, ocr_profiles
+
+    calls = []
+
+    def ambiguous(*_args, memory_tier, **_kwargs):
+        calls.append(memory_tier)
+        raise ocr_profiles.OcrProfileAmbiguityError(
+            "ambiguous synthetic profile match"
+        )
+
+    monkeypatch.setattr(
+        ocr_execution,
+        "validate_bundled_profile_registry",
+        lambda: (),
+    )
+    monkeypatch.setattr(
+        ocr_profiles,
+        "list_execution_profiles",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        ocr_profiles,
+        "auto_select_execution_profile",
+        ambiguous,
+    )
+
+    with pytest.raises(
+        ocr_execution.OcrExecutionError,
+        match="ambiguous synthetic profile match",
+    ):
+        ocr_execution.resolve_execution_profile(
+            "auto",
+            pipeline_id="local-mineru25",
+            memory_tier=None,
+            observation={},
+            search_paths=[],
+            allow_provisional=True,
+        )
+
+    assert calls == ["max"]
 
 
 def test_profile_provider_spec_is_bound_to_profile_and_installation(tmp_path):
@@ -1254,28 +1415,37 @@ def test_bundled_profiles_and_reviewed_trust_registry_are_bijective():
     )
 
 
+def test_bundled_profiles_expose_only_reviewed_memory_tiers():
+    from sneeze.tpn.ocr_execution import validate_bundled_profile_registry
+
+    expected = {
+        "local-mineru25-nvidia-rtx-a6000-sm86-48gb": {
+            "25": (True, None),
+            "50": (True, None),
+            "max": (True, None),
+        },
+        "local-mineru25-nvidia-rtx-pro-6000-blackwell-sm120-96gb": {
+            "25": (True, None),
+            "50": (True, None),
+            "max": (False, "tier_not_tuned"),
+        },
+    }
+
+    profiles = validate_bundled_profile_registry()
+    assert {profile["profile_id"] for profile in profiles} == set(expected)
+    for profile in profiles:
+        observed = {
+            tier: (data["supported"], data["reason"])
+            for tier, data in profile["memory_tiers"].items()
+        }
+        assert observed == expected[profile["profile_id"]]
+
+
 def test_bundled_profile_stages_match_backend_qualification_pins():
     from sneeze.tpn.ocr_backends import get_backend
     from sneeze.tpn.ocr_execution import validate_bundled_profile_registry
 
-    retained_legacy_profile = {
-        "profile_sha256": (
-            "0b15775d6931f451b4efa9bb77a38ca2c546a707932e4ddee33da11955ac7f58"
-        ),
-        "implementations": {
-            "deepseek-vllm": (
-                "1572663ce37a0735db51abb66454a0b1c5cbd8db7dc8bb96153698342f2e58be"
-            ),
-            "mineru25-pro-2605": (
-                "c0fc973d6d3314e83d6acb28884f983721f29af4da53218c1ba0ca38e021e779"
-            ),
-        },
-    }
     for profile in validate_bundled_profile_registry():
-        is_retained_legacy = (
-            profile["profile_sha256"]
-            == retained_legacy_profile["profile_sha256"]
-        )
         for stage_id, stage in profile["stages"].items():
             backend = get_backend(stage["backend_id"])
             model = stage["model"]
@@ -1290,22 +1460,18 @@ def test_bundled_profile_stages_match_backend_qualification_pins():
                     == backend.snapshot_identity_sha256
                 )
 
-            expected_implementation = (
-                retained_legacy_profile["implementations"][
-                    backend.backend_id
-                ]
-                if is_retained_legacy
-                else backend.qualified_implementation_sha256
-            )
             assert runtime["implementation_sha256"] == (
-                expected_implementation
+                backend.qualified_implementation_sha256
             )
-            if is_retained_legacy and stage_id == "grounded_ocr":
+            if stage_id == "grounded_ocr":
                 for tier in profile["memory_tiers"].values():
                     if tier["supported"]:
-                        assert "moe_backend" not in tier["stages"][stage_id][
-                            "settings"
-                        ]
+                        assert (
+                            tier["stages"][stage_id]["settings"][
+                                "moe_backend"
+                            ]
+                            == "triton"
+                        )
             assert runtime["python"] == backend.default_python
             assert runtime["engine"] == backend.runtime_engine
             assert (

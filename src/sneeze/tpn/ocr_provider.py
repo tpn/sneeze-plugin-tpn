@@ -15,6 +15,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .ocr_path_security import (
+    TrustedPathError,
+    reject_protected_corpus_overlap,
+)
 from .ocr_process_lifecycle import isolated_subprocess_signal_guard
 
 SCHEMA_VERSION = 1
@@ -61,6 +65,16 @@ _FORCED_LOCAL_ENV = {
     "PYTHONNOUSERSITE": "1",
     "TRANSFORMERS_OFFLINE": "1",
 }
+_EXECUTION_ENV_OVERRIDE_DENYLIST = frozenset(
+    {
+        "BASH_ENV",
+        "ENV",
+        "GCONV_PATH",
+        "GLIBC_TUNABLES",
+        "PATH",
+    }
+)
+_EXECUTION_ENV_OVERRIDE_DENY_PREFIXES = ("DYLD_", "LD_", "PYTHON")
 _LOCAL_SPEC_KEYS = frozenset(
     {
         "schema_version",
@@ -157,6 +171,19 @@ def _validate_environment_overrides(value: Any) -> dict[str, str]:
         if _SECRET_ENV_RE.search(key):
             raise ProviderError(
                 "provider env cannot contain secret-looking names"
+            )
+        if key in _FORCED_LOCAL_ENV:
+            if item != _FORCED_LOCAL_ENV[key]:
+                raise ProviderError(
+                    "local-only provider env requires "
+                    f"{key}={_FORCED_LOCAL_ENV[key]}"
+                )
+            continue
+        if key in _EXECUTION_ENV_OVERRIDE_DENYLIST or key.startswith(
+            _EXECUTION_ENV_OVERRIDE_DENY_PREFIXES
+        ):
+            raise ProviderError(
+                f"provider env cannot override execution variable {key}"
             )
     _reject_credential_like_environment(value)
     for key, item in _FORCED_LOCAL_ENV.items():
@@ -493,6 +520,13 @@ def validate_provider_run_dir(
     if not candidate.is_absolute():
         raise ProviderError("provider run directory must be absolute")
     candidate = Path(os.path.abspath(candidate))
+    try:
+        reject_protected_corpus_overlap(
+            candidate,
+            label="provider run directory",
+        )
+    except TrustedPathError as exc:
+        raise ProviderError(str(exc)) from exc
     _prepare_provider_run_parent(candidate.parent)
 
     open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC

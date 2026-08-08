@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Mapping
 from pathlib import Path
 
 
@@ -25,6 +26,9 @@ class TrustedPathError(ValueError):
 
 _DIRECTORY_MODE = 0o700
 _OUTPUT_FILE_MODE = 0o600
+_PROTECTED_CORPUS_POLICY_RELATIVE_PATH = (
+    Path("sneeze") / "tpn" / "ocr-protected-roots"
+)
 
 
 def _effective_uid() -> int:
@@ -405,6 +409,122 @@ def validate_trusted_file(
     return path
 
 
+def _protected_corpus_policy_path(
+    environment: Mapping[str, str],
+) -> Path:
+    raw_config_home = environment.get("XDG_CONFIG_HOME")
+    if raw_config_home:
+        config_home = Path(raw_config_home)
+    else:
+        raw_home = environment.get("HOME")
+        config_home = (
+            Path(raw_home) if raw_home else Path.home()
+        ) / ".config"
+    try:
+        return _canonical_absolute_path(
+            config_home / _PROTECTED_CORPUS_POLICY_RELATIVE_PATH,
+            label="protected corpus policy",
+        )
+    except TrustedPathError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise TrustedPathError(
+            "could not resolve protected corpus policy"
+        ) from exc
+
+
+def load_protected_corpus_roots(
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> tuple[Path, ...]:
+    """Load private machine-local corpus roots without exposing them."""
+
+    policy_path = _protected_corpus_policy_path(
+        os.environ if environment is None else environment
+    )
+    try:
+        policy_path.lstat()
+    except FileNotFoundError:
+        return ()
+    except (OSError, ValueError) as exc:
+        raise TrustedPathError(
+            "could not inspect protected corpus policy"
+        ) from exc
+    policy_path = validate_trusted_file(
+        policy_path,
+        label="protected corpus policy",
+        resolve_symlinks=False,
+    )
+    try:
+        metadata = policy_path.lstat()
+    except OSError as exc:
+        raise TrustedPathError(
+            "could not inspect protected corpus policy"
+        ) from exc
+    _validate_regular_file_metadata(
+        metadata,
+        label="protected corpus policy",
+        executable=False,
+        require_current_owner=True,
+        exact_mode=_OUTPUT_FILE_MODE,
+    )
+    try:
+        contents = policy_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise TrustedPathError(
+            "could not read protected corpus policy"
+        ) from exc
+
+    roots: dict[str, Path] = {}
+    for line_number, raw_line in enumerate(contents.splitlines(), start=1):
+        value = raw_line.strip()
+        if not value or value.startswith("#"):
+            continue
+        try:
+            root = _canonical_absolute_path(
+                value,
+                label="protected corpus root",
+            )
+            root = validate_trusted_directory(
+                root,
+                label="protected corpus root",
+            )
+        except (OSError, RuntimeError, TrustedPathError, ValueError) as exc:
+            raise TrustedPathError(
+                "protected corpus policy contains an invalid root at line "
+                f"{line_number}"
+            ) from exc
+        roots[str(root)] = root
+    return tuple(roots[key] for key in sorted(roots))
+
+
+def reject_protected_corpus_overlap(
+    raw_path: str | os.PathLike[str],
+    *,
+    label: str,
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    """Reject a path that contains or is contained by a protected corpus."""
+
+    try:
+        path = _canonical_absolute_path(raw_path, label=label)
+        resolved = Path(os.path.realpath(path))
+    except TrustedPathError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise TrustedPathError(f"{label} is invalid") from exc
+    for root in load_protected_corpus_roots(environment=environment):
+        if (
+            resolved == root
+            or resolved.is_relative_to(root)
+            or root.is_relative_to(resolved)
+        ):
+            raise TrustedPathError(
+                f"{label} must be separate from protected corpora"
+            )
+    return resolved
+
+
 def prepare_private_output_path(
     raw_path: str | os.PathLike[str],
     *,
@@ -523,9 +643,11 @@ def validate_trusted_tree(
 
 __all__ = [
     "TrustedPathError",
+    "load_protected_corpus_roots",
     "prepare_private_directory",
     "prepare_private_output_path",
     "prepare_trusted_directory",
+    "reject_protected_corpus_overlap",
     "validate_trusted_directory",
     "validate_trusted_file",
     "validate_trusted_tree",

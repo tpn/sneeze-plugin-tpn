@@ -436,9 +436,70 @@ def _make_snapshot(tmp_path, backend, *, cache_name="hub"):
     cache = (tmp_path / cache_name).resolve()
     snapshot = expected_snapshot_path(backend, cache)
     snapshot.mkdir(parents=True)
-    (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
-    (snapshot / "model.safetensors").write_bytes(b"test-weights")
+    if backend.snapshot_required_files:
+        for relative in backend.snapshot_required_files:
+            destination = snapshot / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(f"synthetic {relative}\n".encode())
+    else:
+        (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
+        (snapshot / "model.safetensors").write_bytes(b"test-weights")
     return cache, snapshot
+
+
+def test_snapshot_record_rejects_unreviewed_extra_file(tmp_path):
+    from sneeze.tpn.ocr_backends import get_backend
+    from sneeze.tpn.ocr_installations import (
+        InstallationRegistryError,
+        _snapshot_record,
+    )
+
+    backend = get_backend("deepseek-vllm")
+    cache, snapshot = _make_snapshot(tmp_path, backend)
+    (snapshot / "unexpected_runtime.py").write_text(
+        "raise RuntimeError\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        InstallationRegistryError,
+        match="outside the reviewed identity scope",
+    ):
+        _snapshot_record(
+            snapshot,
+            cache,
+            required_files=backend.snapshot_required_files,
+            ignored_files=backend.snapshot_ignored_files,
+        )
+
+
+def test_snapshot_record_rejects_in_snapshot_directory_symlink(tmp_path):
+    from sneeze.tpn.ocr_backends import get_backend
+    from sneeze.tpn.ocr_installations import (
+        InstallationRegistryError,
+        _snapshot_record,
+    )
+
+    backend = get_backend("deepseek-vllm")
+    cache, snapshot = _make_snapshot(tmp_path, backend)
+    assets = snapshot / "assets"
+    assets.mkdir()
+    (assets / "show1.jpg").write_bytes(b"ignored model asset")
+    (snapshot / "linked-assets").symlink_to(
+        assets,
+        target_is_directory=True,
+    )
+
+    with pytest.raises(
+        InstallationRegistryError,
+        match="model snapshot contains a directory symlink",
+    ):
+        _snapshot_record(
+            snapshot,
+            cache,
+            required_files=backend.snapshot_required_files,
+            ignored_files=backend.snapshot_ignored_files,
+        )
 
 
 def _install_unqualified_backends(monkeypatch):
@@ -551,11 +612,11 @@ def test_build_records_exact_machine_artifacts(tmp_path, monkeypatch):
     assert record["hf_cache"]["path"] == str(cache)
     assert record["hf_cache"]["identity_sha256"]
     assert record["snapshot"]["path"] == str(snapshot)
-    assert record["snapshot"]["file_count"] == 2
-    assert record["snapshot"]["files_sha256"]
-    assert record["snapshot"]["weights_sha256"] == file_sha256(
-        snapshot / "model.safetensors"
+    assert record["snapshot"]["file_count"] == len(
+        backend.snapshot_required_files
     )
+    assert record["snapshot"]["files_sha256"]
+    assert record["snapshot"]["weights_sha256"] is None
     assert record["adapter"] is None
     assert record["cuda"] == {
         "visible_devices": "GPU-deadbeef",
@@ -748,6 +809,34 @@ def test_atomic_upsert_preserves_other_backends(
     assert stat.S_IMODE(registry_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(registry_path.parent.stat().st_mode) == 0o700
     assert not list(registry_path.parent.glob("*.candidate"))
+
+
+def test_registry_upsert_rejects_protected_corpus_before_first_write(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn.ocr_installations import (
+        InstallationRegistryError,
+        upsert_backend_installation,
+    )
+
+    protected = tmp_path / "canonical" / "papers"
+    protected.mkdir(parents=True)
+    config_home = tmp_path / "config"
+    policy = config_home / "sneeze" / "tpn" / "ocr-protected-roots"
+    policy.parent.mkdir(parents=True)
+    policy.write_text(f"{protected}\n", encoding="utf-8")
+    policy.chmod(0o600)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    registry_path = protected / "config" / "installations.json"
+
+    with pytest.raises(
+        InstallationRegistryError,
+        match="protected corpora",
+    ):
+        upsert_backend_installation({}, path=registry_path)
+
+    assert not registry_path.parent.exists()
 
 
 def test_registry_load_accepts_private_ancestry_and_leaf(tmp_path):

@@ -4,6 +4,8 @@ import hashlib
 import json
 from io import StringIO
 
+import pytest
+
 
 def _digest(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
@@ -142,6 +144,65 @@ def test_installation_list_revalidates_current_artifacts(
     receipt = json.loads(output.getvalue())
     assert receipt["registry_path"] == str(registry_path)
     assert receipt["installations"] == []
+
+
+def test_hardware_probe_rejects_protected_output_before_probe(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.command import CommandError
+
+    import sneeze.tpn.ocr_hardware as hardware
+    from sneeze.tpn.commands import OcrHardwareProbe
+
+    protected = tmp_path / "canonical" / "papers"
+    protected.mkdir(parents=True)
+    config_home = tmp_path / "config"
+    policy = config_home / "sneeze" / "tpn" / "ocr-protected-roots"
+    policy.parent.mkdir(parents=True)
+    policy.write_text(f"{protected}\n", encoding="utf-8")
+    policy.chmod(0o600)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+
+    def unexpected_probe(**_kwargs):
+        raise AssertionError("hardware probe must not start")
+
+    monkeypatch.setattr(hardware, "probe_nvidia_hardware", unexpected_probe)
+    output_path = protected / "hardware" / "receipt.json"
+    command = OcrHardwareProbe(None, StringIO(), None)
+    command.output = str(output_path)
+
+    with pytest.raises(CommandError, match="protected corpora"):
+        command.run()
+
+    assert not output_path.parent.exists()
+
+
+def test_hardware_probe_rejects_symlinked_output_parent_before_probe(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.command import CommandError
+
+    import sneeze.tpn.ocr_hardware as hardware
+    from sneeze.tpn.commands import OcrHardwareProbe
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    alias = tmp_path / "parent-alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+
+    def unexpected_probe(**_kwargs):
+        raise AssertionError("hardware probe must not start")
+
+    monkeypatch.setattr(hardware, "probe_nvidia_hardware", unexpected_probe)
+    command = OcrHardwareProbe(None, StringIO(), None)
+    command.output = str(alias / "receipt.json")
+
+    with pytest.raises(CommandError, match="must not traverse symlinks"):
+        command.run()
+
+    assert list(real_parent.iterdir()) == []
 
 
 def test_pipeline_list_marks_only_local_mineru_structured():

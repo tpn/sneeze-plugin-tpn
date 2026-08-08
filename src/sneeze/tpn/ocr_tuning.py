@@ -20,10 +20,12 @@ from typing import Any
 
 from .ocr_backend_setup import file_sha256, make_receipt, sha256_json
 from .ocr_backends import get_backend
+from .ocr_memory import canonical_memory_budget
 from .ocr_path_security import (
     TrustedPathError,
     prepare_private_directory,
     prepare_private_output_path,
+    reject_protected_corpus_overlap,
     validate_trusted_file,
 )
 from .ocr_vllm import (
@@ -109,6 +111,10 @@ def _validate_tuning_destination(
                 f"tuning destination must be separate from the {label}"
             )
     try:
+        reject_protected_corpus_overlap(
+            resolved,
+            label="tuning destination",
+        )
         return prepare_private_directory(
             resolved,
             label="tuning destination",
@@ -146,6 +152,10 @@ def _validate_profile_output_path(
                 "execution profile output must be separate from the " + label
             )
     try:
+        reject_protected_corpus_overlap(
+            resolved,
+            label="execution profile output",
+        )
         return prepare_private_output_path(
             resolved,
             label="execution profile output",
@@ -246,7 +256,12 @@ def _validate_tiers(values: Sequence[str]) -> tuple[str, ...]:
 
 
 def _validate_batches(values: Sequence[int]) -> tuple[int, ...]:
-    batches = tuple(dict.fromkeys(int(value) for value in values))
+    if any(type(value) is not int for value in values):
+        raise TuningError(
+            f"batch sizes must be ascending integers from 1 through "
+            f"{MAX_BATCH_SIZE}"
+        )
+    batches = tuple(dict.fromkeys(values))
     if (
         not batches
         or any(value <= 0 or value > MAX_BATCH_SIZE for value in batches)
@@ -454,19 +469,23 @@ def _memory_budget_records(
 
     selector = _portable_hardware_selector(hardware)
     total = selector["total_memory_bytes"]
-    reserve = min(
-        (16 if selector["memory_model"] == "unified" else 2) * 1024**3,
-        total - 1,
-    )
+    reserve = (
+        16 if selector["memory_model"] == "unified" else 2
+    ) * 1024**3
+    if total <= reserve:
+        raise TuningError(
+            "hardware total memory must exceed the fixed memory reserve"
+        )
     max_fraction = 0.75 if selector["memory_model"] == "unified" else 0.9
     fractions = {"25": 0.25, "50": 0.5, "max": max_fraction}
     return {
         tier: {
             "tier": tier,
             "budget_fraction": fractions[tier],
-            "budget_bytes": min(
-                math.floor(total * fractions[tier]),
-                total - reserve,
+            "budget_bytes": canonical_memory_budget(
+                total,
+                fractions[tier],
+                reserve,
             ),
             "reserve_bytes": reserve,
             "policy": (
@@ -755,6 +774,13 @@ def build_tuning_plan(
                         ).model_revision,
                         "hardware_selector": selector,
                         "installation_identity": binding["identity"],
+                        "cuda_binding": {
+                            "device_order": "PCI_BUS_ID",
+                            "visible_devices": binding[
+                                "cuda_visible_devices"
+                            ],
+                            "device": binding["device"],
+                        },
                         "tier": tier,
                         "settings": settings,
                     }
@@ -841,6 +867,16 @@ def build_candidate_provider_spec(
     backend_id = candidate["backend_id"]
     backend = get_backend(backend_id)
     binding = plan["installations"][backend_id]
+    cuda_binding = candidate.get("cuda_binding")
+    expected_cuda_binding = {
+        "device_order": "PCI_BUS_ID",
+        "visible_devices": binding["cuda_visible_devices"],
+        "device": binding["device"],
+    }
+    if cuda_binding != expected_cuda_binding:
+        raise TuningError(
+            "candidate CUDA binding differs from the tuning plan"
+        )
     adapter = _adapter_path(backend_id)
     argv = [
         binding["python_executable"],
@@ -852,7 +888,7 @@ def build_candidate_provider_spec(
         "--revision",
         backend.model_revision,
         "--device",
-        binding.get("device", "cuda:0"),
+        cuda_binding["device"],
         "--tuning",
     ]
     if backend_id == "mineru25-pro-2605":
@@ -890,8 +926,8 @@ def build_candidate_provider_spec(
         "timeout_seconds": plan["policy"]["timeout_seconds"],
         "secret_env_names": [],
         "env": {
-            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-            "CUDA_VISIBLE_DEVICES": binding["cuda_visible_devices"],
+            "CUDA_DEVICE_ORDER": cuda_binding["device_order"],
+            "CUDA_VISIBLE_DEVICES": cuda_binding["visible_devices"],
             "HF_HUB_CACHE": binding["cache_dir"],
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
@@ -1325,6 +1361,7 @@ def evaluate_candidate_evidence(
     dedicated_peak_values: list[tuple[str, int]] = []
     unified_peak_values: list[tuple[str, int]] = []
     unified_aggregate_values: list[tuple[str, int]] = []
+    incomplete_finite_cgroup_headroom = False
     memory_kinds = set()
     for memory in memory_records:
         memory_kind = memory.get("memory_kind")
@@ -1351,6 +1388,17 @@ def evaluate_candidate_evidence(
             unified_aggregate_values.append(record)
         cgroup = memory.get("cgroup_v2_memory")
         if isinstance(cgroup, Mapping):
+            capacity = cgroup.get("capacity_bytes")
+            if type(capacity) is int and capacity >= 0 and any(
+                type(cgroup.get(key)) is not int
+                or cgroup[key] < 0
+                for key in (
+                    "baseline_headroom_bytes",
+                    "minimum_headroom_bytes",
+                    "observed_headroom_delta_bytes",
+                )
+            ):
+                incomplete_finite_cgroup_headroom = True
             for key in (
                 "observed_current_delta_bytes",
                 "observed_peak_delta_bytes",
@@ -1361,9 +1409,25 @@ def evaluate_candidate_evidence(
                     record = (f"cgroup_v2.{key}", value)
                     unified_peak_values.append(record)
                     unified_aggregate_values.append(record)
-    if memory_kinds == {"unified_system"}:
+    hardware_selector = candidate.get("hardware_selector")
+    planned_memory_model = (
+        hardware_selector.get("memory_model")
+        if isinstance(hardware_selector, Mapping)
+        else None
+    )
+    expected_memory_kind = {
+        "dedicated": "dedicated_vram",
+        "unified": "unified_system",
+    }.get(planned_memory_model)
+    if (
+        expected_memory_kind == "unified_system"
+        and memory_kinds == {expected_memory_kind}
+    ):
         peak_values = unified_peak_values
-    elif memory_kinds == {"dedicated_vram"}:
+    elif (
+        expected_memory_kind == "dedicated_vram"
+        and memory_kinds == {expected_memory_kind}
+    ):
         peak_values = dedicated_peak_values
     else:
         peak_values = []
@@ -1397,6 +1461,10 @@ def evaluate_candidate_evidence(
     )
     if inconsistent_process_telemetry:
         reasons.append("inconsistent_process_telemetry")
+    if expected_memory_kind is None:
+        reasons.append("invalid_planned_memory_model")
+    elif memory_kinds != {expected_memory_kind}:
+        reasons.append("memory_kind_mismatch")
     if summary.get("all_pass") is not True:
         reasons.append("quality_or_protocol_failure")
     if summary.get("provenance_complete") is not True:
@@ -1412,8 +1480,16 @@ def evaluate_candidate_evidence(
         reasons.append("missing_memory_telemetry")
     elif peak > budget:
         reasons.append("memory_budget_exceeded")
-    if memory_kinds == {"unified_system"} and not unified_aggregate_values:
+    if (
+        expected_memory_kind == "unified_system"
+        and not unified_aggregate_values
+    ):
         reasons.append("missing_unified_system_memory_telemetry")
+    if (
+        expected_memory_kind == "unified_system"
+        and incomplete_finite_cgroup_headroom
+    ):
+        reasons.append("incomplete_cgroup_headroom_telemetry")
     if any(item.get("max_tokens") is True for item in terminations):
         reasons.append("max_tokens_termination")
     if any(item.get("eos") is not True for item in terminations):
@@ -2613,11 +2689,40 @@ def build_provisional_execution_profile(
         item["candidate_id"]: item for item in confirmation_results
     }
     selections = {
-        (item["capability"], item["tier"]): item
+        (item["capability"], item["backend_id"], item["tier"]): item
         for item in tuning_summary["selections"]
         if item.get("supported") is True
     }
+
+    def selection_for_stage(
+        stage_id: str,
+        pipeline_stage: Mapping[str, Any],
+        tier: str,
+    ) -> Mapping[str, Any]:
+        selection = selections.get(
+            (
+                pipeline_stage["capability"],
+                pipeline_stage["backend_id"],
+                tier,
+            )
+        )
+        if selection is None:
+            raise TuningError(
+                "no supported selection binding for stage "
+                f"{stage_id} at tier {tier}"
+            )
+        return selection
+
     tier_status = {item["tier"]: item for item in tuning_summary["tiers"]}
+
+    def status_for_tier(tier: str) -> Mapping[str, Any]:
+        status = tier_status.get(tier)
+        if status is None:
+            raise TuningError(
+                f"tuning summary is missing planned tier {tier}"
+            )
+        return status
+
     for selection in selections.values():
         confirmation = confirmations.get(selection["candidate_id"])
         if confirmation is None:
@@ -2647,8 +2752,8 @@ def build_provisional_execution_profile(
     stages = {}
     supported_candidate_ids = {
         selection["candidate_id"]
-        for (_capability, tier), selection in selections.items()
-        if tier_status[tier].get("supported") is True
+        for (_capability, _backend_id, tier), selection in selections.items()
+        if status_for_tier(tier).get("supported") is True
     }
     for stage_id, pipeline_stage in pipeline_stages.items():
         stage_confirmations = [
@@ -2695,10 +2800,10 @@ def build_provisional_execution_profile(
 
         identities = []
         for tier in plan["policy"]["memory_tiers"]:
-            status = tier_status[tier]
+            status = status_for_tier(tier)
             if status.get("supported") is not True:
                 continue
-            selection = selections[(stage_id, tier)]
+            selection = selection_for_stage(stage_id, pipeline_stage, tier)
             confirmation = confirmations[selection["candidate_id"]]
             identities.append(confirmation)
         if not identities:
@@ -2751,8 +2856,12 @@ def build_provisional_execution_profile(
         tier_stages = {}
         confirmation_by_stage = {}
         if supported:
-            for stage_id in pipeline_stages:
-                selection = selections[(stage_id, tier)]
+            for stage_id, pipeline_stage in pipeline_stages.items():
+                selection = selection_for_stage(
+                    stage_id,
+                    pipeline_stage,
+                    tier,
+                )
                 confirmation = confirmations[selection["candidate_id"]]
                 if confirmation.get("eligible") is not True:
                     raise TuningError(

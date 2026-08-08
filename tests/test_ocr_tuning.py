@@ -55,6 +55,29 @@ def _hardware(total=48 * 1024**3, memory_model="dedicated"):
     }
 
 
+@pytest.mark.parametrize(
+    ("memory_model", "total"),
+    [
+        ("dedicated", 2 * 1024**3),
+        ("unified", 16 * 1024**3),
+    ],
+)
+def test_memory_budget_fallback_requires_capacity_above_fixed_reserve(
+    memory_model,
+    total,
+):
+    from sneeze.tpn.ocr_tuning import TuningError, _memory_budget_records
+
+    with pytest.raises(
+        TuningError,
+        match="must exceed the fixed memory reserve",
+    ):
+        _memory_budget_records(
+            _hardware(total=total, memory_model=memory_model),
+            ("25",),
+        )
+
+
 def _files(tmp_path):
     from sneeze.tpn.ocr_backends import get_backend
 
@@ -111,6 +134,7 @@ def _files(tmp_path):
             "python_executable": sys.executable,
             "cache_dir": str(cache),
             "cuda_visible_devices": "0",
+            "device": "cuda:0",
             "identity": {
                 "record_sha256": _identity_digest(backend + "-record"),
                 "python_executable_sha256": _identity_digest(
@@ -156,6 +180,7 @@ def _candidate(
     tier="25",
     batch_size=1,
     budget=12 * 1024**3,
+    memory_model="dedicated",
 ):
     from sneeze.tpn.ocr_backends import get_backend
 
@@ -177,7 +202,7 @@ def _candidate(
         "capability": capability,
         "backend_id": backend_id,
         "model_revision": "b" * 40,
-        "hardware_selector": _hardware()["selector"],
+        "hardware_selector": _hardware(memory_model=memory_model)["selector"],
         "installation_identity": {
             "snapshot_files_sha256": _identity_digest(
                 backend_id + "-snapshot"
@@ -191,6 +216,11 @@ def _candidate(
             "installed_distributions_sha256": _distribution_identity(
                 backend_id
             )["sha256"],
+        },
+        "cuda_binding": {
+            "device_order": "PCI_BUS_ID",
+            "visible_devices": "0",
+            "device": "cuda:0",
         },
         "tier": tier,
         "settings": settings,
@@ -521,7 +551,14 @@ def test_tuning_plan_has_stage_specific_memory_candidates(tmp_path):
             if item["backend_id"] == backend_id
         )
         spec = build_candidate_provider_spec(plan, candidate)
+        assert candidate["cuda_binding"] == {
+            "device_order": "PCI_BUS_ID",
+            "visible_devices": "0",
+            "device": "cuda:0",
+        }
         assert spec["argv"][1:3] == ["-I", "-B"]
+        assert spec["env"]["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+        assert spec["env"]["CUDA_VISIBLE_DEVICES"] == "0"
         if backend_id == "deepseek-vllm":
             assert spec["env"]["MAX_JOBS"] == "1"
             assert spec["env"]["FLASHINFER_NVCC_THREADS"] == "1"
@@ -539,6 +576,25 @@ def test_tuning_plan_rejects_auto_moe_backend(tmp_path):
             manifest_path=manifest,
             input_root=inputs,
             deepseek_moe_backend="auto",
+        )
+
+
+@pytest.mark.parametrize(
+    "batch_size",
+    (True, 1.5, "2", float("nan"), float("inf")),
+)
+def test_tuning_plan_rejects_non_integer_batch_sizes(tmp_path, batch_size):
+    from sneeze.tpn.ocr_tuning import TuningError, build_tuning_plan
+
+    manifest, inputs, installations = _files(tmp_path)
+    with pytest.raises(TuningError, match="ascending integers"):
+        build_tuning_plan(
+            pipeline_id="local-mineru25",
+            hardware=_hardware(),
+            installations=installations,
+            manifest_path=manifest,
+            input_root=inputs,
+            batch_sizes=(batch_size,),
         )
 
 
@@ -948,7 +1004,7 @@ def test_unified_candidate_uses_conservative_system_memory_peak(tmp_path):
     )
 
     result = evaluate_candidate_evidence(
-        candidate=_candidate(budget=12 * gib),
+        candidate=_candidate(budget=12 * gib, memory_model="unified"),
         benchmark_dir=benchmark,
         **_expected_evidence(),
     )
@@ -958,6 +1014,87 @@ def test_unified_candidate_uses_conservative_system_memory_peak(tmp_path):
     assert result["peak_memory_sources"] == [
         "cgroup_v2.observed_peak_delta_bytes"
     ]
+
+
+@pytest.mark.parametrize(
+    ("planned_memory_model", "reported_memory_kind"),
+    [
+        ("dedicated", "unified_system"),
+        ("unified", "dedicated_vram"),
+    ],
+)
+def test_candidate_rejects_memory_kind_that_differs_from_plan(
+    tmp_path,
+    planned_memory_model,
+    reported_memory_kind,
+):
+    from sneeze.tpn.ocr_tuning import evaluate_candidate_evidence
+
+    benchmark = tmp_path / "benchmark"
+    _benchmark_evidence(benchmark)
+    rows = [
+        json.loads(line)
+        for line in (benchmark / "results.jsonl").read_text().splitlines()
+    ]
+    for row in rows:
+        memory = row["provenance"]["provider"]["runtime"]["gpu_memory"]
+        memory["memory_kind"] = reported_memory_kind
+    (benchmark / "results.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    result = evaluate_candidate_evidence(
+        candidate=_candidate(memory_model=planned_memory_model),
+        benchmark_dir=benchmark,
+        **_expected_evidence(),
+    )
+
+    assert result["eligible"] is False
+    assert "memory_kind_mismatch" in result["ineligible_reasons"]
+
+
+def test_unified_candidate_rejects_incomplete_finite_cgroup_headroom(
+    tmp_path,
+):
+    from sneeze.tpn.ocr_tuning import evaluate_candidate_evidence
+
+    benchmark = tmp_path / "benchmark"
+    _benchmark_evidence(benchmark)
+    rows = [
+        json.loads(line)
+        for line in (benchmark / "results.jsonl").read_text().splitlines()
+    ]
+    for row in rows:
+        memory = row["provenance"]["provider"]["runtime"]["gpu_memory"]
+        memory.update(
+            {
+                "memory_kind": "unified_system",
+                "observed_linux_mem_available_delta_bytes": 1024,
+                "cgroup_v2_memory": {
+                    "capacity_bytes": 4096,
+                    "baseline_headroom_bytes": None,
+                    "minimum_headroom_bytes": None,
+                    "observed_headroom_delta_bytes": None,
+                },
+            }
+        )
+    (benchmark / "results.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    result = evaluate_candidate_evidence(
+        candidate=_candidate(memory_model="unified"),
+        benchmark_dir=benchmark,
+        **_expected_evidence(),
+    )
+
+    assert result["eligible"] is False
+    assert (
+        "incomplete_cgroup_headroom_telemetry"
+        in result["ineligible_reasons"]
+    )
 
 
 def test_unified_candidate_requires_aggregate_system_telemetry(tmp_path):
@@ -978,7 +1115,7 @@ def test_unified_candidate_requires_aggregate_system_telemetry(tmp_path):
     )
 
     result = evaluate_candidate_evidence(
-        candidate=_candidate(),
+        candidate=_candidate(memory_model="unified"),
         benchmark_dir=benchmark,
         **_expected_evidence(),
     )
@@ -2065,6 +2202,117 @@ def test_onboarding_confirms_selected_candidates_and_exports_profile(
     }
 
 
+def test_profile_assembly_binds_selections_independently_of_stage_ids(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn import ocr_profiles
+    from sneeze.tpn.ocr_profiles import content_sha256
+    from sneeze.tpn.ocr_tuning import (
+        build_provisional_execution_profile,
+        build_tuning_plan,
+        run_tuning_session,
+    )
+
+    manifest, inputs, installations = _files(tmp_path)
+    plan = build_tuning_plan(
+        pipeline_id="local-mineru25",
+        hardware=_hardware(),
+        installations=installations,
+        manifest_path=manifest,
+        input_root=inputs,
+        memory_tiers=("25",),
+        batch_sizes=(1,),
+        discovery_repeats=1,
+        confirmation_repeats=2,
+    )
+
+    def runner(**kwargs):
+        _write_evidence_for_runner(kwargs)
+        return {"all_pass": True}
+
+    summary = run_tuning_session(
+        plan=plan,
+        dest_dir=tmp_path / "session",
+        runner=runner,
+    )
+    pipeline = ocr_profiles.get_pipeline_definition("local-mineru25")
+    renamed_stage_ids = {}
+    for stage in pipeline["stages"]:
+        stage["stage_id"] = f"synthetic-{stage['capability']}-stage"
+        renamed_stage_ids[stage["capability"]] = stage["stage_id"]
+    pipeline.pop("definition_sha256")
+    pipeline["definition_sha256"] = content_sha256(pipeline)
+    monkeypatch.setattr(
+        ocr_profiles,
+        "get_pipeline_definition",
+        lambda _name: copy.deepcopy(pipeline),
+    )
+
+    profile = build_provisional_execution_profile(
+        plan=plan,
+        tuning_summary=summary,
+        profile_id="synthetic-renamed-stage-profile",
+        display_name="Synthetic renamed-stage profile",
+    )
+
+    assert set(profile["stages"]) == set(renamed_stage_ids.values())
+    assert set(profile["memory_tiers"]["25"]["stages"]) == set(
+        renamed_stage_ids.values()
+    )
+    assert {
+        stage["capability"]: stage["backend_id"]
+        for stage in profile["stages"].values()
+    } == {
+        "grounded_ocr": "deepseek-vllm",
+        "markdown": "mineru25-pro-2605",
+    }
+
+
+def test_profile_assembly_rejects_missing_planned_tier(tmp_path):
+    from sneeze.tpn.ocr_tuning import (
+        TuningError,
+        build_provisional_execution_profile,
+        build_tuning_plan,
+        run_tuning_session,
+    )
+
+    manifest, inputs, installations = _files(tmp_path)
+    plan = build_tuning_plan(
+        pipeline_id="local-mineru25",
+        hardware=_hardware(),
+        installations=installations,
+        manifest_path=manifest,
+        input_root=inputs,
+        memory_tiers=("25", "50"),
+        batch_sizes=(1,),
+        discovery_repeats=1,
+        confirmation_repeats=2,
+    )
+
+    def runner(**kwargs):
+        _write_evidence_for_runner(kwargs)
+        return {"all_pass": True}
+
+    summary = run_tuning_session(
+        plan=plan,
+        dest_dir=tmp_path / "session",
+        runner=runner,
+    )
+    summary["tiers"] = [
+        item for item in summary["tiers"] if item["tier"] != "25"
+    ]
+    summary = _reseal_receipt(summary)
+
+    with pytest.raises(TuningError, match="missing planned tier 25"):
+        build_provisional_execution_profile(
+            plan=plan,
+            tuning_summary=summary,
+            profile_id="synthetic-missing-tier-profile",
+            display_name="Synthetic missing-tier profile",
+        )
+
+
 def test_tuning_rejects_input_overlap_before_first_write(tmp_path):
     from sneeze.tpn.ocr_tuning import (
         TuningError,
@@ -2085,6 +2333,46 @@ def test_tuning_rejects_input_overlap_before_first_write(tmp_path):
     destination = inputs / "forbidden-tuning-output"
 
     with pytest.raises(TuningError, match="separate from the input root"):
+        run_tuning_session(
+            plan=plan,
+            dest_dir=destination,
+            runner=lambda **_kwargs: {},
+        )
+
+    assert not destination.exists()
+
+
+def test_tuning_rejects_protected_corpus_before_first_write(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn.ocr_tuning import (
+        TuningError,
+        build_tuning_plan,
+        run_tuning_session,
+    )
+
+    manifest, inputs, installations = _files(tmp_path)
+    plan = build_tuning_plan(
+        pipeline_id="local-mineru25",
+        hardware=_hardware(),
+        installations=installations,
+        manifest_path=manifest,
+        input_root=inputs,
+        memory_tiers=("25",),
+        batch_sizes=(1,),
+    )
+    protected = tmp_path / "canonical" / "papers"
+    protected.mkdir(parents=True)
+    config_home = tmp_path / "config"
+    policy = config_home / "sneeze" / "tpn" / "ocr-protected-roots"
+    policy.parent.mkdir(parents=True)
+    policy.write_text(f"{protected}\n", encoding="utf-8")
+    policy.chmod(0o600)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    destination = protected / "tuning-output"
+
+    with pytest.raises(TuningError, match="protected corpora"):
         run_tuning_session(
             plan=plan,
             dest_dir=destination,
@@ -2147,6 +2435,51 @@ def test_tuning_rejects_profile_output_in_input_before_first_write(tmp_path):
     profile = inputs / "forbidden" / "profile.json"
 
     with pytest.raises(TuningError, match="separate from the input root"):
+        run_tuning_session(
+            plan=plan,
+            dest_dir=destination,
+            runner=lambda **_kwargs: {},
+            profile_path=profile,
+            profile_id="synthetic-local-mineru25",
+            profile_display_name="Synthetic local MinerU profile",
+        )
+
+    assert not destination.exists()
+    assert not profile.parent.exists()
+
+
+def test_tuning_rejects_protected_profile_before_first_write(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn.ocr_tuning import (
+        TuningError,
+        build_tuning_plan,
+        run_tuning_session,
+    )
+
+    manifest, inputs, installations = _files(tmp_path)
+    plan = build_tuning_plan(
+        pipeline_id="local-mineru25",
+        hardware=_hardware(),
+        installations=installations,
+        manifest_path=manifest,
+        input_root=inputs,
+        memory_tiers=("25",),
+        batch_sizes=(1,),
+    )
+    protected = tmp_path / "canonical" / "papers"
+    protected.mkdir(parents=True)
+    config_home = tmp_path / "config"
+    policy = config_home / "sneeze" / "tpn" / "ocr-protected-roots"
+    policy.parent.mkdir(parents=True)
+    policy.write_text(f"{protected}\n", encoding="utf-8")
+    policy.chmod(0o600)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    destination = tmp_path / "session"
+    profile = protected / "profiles" / "profile.json"
+
+    with pytest.raises(TuningError, match="protected corpora"):
         run_tuning_session(
             plan=plan,
             dest_dir=destination,
@@ -2396,6 +2729,34 @@ def test_resume_rejects_changed_installation_identity_at_same_paths(tmp_path):
     assert {
         item["candidate_id"] for item in first["candidates"]
     } != {item["candidate_id"] for item in third["candidates"]}
+
+
+def test_candidate_identity_binds_cuda_selection(tmp_path):
+    from sneeze.tpn.ocr_tuning import build_tuning_plan
+
+    manifest, inputs, installations = _files(tmp_path)
+    arguments = {
+        "pipeline_id": "local-mineru25",
+        "hardware": _hardware(),
+        "manifest_path": manifest,
+        "input_root": inputs,
+        "memory_tiers": ("25",),
+        "batch_sizes": (1,),
+        "deepseek_engine_overhead_headroom_bytes": (1024**3,),
+    }
+    first = build_tuning_plan(installations=installations, **arguments)
+    changed = copy.deepcopy(installations)
+    for binding in changed.values():
+        binding["cuda_visible_devices"] = "GPU-deadbeef"
+    second = build_tuning_plan(installations=changed, **arguments)
+
+    assert {
+        item["candidate_id"] for item in first["candidates"]
+    } != {item["candidate_id"] for item in second["candidates"]}
+    assert all(
+        item["cuda_binding"]["visible_devices"] == "GPU-deadbeef"
+        for item in second["candidates"]
+    )
 
 
 def test_live_free_memory_changes_do_not_break_safe_resume_identity(tmp_path):

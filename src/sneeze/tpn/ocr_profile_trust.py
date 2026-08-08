@@ -13,7 +13,8 @@ from __future__ import annotations
 
 TRUSTED_QUALIFIED_PROFILE_SHA256S: frozenset[str] = frozenset(
     {
-        "0b15775d6931f451b4efa9bb77a38ca2c546a707932e4ddee33da11955ac7f58",
+        "e3e1df959942b96141d0dbbfa65b47ded5bedede446a141461d0d77ef15b3aef",
+        "368531b003418d2cb0749949e8e842a6db929d8bb7e71b62ddaac0e3d2af2c51",
     }
 )
 

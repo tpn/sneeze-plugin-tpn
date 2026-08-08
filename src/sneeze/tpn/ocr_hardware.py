@@ -15,7 +15,6 @@ import selectors
 import shutil
 import signal
 import socket
-import stat
 import subprocess
 import time
 from collections.abc import Callable, Mapping
@@ -23,6 +22,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .ocr_memory import canonical_memory_budget
+from .ocr_path_security import TrustedPathError, validate_trusted_file
 from .ocr_process_lifecycle import isolated_subprocess_signal_guard
 
 SCHEMA_VERSION = 1
@@ -291,15 +292,17 @@ def _resolve_executable(value: str, label: str) -> str:
             candidate = str(path)
     if candidate is None:
         raise HardwareProbeError(f"could not find {label}: {value}")
-    path = Path(candidate).resolve()
+    path = Path(candidate).expanduser()
+    if not path.is_absolute():
+        path = Path(os.path.abspath(path))
     try:
-        mode = path.stat().st_mode
-    except OSError as exc:
-        raise HardwareProbeError(
-            f"could not inspect {label}: {path}"
-        ) from exc
-    if not stat.S_ISREG(mode) or not os.access(path, os.X_OK):
-        raise HardwareProbeError(f"{label} is not executable: {path}")
+        path = validate_trusted_file(
+            path,
+            label=label,
+            executable=True,
+        )
+    except TrustedPathError as exc:
+        raise HardwareProbeError(str(exc)) from exc
     return str(path)
 
 
@@ -616,7 +619,14 @@ def _read_cgroup_v2_memory(
     root: str | os.PathLike[str],
     membership_path: str | os.PathLike[str],
 ) -> dict[str, Any]:
-    """Read the current cgroup-v2 memory envelope without recording paths."""
+    """Read the effective cgroup-v2 memory envelope without recording paths.
+
+    A process cgroup can be unlimited while an intermediate ancestor carries
+    the effective limit. Capacity and availability therefore use the most
+    restrictive value observed from the process cgroup through the cgroup-v2
+    root. ``current_bytes`` and ``peak_bytes`` remain diagnostics for the
+    nearest readable cgroup.
+    """
 
     result = {
         "status": "unavailable",
@@ -627,7 +637,7 @@ def _read_cgroup_v2_memory(
         "available_bytes": None,
     }
     root_path = Path(root)
-    relative = None
+    relative: str | None = None
     try:
         for line in (
             Path(membership_path).read_text(encoding="utf-8").splitlines()
@@ -636,23 +646,30 @@ def _read_cgroup_v2_memory(
                 relative = line[3:].strip().lstrip("/")
                 break
     except OSError:
-        pass
-    candidates = []
-    if relative:
-        candidates.append(root_path / relative)
-    candidates.append(root_path)
-    directory = next(
-        (
-            candidate
-            for candidate in candidates
-            if (candidate / "memory.max").is_file()
-        ),
-        None,
-    )
-    if directory is None:
+        return result
+    if relative is None:
+        return result
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or any(
+        part in {".", ".."} for part in relative_path.parts
+    ):
+        return result
+    directory = root_path.joinpath(*relative_path.parts)
+    if directory != root_path and root_path not in directory.parents:
         return result
 
-    def read_value(name: str) -> int | str | None:
+    directories = []
+    while True:
+        directories.append(directory)
+        if directory == root_path:
+            break
+        directory = directory.parent
+        if directory != root_path and root_path not in directory.parents:
+            return result
+    if not directories:
+        return result
+
+    def read_value(directory: Path, name: str) -> int | str | None:
         try:
             value = (directory / name).read_text(encoding="utf-8").strip()
         except OSError:
@@ -665,27 +682,68 @@ def _read_cgroup_v2_memory(
             return None
         return number if number >= 0 else None
 
-    limit = read_value("memory.max")
-    current = read_value("memory.current")
-    peak = read_value("memory.peak")
-    if limit is None and current is None and peak is None:
+    records = [
+        {
+            "limit": read_value(candidate, "memory.max"),
+            "current": read_value(candidate, "memory.current"),
+            "peak": read_value(candidate, "memory.peak"),
+        }
+        for candidate in directories
+    ]
+    records = [
+        record
+        for record in records
+        if any(value is not None for value in record.values())
+    ]
+    if not records:
         return result
-    unlimited = limit == "max"
-    limit_bytes = limit if isinstance(limit, int) else None
-    current_bytes = current if isinstance(current, int) else None
-    peak_bytes = peak if isinstance(peak, int) else None
-    available = (
-        max(0, limit_bytes - current_bytes)
-        if limit_bytes is not None and current_bytes is not None
-        else None
+    finite_limits = [
+        record["limit"]
+        for record in records
+        if isinstance(record["limit"], int)
+    ]
+    valid_limits = [
+        record["limit"]
+        for record in records
+        if isinstance(record["limit"], int) or record["limit"] == "max"
+    ]
+    finite_records = [
+        record for record in records if isinstance(record["limit"], int)
+    ]
+    available_values = (
+        [
+            max(0, record["limit"] - record["current"])
+            for record in finite_records
+        ]
+        if finite_records
+        and all(
+            isinstance(record["current"], int)
+            for record in finite_records
+        )
+        else []
     )
+    nearest = records[0]
     return {
         "status": "available",
-        "unlimited": unlimited,
-        "limit_bytes": limit_bytes,
-        "current_bytes": current_bytes,
-        "peak_bytes": peak_bytes,
-        "available_bytes": available,
+        "unlimited": (
+            all(value == "max" for value in valid_limits)
+            if valid_limits
+            else None
+        ),
+        "limit_bytes": min(finite_limits) if finite_limits else None,
+        "current_bytes": (
+            nearest["current"]
+            if isinstance(nearest["current"], int)
+            else None
+        ),
+        "peak_bytes": (
+            nearest["peak"]
+            if isinstance(nearest["peak"], int)
+            else None
+        ),
+        "available_bytes": (
+            min(available_values) if available_values else None
+        ),
     }
 
 
@@ -801,9 +859,7 @@ def _effective_memory(
     integrated = torch_device.get("integrated") if torch_device else None
     if integrated is True:
         memory_model = "unified"
-    elif integrated is False or (
-        isinstance(nvml_total, int) and nvml_total > 0
-    ):
+    elif integrated is False:
         memory_model = "dedicated"
     else:
         memory_model = "unknown"
@@ -827,10 +883,15 @@ def _effective_memory(
             free_sources["system"] = system_available
         cgroup_limit = cgroup_memory.get("limit_bytes")
         cgroup_available = cgroup_memory.get("available_bytes")
-        if isinstance(cgroup_limit, int) and cgroup_limit > 0:
+        finite_cgroup_limit = (
+            isinstance(cgroup_limit, int) and cgroup_limit >= 0
+        )
+        if finite_cgroup_limit:
             total_sources["cgroup_v2"] = cgroup_limit
         if isinstance(cgroup_available, int) and cgroup_available >= 0:
             free_sources["cgroup_v2"] = cgroup_available
+    else:
+        finite_cgroup_limit = False
 
     if memory_model == "dedicated":
         total = total_sources.get("nvidia_smi")
@@ -840,19 +901,35 @@ def _effective_memory(
         if free is None:
             free = free_sources.get("torch_cuda")
     elif memory_model == "unified":
-        total = min(total_sources.values()) if total_sources else None
+        # Integrated CUDA may expose only a small currently mapped ATS window
+        # through cudaMemGetInfo. Keep it as diagnostic telemetry, but derive
+        # shared-memory capacity from system-level authorities.
+        authoritative_total = [
+            total_sources[name]
+            for name in ("nvidia_smi", "system", "cgroup_v2")
+            if name in total_sources
+        ]
+        total = min(authoritative_total) if authoritative_total else None
+        if total is None:
+            total = total_sources.get("torch_cuda")
         # Integrated GPUs share reclaimable system memory. cudaMemGetInfo may
         # report only the small currently mapped ATS window (GB10 commonly
         # reports less than 1 GiB while Linux has over 100 GiB available), so
         # it is diagnostic rather than the capacity authority.
-        authoritative_free = [
-            free_sources[name]
-            for name in ("system", "cgroup_v2")
-            if name in free_sources
-        ]
-        free = min(authoritative_free) if authoritative_free else None
-        if free is None:
-            free = free_sources.get("torch_cuda")
+        if finite_cgroup_limit and "cgroup_v2" not in free_sources:
+            # A finite cgroup envelope without a readable current value has
+            # unknown live headroom. Falling back to host-wide availability
+            # could select a tier the process cannot actually sustain.
+            free = None
+        else:
+            authoritative_free = [
+                free_sources[name]
+                for name in ("system", "cgroup_v2")
+                if name in free_sources
+            ]
+            free = min(authoritative_free) if authoritative_free else None
+            if free is None:
+                free = free_sources.get("torch_cuda")
     else:
         # Without either NVML capacity or an explicit Torch integration flag,
         # do not infer a shared-memory topology from host RAM.  Diagnostic
@@ -1087,9 +1164,7 @@ def calculate_memory_tiers(
         capacity = None
         live_after_reserve = None
         if isinstance(total, int) and total > 0:
-            fraction_capacity = int(total * fraction)
-            reserve_capacity = max(0, total - reserve)
-            capacity = min(fraction_capacity, reserve_capacity)
+            capacity = canonical_memory_budget(total, fraction, reserve)
         else:
             reasons.append("total_memory_unknown")
         if isinstance(free, int) and free >= 0:

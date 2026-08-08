@@ -434,10 +434,59 @@ def test_cgroup_v2_memory_sampling_does_not_treat_max_as_capacity(tmp_path):
         "available": True,
         "memory_max_bytes": None,
         "memory_max_is_unlimited": True,
+        "memory_available_bytes": None,
         "memory_current_bytes": 123,
         "memory_peak_bytes": 456,
     }
     assert str(tmp_path) not in json.dumps(telemetry)
+
+
+def test_cgroup_v2_memory_sampling_uses_tightest_ancestor(tmp_path):
+    membership = tmp_path / "self.cgroup"
+    membership.write_text("0::/parent/workload\n", encoding="utf-8")
+    parent = tmp_path / "parent"
+    workload = parent / "workload"
+    workload.mkdir(parents=True)
+    (workload / "memory.max").write_text("max\n", encoding="utf-8")
+    (workload / "memory.current").write_text("123\n", encoding="utf-8")
+    (workload / "memory.peak").write_text("456\n", encoding="utf-8")
+    (parent / "memory.max").write_text("800\n", encoding="utf-8")
+    (parent / "memory.current").write_text("300\n", encoding="utf-8")
+    (tmp_path / "memory.max").write_text("900\n", encoding="utf-8")
+    (tmp_path / "memory.current").write_text("850\n", encoding="utf-8")
+
+    telemetry = mineru25._cgroup_v2_memory(
+        membership_path=membership,
+        cgroup_root=tmp_path,
+    )
+
+    assert telemetry == {
+        "available": True,
+        "memory_max_bytes": 800,
+        "memory_max_is_unlimited": False,
+        "memory_available_bytes": 50,
+        "memory_current_bytes": 123,
+        "memory_peak_bytes": 456,
+    }
+
+
+def test_cgroup_v2_memory_sampling_requires_every_finite_current(tmp_path):
+    membership = tmp_path / "self.cgroup"
+    membership.write_text("0::/parent/workload\n", encoding="utf-8")
+    parent = tmp_path / "parent"
+    workload = parent / "workload"
+    workload.mkdir(parents=True)
+    (workload / "memory.max").write_text("max\n", encoding="utf-8")
+    (workload / "memory.current").write_text("123\n", encoding="utf-8")
+    (parent / "memory.max").write_text("800\n", encoding="utf-8")
+
+    telemetry = mineru25._cgroup_v2_memory(
+        membership_path=membership,
+        cgroup_root=tmp_path,
+    )
+
+    assert telemetry["memory_max_bytes"] == 800
+    assert telemetry["memory_available_bytes"] is None
 
 
 @pytest.mark.parametrize(
@@ -500,6 +549,7 @@ def test_memory_tracker_records_linux_and_cgroup_deltas(
                 "available": True,
                 "memory_max_bytes": 1000,
                 "memory_max_is_unlimited": False,
+                "memory_available_bytes": 900,
                 "memory_current_bytes": 100,
                 "memory_peak_bytes": 400,
             },
@@ -507,6 +557,7 @@ def test_memory_tracker_records_linux_and_cgroup_deltas(
                 "available": True,
                 "memory_max_bytes": 1000,
                 "memory_max_is_unlimited": False,
+                "memory_available_bytes": 500,
                 "memory_current_bytes": 500,
                 "memory_peak_bytes": 700,
             },
@@ -514,6 +565,7 @@ def test_memory_tracker_records_linux_and_cgroup_deltas(
                 "available": True,
                 "memory_max_bytes": 1000,
                 "memory_max_is_unlimited": False,
+                "memory_available_bytes": 600,
                 "memory_current_bytes": 400,
                 "memory_peak_bytes": 700,
             },
@@ -571,6 +623,22 @@ def test_memory_tracker_records_linux_and_cgroup_deltas(
     assert all("cgroup_v2" in sample for sample in telemetry["samples"])
 
 
+@pytest.mark.parametrize(
+    ("properties", "expected"),
+    [
+        (SimpleNamespace(is_integrated=1), True),
+        (SimpleNamespace(integrated=1), True),
+        (SimpleNamespace(is_integrated=0), False),
+        (SimpleNamespace(), None),
+    ],
+)
+def test_cuda_integrated_property_supports_both_torch_spellings(
+    properties,
+    expected,
+):
+    assert mineru25._cuda_integrated_property(properties) is expected
+
+
 def test_profile_settings_require_explicit_provisional_approval(tmp_path):
     path, profile, expected = _sealed_profile(tmp_path)
 
@@ -600,6 +668,29 @@ def test_profile_settings_require_explicit_provisional_approval(tmp_path):
         "qualification_state": "provisional",
         "memory_tier": "max",
     }
+
+
+def test_profile_settings_reject_duplicate_json_keys(tmp_path):
+    path, profile, _settings = _sealed_profile(tmp_path)
+    payload = path.read_text(encoding="utf-8")
+    payload = payload.replace(
+        '"profile_id": "test-mineru-profile"',
+        '"profile_id": "ignored-duplicate", '
+        '"profile_id": "test-mineru-profile"',
+        1,
+    )
+    assert payload.count('"profile_id"') >= 2
+    path.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        mineru25.load_profile_settings(
+            str(path),
+            expected_sha256=profile["profile_sha256"],
+            memory_tier="max",
+            allow_provisional=True,
+            model_id=mineru25.DEFAULT_MODEL_ID,
+            revision=mineru25.DEFAULT_REVISION,
+        )
 
 
 def test_profile_settings_reject_tampering_and_request_drift(tmp_path):

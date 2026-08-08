@@ -969,12 +969,96 @@ def test_full_mode_rejects_loaded_engine_drift_before_generation(tmp_path):
             execution_plan={
                 "profile": profile,
                 "installations": {"deepseek-vllm": installation},
+                "tier": {
+                    "stages": {
+                        "grounded_ocr": profile["memory_tiers"]["max"][
+                            "stages"
+                        ]["grounded_ocr"]
+                    }
+                },
             },
         )
 
     assert processor.run_calls == 0
     assert processor.shutdown_calls == [engine]
     assert not output.exists()
+
+
+def test_structured_full_mode_discards_staged_ocr_after_run_failure(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn import ocr_execution
+    from sneeze.tpn.commands import OcrPdfPages
+    from sneeze.tpn.ocr_vllm import OcrFullItem
+
+    monkeypatch.setattr(
+        ocr_execution,
+        "deepseek_engine_identity_mismatches",
+        lambda *_args, **_kwargs: [],
+    )
+    engine = object()
+
+    class FakeProcessor:
+        generation_metadata = {}
+
+        def __init__(self):
+            self.candidate_path = None
+            self.shutdown_calls = []
+
+        def init_progressbar(self, **_kwargs):
+            return None
+
+        def prepare_engine(self):
+            return engine, object()
+
+        def run(self, tasks, **_kwargs):
+            task = list(tasks)[0]
+            self.candidate_path = Path(task.output_path)
+            self.candidate_path.write_text(
+                "partial grounded OCR",
+                encoding="utf-8",
+            )
+            raise RuntimeError("synthetic generation failure")
+
+        def close_progressbar(self):
+            return None
+
+        def shutdown_engine(self, value):
+            self.shutdown_calls.append(value)
+
+    image = tmp_path / "page.png"
+    image.write_bytes(VALID_PNG_BYTES)
+    output = tmp_path / "page.ocr"
+    output.write_text("previous grounded OCR", encoding="utf-8")
+    item = OcrFullItem(
+        image_path=str(image),
+        base="page",
+        ocr_path=str(output),
+        markdown_path=str(tmp_path / "page.md"),
+        json_path=str(tmp_path / "page.json"),
+        need_ocr=True,
+        need_markdown=False,
+    )
+    processor = FakeProcessor()
+
+    with pytest.raises(RuntimeError, match="synthetic generation failure"):
+        OcrPdfPages(None, StringIO(), None)._run_full_mode(
+            processor,
+            [item],
+            execution_plan={
+                "profile": {},
+                "installations": {"deepseek-vllm": {}},
+                "tier": {
+                    "stages": {"grounded_ocr": {"settings": {}}}
+                },
+            },
+        )
+
+    assert processor.candidate_path is not None
+    assert not processor.candidate_path.exists()
+    assert output.read_text(encoding="utf-8") == "previous grounded OCR"
+    assert processor.shutdown_calls == [engine]
 
 
 @pytest.mark.parametrize(
@@ -1041,10 +1125,16 @@ def test_structured_full_mode_rejects_unqualified_grounded_termination(
                         "installed_distributions_sha256"
                     ],
                     "dtype": runtime["dtype"],
-                    "attention_backend_selected": runtime[
-                        "attention_backend"
-                    ],
-                },
+                        "attention_backend_selected": runtime[
+                            "attention_backend"
+                        ],
+                        "moe_backend_requested": "triton",
+                        "moe_backend_configured": "triton",
+                        "jit_environment": {
+                            "MAX_JOBS": "1",
+                            "FLASHINFER_NVCC_THREADS": "1",
+                        },
+                    },
             }
 
         def init_progressbar(self, **_kwargs):
@@ -1100,6 +1190,13 @@ def test_structured_full_mode_rejects_unqualified_grounded_termination(
                 "profile": profile,
                 "receipt": {"receipt_sha256": "b" * 64},
                 "installations": {"deepseek-vllm": installation},
+                "tier": {
+                    "stages": {
+                        "grounded_ocr": profile["memory_tiers"]["max"][
+                            "stages"
+                        ]["grounded_ocr"]
+                    }
+                },
             },
         )
 

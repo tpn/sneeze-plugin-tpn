@@ -28,6 +28,7 @@ from typing import Any
 
 from .ocr_path_security import (
     TrustedPathError,
+    reject_protected_corpus_overlap,
     validate_trusted_directory,
     validate_trusted_file,
     validate_trusted_tree,
@@ -162,7 +163,12 @@ def build_backend_installation(
 
     snapshot_path = _expected_snapshot_path(backend, cache_path).resolve()
     _require_within(snapshot_path, cache_path, "model snapshot")
-    snapshot = _snapshot_record(snapshot_path, cache_path)
+    snapshot = _snapshot_record(
+        snapshot_path,
+        cache_path,
+        required_files=backend.snapshot_required_files,
+        ignored_files=backend.snapshot_ignored_files,
+    )
     _check_qualified_snapshot(backend, snapshot)
 
     adapter = _adapter_record(backend)
@@ -451,6 +457,13 @@ def upsert_backend_installation(
     """Atomically create or update one entry while preserving all others."""
 
     registry_path = _registry_path(path)
+    try:
+        reject_protected_corpus_overlap(
+            registry_path,
+            label="installation registry output",
+        )
+    except TrustedPathError as exc:
+        raise InstallationRegistryError(str(exc)) from exc
     candidate = validate_backend_installation(
         record,
         validate_current=True,
@@ -1271,11 +1284,47 @@ def _require_within(path: Path, root: Path, label: str) -> None:
         )
 
 
-def _snapshot_record(snapshot_path: Path, cache_path: Path) -> dict[str, Any]:
+def _reject_snapshot_directory_symlinks(snapshot_path: Path) -> None:
+    """Reject directory links without following them during snapshot scans."""
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    try:
+        for directory, directory_names, file_names in os.walk(
+            snapshot_path,
+            followlinks=False,
+            onerror=raise_walk_error,
+        ):
+            root = Path(directory)
+            for name in (*directory_names, *file_names):
+                candidate = root / name
+                if not stat.S_ISLNK(candidate.lstat().st_mode):
+                    continue
+                if stat.S_ISDIR(candidate.stat().st_mode):
+                    raise InstallationRegistryError(
+                        "model snapshot contains a directory symlink"
+                    )
+    except InstallationRegistryError:
+        raise
+    except OSError as exc:
+        raise InstallationRegistryError(
+            "could not inspect model snapshot directory tree"
+        ) from exc
+
+
+def _snapshot_record(
+    snapshot_path: Path,
+    cache_path: Path,
+    *,
+    required_files: tuple[str, ...] = (),
+    ignored_files: tuple[str, ...] = (),
+) -> dict[str, Any]:
     if snapshot_path.is_symlink() or not snapshot_path.is_dir():
         raise InstallationRegistryError(
             "pinned model snapshot is missing or is a directory symlink"
         )
+    _reject_snapshot_directory_symlinks(snapshot_path)
     try:
         validate_trusted_tree(
             snapshot_path,
@@ -1287,10 +1336,38 @@ def _snapshot_record(snapshot_path: Path, cache_path: Path) -> dict[str, Any]:
     files: dict[str, dict[str, Any]] = {}
     total_size = 0
     try:
-        candidates = sorted(
-            snapshot_path.rglob("*"),
-            key=lambda item: item.relative_to(snapshot_path).as_posix(),
-        )
+        if required_files:
+            materialized_files = {
+                candidate.relative_to(snapshot_path).as_posix()
+                for candidate in snapshot_path.rglob("*")
+                if candidate.is_file()
+            }
+            missing = [
+                relative
+                for relative in required_files
+                if relative not in materialized_files
+            ]
+            if missing:
+                raise InstallationRegistryError(
+                    "pinned model snapshot is missing required files: "
+                    + ", ".join(missing)
+                )
+            unexpected = materialized_files - set(required_files) - set(
+                ignored_files
+            )
+            if unexpected:
+                raise InstallationRegistryError(
+                    "pinned model snapshot contains files outside the "
+                    "reviewed identity scope"
+                )
+            candidates = [
+                snapshot_path / relative for relative in required_files
+            ]
+        else:
+            candidates = sorted(
+                snapshot_path.rglob("*"),
+                key=lambda item: item.relative_to(snapshot_path).as_posix(),
+            )
         for candidate in candidates:
             if candidate.is_dir():
                 if candidate.is_symlink():
@@ -1489,7 +1566,12 @@ def _validate_current_artifacts(
             f"stale model snapshot path for {backend.backend_id}"
         )
     _require_within(expected_snapshot, current_cache, "model snapshot")
-    current_snapshot = _snapshot_record(expected_snapshot, current_cache)
+    current_snapshot = _snapshot_record(
+        expected_snapshot,
+        current_cache,
+        required_files=backend.snapshot_required_files,
+        ignored_files=backend.snapshot_ignored_files,
+    )
     if current_snapshot != snapshot:
         raise InstallationRegistryError(
             f"stale or tampered model snapshot for {backend.backend_id}"

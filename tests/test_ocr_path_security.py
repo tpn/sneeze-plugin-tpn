@@ -4,6 +4,176 @@ import stat
 import pytest
 
 
+def _write_protected_corpus_policy(tmp_path, monkeypatch, *roots):
+    config_home = tmp_path / "config"
+    policy = config_home / "sneeze" / "tpn" / "ocr-protected-roots"
+    policy.parent.mkdir(parents=True)
+    policy.write_text(
+        "# One canonical absolute root per line.\n"
+        + "".join(f"{root}\n" for root in roots),
+        encoding="utf-8",
+    )
+    policy.chmod(0o600)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    return policy
+
+
+def test_protected_corpus_policy_rejects_contained_and_containing_paths(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn.ocr_path_security import (
+        TrustedPathError,
+        load_protected_corpus_roots,
+        reject_protected_corpus_overlap,
+    )
+
+    protected = tmp_path / "canonical" / "papers"
+    protected.mkdir(parents=True)
+    _write_protected_corpus_policy(
+        tmp_path,
+        monkeypatch,
+        protected,
+        protected,
+    )
+
+    assert load_protected_corpus_roots() == (protected,)
+    with pytest.raises(TrustedPathError, match="protected corpora"):
+        reject_protected_corpus_overlap(
+            protected / "evidence",
+            label="test output",
+        )
+    with pytest.raises(TrustedPathError, match="protected corpora"):
+        reject_protected_corpus_overlap(
+            protected.parent,
+            label="test output",
+        )
+    outside = tmp_path / "scratch" / "evidence"
+    assert reject_protected_corpus_overlap(
+        outside,
+        label="test output",
+    ) == outside
+
+
+def test_protected_corpus_policy_requires_private_mode(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn.ocr_path_security import (
+        TrustedPathError,
+        load_protected_corpus_roots,
+    )
+
+    protected = tmp_path / "canonical" / "papers"
+    protected.mkdir(parents=True)
+    policy = _write_protected_corpus_policy(
+        tmp_path,
+        monkeypatch,
+        protected,
+    )
+    policy.chmod(0o644)
+
+    with pytest.raises(TrustedPathError, match="mode 0600"):
+        load_protected_corpus_roots()
+
+
+def test_protected_corpus_policy_inspection_failure_is_fail_closed(
+    tmp_path,
+    monkeypatch,
+):
+    from pathlib import Path
+
+    from sneeze.tpn.ocr_path_security import (
+        TrustedPathError,
+        load_protected_corpus_roots,
+    )
+
+    protected = tmp_path / "canonical" / "papers"
+    protected.mkdir(parents=True)
+    policy = _write_protected_corpus_policy(
+        tmp_path,
+        monkeypatch,
+        protected,
+    )
+    original_lstat = Path.lstat
+
+    def fail_policy_inspection(path):
+        if path == policy:
+            raise PermissionError("synthetic inaccessible policy")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fail_policy_inspection)
+
+    with pytest.raises(
+        TrustedPathError,
+        match="could not inspect protected corpus policy",
+    ):
+        load_protected_corpus_roots()
+
+
+def test_protected_corpus_policy_hides_malformed_root_content(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn.ocr_path_security import (
+        TrustedPathError,
+        load_protected_corpus_roots,
+    )
+
+    policy = _write_protected_corpus_policy(tmp_path, monkeypatch)
+    policy.write_bytes(b"/absolute/malformed\x00private-detail\n")
+    policy.chmod(0o600)
+
+    with pytest.raises(
+        TrustedPathError,
+        match="invalid root at line 1",
+    ) as exc_info:
+        load_protected_corpus_roots()
+    assert "private-detail" not in str(exc_info.value)
+
+
+def test_protected_corpus_policy_path_failure_is_normalized(
+    monkeypatch,
+):
+    from pathlib import Path
+
+    from sneeze.tpn.ocr_path_security import (
+        TrustedPathError,
+        load_protected_corpus_roots,
+    )
+
+    monkeypatch.setattr(
+        Path,
+        "expanduser",
+        lambda _path: (_ for _ in ()).throw(
+            RuntimeError("synthetic private home detail")
+        ),
+    )
+
+    with pytest.raises(
+        TrustedPathError,
+        match="could not resolve protected corpus policy",
+    ) as exc_info:
+        load_protected_corpus_roots(
+            environment={"HOME": "~synthetic-private-user"}
+        )
+    assert "private home detail" not in str(exc_info.value)
+
+
+def test_protected_corpus_output_path_failure_is_normalized():
+    from sneeze.tpn.ocr_path_security import (
+        TrustedPathError,
+        reject_protected_corpus_overlap,
+    )
+
+    with pytest.raises(TrustedPathError, match="test output is invalid"):
+        reject_protected_corpus_overlap(
+            "/absolute/malformed\x00private-detail",
+            label="test output",
+            environment={"XDG_CONFIG_HOME": "/unused"},
+        )
+
+
 def test_private_directory_accepts_sticky_tmp_ancestor_and_creates_0700(
     tmp_path,
 ):

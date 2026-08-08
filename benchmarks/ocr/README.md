@@ -47,6 +47,17 @@ offline runtime settings. Any adapter that may transmit an input must declare
 Do not run `--force` against either canonical corpus. The benchmark harness has
 no such option.
 
+Protect canonical corpora with the private machine-local policy file
+`$XDG_CONFIG_HOME/sneeze/tpn/ocr-protected-roots` (or
+`$HOME/.config/sneeze/tpn/ocr-protected-roots` when `XDG_CONFIG_HOME` is
+unset). Give the file mode `0600` and list one existing canonical absolute
+directory per line, such as `/absolute/path/to/canonical-corpus`. Benchmark,
+tuning, provider-evidence, installation-registry, hardware-receipt, and
+generated-profile destinations that overlap a configured root are rejected
+before creation. Policy paths are not serialized merely because they appear in
+this machine-local file; normal provenance still records paths explicitly
+supplied as benchmark or tuning inputs.
+
 ## Provider specification
 
 Provider configuration is machine-specific and belongs in scratch space, not
@@ -368,20 +379,20 @@ implementation identities. A resumed run requires the exact same plan and
 matching artifacts, even when all filesystem paths are unchanged.
 
 The bundled profile
-`local-mineru25-nvidia-rtx-a6000-sm86-48gb` is trusted at profile SHA-256
-`0b15775d6931f451b4efa9bb77a38ca2c546a707932e4ddee33da11955ac7f58`.
-Its formal A6000 onboarding run executed 39 discovery candidates and retained
-37 eligible configurations. All six selected capability/tier candidates then
-passed five repeats of the three-page suite with complete provenance and no
-max-token termination. Manual review covered all 25 distinct output hashes
-across the 90 confirmation artifacts. The selected DeepSeek batches are 3 at
-every tier, with 1, 2, and 1 GiB of engine headroom at 25%, 50%, and max.
-Selected MinerU batches are 2 at every tier.
+`local-mineru25-nvidia-rtx-a6000-sm86-48gb` covers the 25%, 50%, and maximum
+tiers. Its selected settings were reconfirmed against the final source with
+one focused discovery and five cold repeats of the three-page suite for each
+of the six stage/tier configurations. All 90 confirmation outputs passed with
+complete provenance and EOS termination. The selected DeepSeek batch is 3 at
+every tier, with 2, 1, and 1 GiB of engine headroom at 25%, 50%, and max.
+Selected MinerU batches are 2, 2, and 4 respectively. The exact trusted profile
+hash is reported by `sne ocr-profile-list` and in the main README.
 
-The GB10 run remains exploratory: MinerU passed all three pages at all three
-tiers, while DeepSeek failed quality, ran with vLLM 0.20.0 rather than the
-pinned tuple, and used an OCI-derived environment that the portable profile
-does not attest. It is not production qualification.
+GB10 remains unqualified. With the final pinned source and runtime tuple, two
+fresh 50% attempts failed closed during the first DeepSeek cold start when the
+unchanged PSI pressure watchdog tripped. Neither attempt completed a provider
+call, so the result is a platform-pressure limitation rather than OCR-quality
+evidence. No GB10 profile is bundled or trusted.
 
 ## Running the smoke benchmark
 

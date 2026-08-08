@@ -58,7 +58,7 @@ def test_registry_has_only_pinned_initial_backends():
     assert mineru.model_revision == MINERU_MODEL_REVISION
     assert mineru.capability_status("markdown") == "qualified"
     assert mineru.qualified_adapter_sha256 == (
-        "8cc54b6d009d4e9971f8aa712a7dd1963e4148c5851c8d30de513b12b894cafa"
+        "0e64a995532b598315a82b711cf739af46ae64131dd9654e4730af3ba6ef2696"
     )
     assert mineru.snapshot_identity_sha256
     assert mineru.weights_sha256
@@ -72,8 +72,13 @@ def test_registry_has_only_pinned_initial_backends():
         "batch_size": 1,
         "image_analysis": False,
     }
-    assert get_backend("deepseek-vllm").capability_status("markdown") == (
-        "guarded"
+    deepseek = get_backend("deepseek-vllm")
+    assert deepseek.capability_status("markdown") == "guarded"
+    assert deepseek.snapshot_identity_sha256
+    assert "modeling_deepseekocr.py" in deepseek.snapshot_required_files
+    assert "README.md" in deepseek.snapshot_ignored_files
+    assert not set(deepseek.snapshot_required_files) & set(
+        deepseek.snapshot_ignored_files
     )
 
 

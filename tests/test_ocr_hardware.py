@@ -8,6 +8,13 @@ import sys
 import pytest
 
 
+def _trusted_executable(tmp_path, name):
+    path = tmp_path / name
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+    return str(path)
+
+
 def _completed(argv, *, stdout="", stderr="", returncode=0):
     return subprocess.CompletedProcess(
         argv,
@@ -131,8 +138,8 @@ def test_dedicated_probe_keeps_observation_identity_but_portable_selector(
     _write_meminfo(meminfo)
     environments = []
     observation = probe_nvidia_hardware(
-        nvidia_smi=sys.executable,
-        torch_python=sys.executable,
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
+        torch_python=_trusted_executable(tmp_path, "torch-python"),
         environment={
             "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
             "CUDA_VISIBLE_DEVICES": "0",
@@ -188,8 +195,8 @@ def test_torch_probe_is_isolated_and_receives_no_ambient_secret(tmp_path):
         return base_runner(argv, **kwargs)
 
     observation = probe_nvidia_hardware(
-        nvidia_smi=sys.executable,
-        torch_python=sys.executable,
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
+        torch_python=_trusted_executable(tmp_path, "torch-python"),
         environment={
             "CUDA_VISIBLE_DEVICES": "0",
             "PATH": "/usr/bin:/bin",
@@ -226,9 +233,76 @@ def test_default_probe_runner_streams_successfully(tmp_path):
         meminfo_path=meminfo,
     )
 
-    assert observation["memory"]["model"] == "dedicated"
+    assert observation["memory"]["model"] == "unknown"
+    assert observation["memory"]["total_memory_bytes"] is None
     assert observation["nvidia_smi"]["returncode"] == 0
     assert observation["nvidia_smi"]["discovered_device_count"] == 1
+
+
+def test_probe_rejects_group_writable_nvidia_smi(tmp_path):
+    from sneeze.tpn.ocr_hardware import (
+        HardwareProbeError,
+        probe_nvidia_hardware,
+    )
+
+    meminfo = tmp_path / "meminfo"
+    _write_meminfo(meminfo)
+    nvidia_smi = tmp_path / "nvidia-smi"
+    nvidia_smi.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    nvidia_smi.chmod(0o775)
+
+    with pytest.raises(HardwareProbeError, match="writable by group"):
+        probe_nvidia_hardware(
+            nvidia_smi=str(nvidia_smi),
+            environment={"CUDA_VISIBLE_DEVICES": "0"},
+            meminfo_path=meminfo,
+        )
+
+
+def test_probe_rejects_group_writable_torch_interpreter(tmp_path):
+    from sneeze.tpn.ocr_hardware import (
+        HardwareProbeError,
+        probe_nvidia_hardware,
+    )
+
+    meminfo = tmp_path / "meminfo"
+    _write_meminfo(meminfo)
+    torch_python = tmp_path / "python"
+    torch_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    torch_python.chmod(0o775)
+
+    with pytest.raises(HardwareProbeError, match="writable by group"):
+        probe_nvidia_hardware(
+            nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
+            torch_python=str(torch_python),
+            environment={"CUDA_VISIBLE_DEVICES": "0"},
+            meminfo_path=meminfo,
+            runner=_runner_for(_smi_row()),
+        )
+
+
+def test_nvml_capacity_without_torch_memory_topology_stays_unknown(tmp_path):
+    from sneeze.tpn.ocr_hardware import (
+        calculate_memory_tiers,
+        probe_nvidia_hardware,
+    )
+
+    meminfo = tmp_path / "meminfo"
+    _write_meminfo(meminfo)
+    observation = probe_nvidia_hardware(
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
+        environment={"CUDA_VISIBLE_DEVICES": "0"},
+        meminfo_path=meminfo,
+        runner=_runner_for(_smi_row()),
+    )
+    budgets = calculate_memory_tiers(observation)
+
+    assert observation["memory"]["model"] == "unknown"
+    assert observation["memory"]["total_memory_bytes"] is None
+    assert observation["memory"]["total_sources"] == {
+        "nvidia_smi": 24 * 1024**3
+    }
+    assert all(tier["supported"] is False for tier in budgets["tiers"])
 
 
 def test_visible_device_selection_fails_closed(tmp_path):
@@ -253,28 +327,28 @@ def test_visible_device_selection_fails_closed(tmp_path):
 
     with pytest.raises(HardwareProbeError, match="multiple NVIDIA GPUs"):
         probe_nvidia_hardware(
-            nvidia_smi=sys.executable,
+            nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
             environment={},
             meminfo_path=meminfo,
             runner=runner,
         )
     with pytest.raises(HardwareProbeError, match="numeric.*ambiguous"):
         probe_nvidia_hardware(
-            nvidia_smi=sys.executable,
+            nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
             environment={"CUDA_VISIBLE_DEVICES": "0"},
             meminfo_path=meminfo,
             runner=runner,
         )
     with pytest.raises(HardwareProbeError, match="did not resolve uniquely"):
         probe_nvidia_hardware(
-            nvidia_smi=sys.executable,
+            nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
             environment={"CUDA_VISIBLE_DEVICES": "GPU-NOT-FOUND"},
             meminfo_path=meminfo,
             runner=runner,
         )
     with pytest.raises(HardwareProbeError, match="exactly one"):
         probe_nvidia_hardware(
-            nvidia_smi=sys.executable,
+            nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
             environment={"CUDA_VISIBLE_DEVICES": "0,1"},
             meminfo_path=meminfo,
             runner=runner,
@@ -295,7 +369,7 @@ def test_pci_order_and_unique_uuid_resolve_exact_device(tmp_path):
     )
     runner = _runner_for(rows)
     by_ordinal = probe_nvidia_hardware(
-        nvidia_smi=sys.executable,
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
         environment={
             "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
             "CUDA_VISIBLE_DEVICES": "0",
@@ -307,7 +381,7 @@ def test_pci_order_and_unique_uuid_resolve_exact_device(tmp_path):
     assert by_ordinal["selection"]["method"] == "cuda_pci_bus_ordinal"
 
     by_uuid = probe_nvidia_hardware(
-        nvidia_smi=sys.executable,
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
         environment={"CUDA_VISIBLE_DEVICES": "GPU-BBBBBBBB"},
         meminfo_path=meminfo,
         runner=runner,
@@ -316,7 +390,7 @@ def test_pci_order_and_unique_uuid_resolve_exact_device(tmp_path):
     assert by_uuid["selection"]["method"] == "cuda_gpu_uuid"
 
 
-def test_nvml_na_uses_torch_and_system_memory_for_unified_gpu(tmp_path):
+def test_unified_gpu_ignores_small_torch_ats_window_for_capacity(tmp_path):
     from sneeze.tpn.ocr_hardware import probe_nvidia_hardware
 
     gib = 1024**3
@@ -325,13 +399,13 @@ def test_nvml_na_uses_torch_and_system_memory_for_unified_gpu(tmp_path):
     torch_result = _torch_result(
         name="NVIDIA GB10",
         capability=(12, 1),
-        total_bytes=128 * gib,
+        total_bytes=512 * 1024**2,
         free_bytes=800 * 1024**2,
         integrated=True,
     )
     observation = probe_nvidia_hardware(
-        nvidia_smi=sys.executable,
-        torch_python=sys.executable,
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
+        torch_python=_trusted_executable(tmp_path, "torch-python"),
         environment={"CUDA_VISIBLE_DEVICES": "0"},
         meminfo_path=meminfo,
         runner=_runner_for(
@@ -351,7 +425,7 @@ def test_nvml_na_uses_torch_and_system_memory_for_unified_gpu(tmp_path):
     assert observation["memory"]["free_memory_bytes"] == 90 * gib
     assert observation["memory"]["total_sources"] == {
         "system": 128 * gib,
-        "torch_cuda": 128 * gib,
+        "torch_cuda": 512 * 1024**2,
     }
     assert observation["memory"]["free_sources"]["torch_cuda"] == (
         800 * 1024**2
@@ -366,8 +440,8 @@ def test_nvml_na_uses_torch_memory_for_explicit_discrete_gpu(tmp_path):
     meminfo = tmp_path / "meminfo"
     _write_meminfo(meminfo, total_gib=128, available_gib=90)
     observation = probe_nvidia_hardware(
-        nvidia_smi=sys.executable,
-        torch_python=sys.executable,
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
+        torch_python=_trusted_executable(tmp_path, "torch-python"),
         environment={"CUDA_VISIBLE_DEVICES": "0"},
         meminfo_path=meminfo,
         runner=_runner_for(
@@ -399,8 +473,8 @@ def test_nvml_na_without_explicit_torch_integration_stays_unknown(tmp_path):
     torch_result = _torch_result()
     del torch_result["device"]["integrated"]
     observation = probe_nvidia_hardware(
-        nvidia_smi=sys.executable,
-        torch_python=sys.executable,
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
+        torch_python=_trusted_executable(tmp_path, "torch-python"),
         environment={"CUDA_VISIBLE_DEVICES": "0"},
         meminfo_path=meminfo,
         runner=_runner_for(
@@ -440,8 +514,8 @@ def test_unified_gpu_capacity_is_capped_by_current_cgroup_v2(tmp_path):
     membership.write_text("0::/users/job\n", encoding="utf-8")
 
     observation = probe_nvidia_hardware(
-        nvidia_smi=sys.executable,
-        torch_python=sys.executable,
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
+        torch_python=_trusted_executable(tmp_path, "torch-python"),
         environment={"CUDA_VISIBLE_DEVICES": "0"},
         meminfo_path=meminfo,
         cgroup_root=cgroup_root,
@@ -478,6 +552,190 @@ def test_unified_gpu_capacity_is_capped_by_current_cgroup_v2(tmp_path):
     assert observation["selector"]["total_memory_bytes"] == 80 * gib
 
 
+def test_unified_gpu_capacity_uses_tightest_cgroup_v2_ancestor(tmp_path):
+    from sneeze.tpn.ocr_hardware import probe_nvidia_hardware
+
+    gib = 1024**3
+    meminfo = tmp_path / "meminfo"
+    _write_meminfo(meminfo, total_gib=128, available_gib=90)
+    cgroup_root = tmp_path / "cgroup"
+    parent_group = cgroup_root / "users"
+    current_group = parent_group / "job"
+    current_group.mkdir(parents=True)
+    (current_group / "memory.max").write_text("max", encoding="utf-8")
+    (current_group / "memory.current").write_text(
+        str(5 * gib), encoding="utf-8"
+    )
+    (current_group / "memory.peak").write_text(
+        str(6 * gib), encoding="utf-8"
+    )
+    (parent_group / "memory.max").write_text(
+        str(80 * gib), encoding="utf-8"
+    )
+    (parent_group / "memory.current").write_text(
+        str(30 * gib), encoding="utf-8"
+    )
+    (cgroup_root / "memory.max").write_text(
+        str(96 * gib), encoding="utf-8"
+    )
+    (cgroup_root / "memory.current").write_text(
+        str(90 * gib), encoding="utf-8"
+    )
+    membership = tmp_path / "self-cgroup"
+    membership.write_text("0::/users/job\n", encoding="utf-8")
+
+    observation = probe_nvidia_hardware(
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
+        torch_python=_trusted_executable(tmp_path, "torch-python"),
+        environment={"CUDA_VISIBLE_DEVICES": "0"},
+        meminfo_path=meminfo,
+        cgroup_root=cgroup_root,
+        cgroup_membership_path=membership,
+        runner=_runner_for(
+            _smi_row(
+                name="NVIDIA GB10",
+                capability="12.1",
+                total_mib="N/A",
+                free_mib="N/A",
+            ),
+            _torch_result(
+                name="NVIDIA GB10",
+                capability=(12, 1),
+                total_bytes=128 * gib,
+                free_bytes=800 * 1024**2,
+                integrated=True,
+            ),
+        ),
+    )
+
+    assert observation["memory"]["total_memory_bytes"] == 80 * gib
+    assert observation["memory"]["free_memory_bytes"] == 6 * gib
+    assert observation["memory"]["cgroup_v2"] == {
+        "status": "available",
+        "unlimited": False,
+        "limit_bytes": 80 * gib,
+        "current_bytes": 5 * gib,
+        "peak_bytes": 6 * gib,
+        "available_bytes": 6 * gib,
+    }
+
+
+def test_cgroup_v2_diagnostics_stay_bound_to_process_leaf(tmp_path):
+    from sneeze.tpn.ocr_hardware import _read_cgroup_v2_memory
+
+    root = tmp_path / "cgroup"
+    parent = root / "users"
+    leaf = parent / "job"
+    leaf.mkdir(parents=True)
+    (leaf / "memory.current").write_text("10\n", encoding="utf-8")
+    (leaf / "memory.peak").write_text("20\n", encoding="utf-8")
+    (parent / "memory.max").write_text("100\n", encoding="utf-8")
+    (parent / "memory.current").write_text("30\n", encoding="utf-8")
+    (root / "memory.max").write_text("200\n", encoding="utf-8")
+    (root / "memory.current").write_text("150\n", encoding="utf-8")
+    membership = tmp_path / "self-cgroup"
+    membership.write_text("0::/users/job\n", encoding="utf-8")
+
+    assert _read_cgroup_v2_memory(root, membership) == {
+        "status": "available",
+        "unlimited": False,
+        "limit_bytes": 100,
+        "current_bytes": 10,
+        "peak_bytes": 20,
+        "available_bytes": 50,
+    }
+
+
+@pytest.mark.parametrize(
+    "membership_contents",
+    [None, "1:memory:/workload\n"],
+)
+def test_cgroup_v2_memory_requires_known_process_membership(
+    tmp_path,
+    membership_contents,
+):
+    from sneeze.tpn.ocr_hardware import _read_cgroup_v2_memory
+
+    cgroup_root = tmp_path / "cgroup"
+    cgroup_root.mkdir()
+    (cgroup_root / "memory.max").write_text("1024\n", encoding="utf-8")
+    (cgroup_root / "memory.current").write_text("512\n", encoding="utf-8")
+    membership = tmp_path / "self-cgroup"
+    if membership_contents is not None:
+        membership.write_text(membership_contents, encoding="utf-8")
+
+    assert _read_cgroup_v2_memory(cgroup_root, membership) == {
+        "status": "unavailable",
+        "unlimited": None,
+        "limit_bytes": None,
+        "current_bytes": None,
+        "peak_bytes": None,
+        "available_bytes": None,
+    }
+
+
+def test_unified_gpu_headroom_is_unknown_when_finite_cgroup_usage_is_missing(
+    tmp_path,
+):
+    from sneeze.tpn.ocr_hardware import (
+        calculate_memory_tiers,
+        probe_nvidia_hardware,
+    )
+
+    gib = 1024**3
+    meminfo = tmp_path / "meminfo"
+    _write_meminfo(meminfo, total_gib=128, available_gib=90)
+    cgroup_root = tmp_path / "cgroup"
+    parent_group = cgroup_root / "users"
+    current_group = parent_group / "job"
+    current_group.mkdir(parents=True)
+    (current_group / "memory.max").write_text("max\n", encoding="utf-8")
+    (current_group / "memory.current").write_text(
+        str(5 * gib), encoding="utf-8"
+    )
+    (parent_group / "memory.max").write_text(
+        str(80 * gib), encoding="utf-8"
+    )
+    membership = tmp_path / "self-cgroup"
+    membership.write_text("0::/users/job\n", encoding="utf-8")
+
+    observation = probe_nvidia_hardware(
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
+        torch_python=_trusted_executable(tmp_path, "torch-python"),
+        environment={"CUDA_VISIBLE_DEVICES": "0"},
+        meminfo_path=meminfo,
+        cgroup_root=cgroup_root,
+        cgroup_membership_path=membership,
+        runner=_runner_for(
+            _smi_row(
+                name="NVIDIA GB10",
+                capability="12.1",
+                total_mib="N/A",
+                free_mib="N/A",
+            ),
+            _torch_result(
+                name="NVIDIA GB10",
+                capability=(12, 1),
+                total_bytes=128 * gib,
+                free_bytes=800 * 1024**2,
+                integrated=True,
+            ),
+        ),
+    )
+    budgets = calculate_memory_tiers(observation)
+
+    assert observation["memory"]["total_memory_bytes"] == 80 * gib
+    assert observation["memory"]["free_memory_bytes"] is None
+    assert observation["memory"]["cgroup_v2"]["available_bytes"] is None
+    assert all(
+        "live_free_memory_unknown" in tier["reason_codes"]
+        for tier in budgets["tiers"]
+    )
+    assert all(
+        tier["full_budget_available"] is False for tier in budgets["tiers"]
+    )
+
+
 def test_nvml_na_without_torch_has_explicit_unsupported_budgets(tmp_path):
     from sneeze.tpn.ocr_hardware import (
         calculate_memory_tiers,
@@ -487,7 +745,7 @@ def test_nvml_na_without_torch_has_explicit_unsupported_budgets(tmp_path):
     meminfo = tmp_path / "meminfo"
     _write_meminfo(meminfo, total_gib=128, available_gib=90)
     observation = probe_nvidia_hardware(
-        nvidia_smi=sys.executable,
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
         environment={"CUDA_VISIBLE_DEVICES": "0"},
         meminfo_path=meminfo,
         runner=_runner_for(
@@ -525,10 +783,14 @@ def test_dedicated_tiers_report_support_and_live_availability(tmp_path):
     meminfo = tmp_path / "meminfo"
     _write_meminfo(meminfo)
     observation = probe_nvidia_hardware(
-        nvidia_smi=sys.executable,
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
+        torch_python=_trusted_executable(tmp_path, "torch-python"),
         environment={"CUDA_VISIBLE_DEVICES": "0"},
         meminfo_path=meminfo,
-        runner=_runner_for(_smi_row(free_mib="10240")),
+        runner=_runner_for(
+            _smi_row(free_mib="10240"),
+            _torch_result(),
+        ),
     )
     budgets = calculate_memory_tiers(
         observation,
@@ -560,8 +822,8 @@ def test_unified_memory_tiers_reserve_host_capacity(tmp_path):
     meminfo = tmp_path / "meminfo"
     _write_meminfo(meminfo, total_gib=128, available_gib=90)
     observation = probe_nvidia_hardware(
-        nvidia_smi=sys.executable,
-        torch_python=sys.executable,
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
+        torch_python=_trusted_executable(tmp_path, "torch-python"),
         environment={"CUDA_VISIBLE_DEVICES": "0"},
         meminfo_path=meminfo,
         runner=_runner_for(
@@ -606,10 +868,11 @@ def test_reserve_can_make_a_tier_explicitly_unsupported(tmp_path):
     meminfo = tmp_path / "meminfo"
     _write_meminfo(meminfo)
     observation = probe_nvidia_hardware(
-        nvidia_smi=sys.executable,
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
+        torch_python=_trusted_executable(tmp_path, "torch-python"),
         environment={"CUDA_VISIBLE_DEVICES": "0"},
         meminfo_path=meminfo,
-        runner=_runner_for(_smi_row()),
+        runner=_runner_for(_smi_row(), _torch_result()),
     )
     budgets = calculate_memory_tiers(
         observation,
@@ -634,7 +897,7 @@ def test_receipts_are_deterministic_hashed_and_reject_secrets(tmp_path):
     meminfo = tmp_path / "meminfo"
     _write_meminfo(meminfo)
     observation = probe_nvidia_hardware(
-        nvidia_smi=sys.executable,
+        nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
         environment={"CUDA_VISIBLE_DEVICES": "0"},
         meminfo_path=meminfo,
         hostname="deterministic-host",
@@ -667,8 +930,8 @@ def test_torch_identity_mismatch_is_rejected(tmp_path):
     _write_meminfo(meminfo)
     with pytest.raises(HardwareProbeError, match="compute capabilities"):
         probe_nvidia_hardware(
-            nvidia_smi=sys.executable,
-            torch_python=sys.executable,
+            nvidia_smi=_trusted_executable(tmp_path, "nvidia-smi"),
+            torch_python=_trusted_executable(tmp_path, "torch-python"),
             environment={"CUDA_VISIBLE_DEVICES": "0"},
             meminfo_path=meminfo,
             runner=_runner_for(

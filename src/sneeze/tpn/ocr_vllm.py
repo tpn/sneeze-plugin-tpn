@@ -338,8 +338,9 @@ def ocr_full_item_from_candidate(
         or refresh_metadata
         or not os.path.exists(json_path)
     )
-    image_sha256 = file_sha256(candidate.image_path)
+    image_sha256 = None
     if expected_execution_receipt is not None:
+        image_sha256 = file_sha256(candidate.image_path)
         reused_stages = []
         if not need_ocr:
             reused_stages.append(("grounded_ocr", "ocr", ocr_path))
@@ -360,6 +361,8 @@ def ocr_full_item_from_candidate(
         need_json = True
     if not (need_ocr or need_markdown or need_json):
         return None
+    if image_sha256 is None:
+        image_sha256 = file_sha256(candidate.image_path)
     return OcrFullItem(
         image_path=candidate.image_path,
         base=candidate.base,
@@ -883,7 +886,7 @@ def _word_tokens(text: str | None) -> list[str]:
 def _grounded_content_tokens(text: str | None) -> list[str]:
     """Tokenize OCR content while ignoring DeepSeek box coordinates."""
 
-    return _word_tokens(_GROUNDING_BOX_LINE_RE.sub(r"\1", text or ""))
+    return _word_tokens(_GROUNDING_BOX_LINE_RE.sub("", text or ""))
 
 
 def _source_coverage(text: str, source: str | None) -> float | None:
@@ -2176,7 +2179,12 @@ class DeepSeekOcrOfflineProcessor:
     def _filter_llm_kwargs(self, kwargs):
         try:
             from vllm.engine.arg_utils import EngineArgs
-        except Exception:  # pragma: no cover - depends on vLLM version
+        except Exception as exc:  # pragma: no cover - version fallback
+            if self.moe_backend != DEFAULT_DEEPSEEK_MOE_BACKEND:
+                raise RuntimeError(
+                    "the installed vLLM cannot verify support for explicit "
+                    f"moe_backend={self.moe_backend}"
+                ) from exc
             try:
                 from vllm import LLM
             except Exception:

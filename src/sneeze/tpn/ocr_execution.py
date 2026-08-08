@@ -529,7 +529,7 @@ def resolve_execution_profile(
     selection: str,
     *,
     pipeline_id: str | None,
-    memory_tier: str,
+    memory_tier: str | None,
     observation: Mapping[str, Any],
     search_paths: Sequence[str | os.PathLike[str]],
     allow_provisional: bool = False,
@@ -539,6 +539,7 @@ def resolve_execution_profile(
     from .ocr_profiles import (
         TRUSTED_QUALIFIED_PROFILE_SHA256S,
         OcrProfileError,
+        OcrProfileNoMatchError,
         auto_select_execution_profile,
         get_pipeline_definition,
         list_execution_profiles,
@@ -562,16 +563,41 @@ def resolve_execution_profile(
             profiles = list_execution_profiles(
                 paths=tuple(path for path in paths if path.exists())
             )
-            profile = auto_select_execution_profile(
-                profiles,
-                observation,
-                pipeline_id=pipeline_id,
-                memory_tier=memory_tier,
-                require_qualified=not allow_provisional,
-                trusted_qualified_profile_sha256s=(
-                    TRUSTED_QUALIFIED_PROFILE_SHA256S
-                ),
-            )
+            if memory_tier is None:
+                failures = []
+                for candidate_tier in ("max", "50", "25"):
+                    try:
+                        profile = auto_select_execution_profile(
+                            profiles,
+                            observation,
+                            pipeline_id=pipeline_id,
+                            memory_tier=candidate_tier,
+                            require_qualified=not allow_provisional,
+                            trusted_qualified_profile_sha256s=(
+                                TRUSTED_QUALIFIED_PROFILE_SHA256S
+                            ),
+                        )
+                    except OcrProfileNoMatchError as exc:
+                        failures.append(f"{candidate_tier}: {exc}")
+                        continue
+                    memory_tier = candidate_tier
+                    break
+                else:
+                    raise OcrExecutionError(
+                        "no supported OCR memory tier matches this "
+                        "execution: " + "; ".join(failures)
+                    )
+            else:
+                profile = auto_select_execution_profile(
+                    profiles,
+                    observation,
+                    pipeline_id=pipeline_id,
+                    memory_tier=memory_tier,
+                    require_qualified=not allow_provisional,
+                    trusted_qualified_profile_sha256s=(
+                        TRUSTED_QUALIFIED_PROFILE_SHA256S
+                    ),
+                )
             source = "auto"
         else:
             candidate = Path(normalized).expanduser()
@@ -590,6 +616,21 @@ def resolve_execution_profile(
                     paths=tuple(path for path in paths if path.exists()),
                 )
                 source = "id:" + normalized
+            if memory_tier is None:
+                memory_tier = next(
+                    (
+                        tier
+                        for tier in ("max", "50", "25")
+                        if profile["memory_tiers"][tier]["supported"]
+                    ),
+                    None,
+                )
+                if memory_tier is None:
+                    raise OcrExecutionError(
+                        "execution profile has no supported memory tier"
+                    )
+        if memory_tier is None:
+            raise OcrExecutionError("could not select an OCR memory tier")
         canonical_pipeline = profile["pipeline_id"]
         if pipeline_id:
             requested = get_pipeline_definition(pipeline_id)["pipeline_id"]
@@ -618,6 +659,7 @@ def resolve_execution_profile(
     return {
         "profile": profile,
         "profile_source": source,
+        "memory_tier": memory_tier,
         "match": report,
     }
 
@@ -746,7 +788,7 @@ def deepseek_engine_identity_mismatches(
     *,
     installation: Mapping[str, Any],
     engine_metadata: Mapping[str, Any],
-    execution_settings: Mapping[str, Any] | None = None,
+    execution_settings: Mapping[str, Any] | None,
 ) -> list[str]:
     """Compare the loaded DeepSeek engine with its sealed identities.
 
@@ -871,11 +913,17 @@ def deepseek_engine_identity_mismatches(
                 f"engine.runtime.{loaded_key} differs from profile package"
             )
 
-    expected_dtype = str(expected_runtime.get("dtype", "")).removeprefix(
-        "torch."
+    expected_dtype_value = expected_runtime.get("dtype")
+    expected_dtype = (
+        expected_dtype_value.removeprefix("torch.")
+        if isinstance(expected_dtype_value, str)
+        else ""
     )
-    actual_dtype = str(loaded_runtime.get("dtype", "")).removeprefix(
-        "torch."
+    actual_dtype_value = loaded_runtime.get("dtype")
+    actual_dtype = (
+        actual_dtype_value.removeprefix("torch.")
+        if isinstance(actual_dtype_value, str)
+        else ""
     )
     if not actual_dtype:
         reasons.append("engine.runtime.dtype is missing")
@@ -902,16 +950,24 @@ def deepseek_engine_identity_mismatches(
             "engine.runtime.attention_backend_selected differs from "
             "installation"
         )
-    if execution_settings is not None:
-        expected_moe = execution_settings.get("moe_backend", "auto")
+    expected_moe = None
+    if not isinstance(execution_settings, Mapping):
+        reasons.append("execution settings are missing")
+    else:
+        candidate_moe = execution_settings.get("moe_backend")
+        if not isinstance(candidate_moe, str) or not candidate_moe:
+            reasons.append("execution settings moe_backend is missing")
+        else:
+            expected_moe = candidate_moe
+    if expected_moe is not None:
         for key in ("moe_backend_requested", "moe_backend_configured"):
             if loaded_runtime.get(key) != expected_moe:
                 reasons.append(f"engine.runtime.{key} differs from profile")
-        expected_jit = deepseek_jit_environment()
-        if loaded_runtime.get("jit_environment") != expected_jit:
-            reasons.append(
-                "engine.runtime.jit_environment differs from implementation"
-            )
+    expected_jit = deepseek_jit_environment()
+    if loaded_runtime.get("jit_environment") != expected_jit:
+        reasons.append(
+            "engine.runtime.jit_environment differs from implementation"
+        )
     return list(dict.fromkeys(reasons))
 
 

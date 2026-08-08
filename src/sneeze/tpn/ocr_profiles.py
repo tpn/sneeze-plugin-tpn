@@ -25,8 +25,11 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
+from .ocr_memory import canonical_memory_budget
 from .ocr_path_security import (
     TrustedPathError,
+    prepare_trusted_directory,
+    reject_protected_corpus_overlap,
     validate_trusted_directory,
     validate_trusted_file,
 )
@@ -161,7 +164,7 @@ _TIER_STAGE_KEYS = frozenset(
         "confirmed_pages_per_second",
     }
 )
-_DEEPSEEK_LEGACY_TIER_SETTING_KEYS = frozenset(
+_DEEPSEEK_TIER_SETTING_KEYS = frozenset(
     {
         "attention_backend",
         "batch_size",
@@ -178,16 +181,10 @@ _DEEPSEEK_LEGACY_TIER_SETTING_KEYS = frozenset(
         "ngram_size",
         "temperature",
         "window_size",
+        "moe_backend",
     }
 )
-_DEEPSEEK_RUNTIME_CONTROL_KEYS = frozenset({"moe_backend"})
-_DEEPSEEK_TIER_SETTING_KEYS = (
-    _DEEPSEEK_LEGACY_TIER_SETTING_KEYS | _DEEPSEEK_RUNTIME_CONTROL_KEYS
-)
 _QUALIFIED_DEEPSEEK_MOE_BACKEND = "triton"
-_DEEPSEEK_LEGACY_IMPLEMENTATION_SHA256 = (
-    "1572663ce37a0735db51abb66454a0b1c5cbd8db7dc8bb96153698342f2e58be"
-)
 _MINERU_TIER_SETTING_KEYS = frozenset(
     {
         "backend",
@@ -230,6 +227,14 @@ class OcrProfileNotFoundError(OcrProfileError):
 
 class OcrProfileSelectionError(OcrProfileError):
     """Raised when automatic profile selection cannot resolve one profile."""
+
+
+class OcrProfileNoMatchError(OcrProfileSelectionError):
+    """Raised when no execution profile matches an observation."""
+
+
+class OcrProfileAmbiguityError(OcrProfileSelectionError):
+    """Raised when more than one execution profile matches exactly."""
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
@@ -313,6 +318,12 @@ def _require_sha256(value: Any, label: str) -> str:
 def _require_positive_integer(value: Any, label: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise OcrProfileError(f"{label} must be a positive integer")
+    return value
+
+
+def _require_nonnegative_integer(value: Any, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise OcrProfileError(f"{label} must be a nonnegative integer")
     return value
 
 
@@ -689,7 +700,6 @@ def _validate_tier_stage(
     label: str,
     *,
     backend_id: str,
-    implementation_sha256: str,
     memory_tier: str,
     budget_bytes: int,
     total_memory_bytes: int,
@@ -705,19 +715,7 @@ def _validate_tier_stage(
         raise OcrProfileError(
             f"{label} has no validated settings schema for {backend_id}"
         )
-    legacy_deepseek_settings = (
-        backend_id == "deepseek-vllm"
-        and set(settings) == _DEEPSEEK_LEGACY_TIER_SETTING_KEYS
-        and implementation_sha256
-        == _DEEPSEEK_LEGACY_IMPLEMENTATION_SHA256
-    )
-    if legacy_deepseek_settings:
-        # Existing sealed profiles remain readable. Their implementation
-        # selector prevents reuse with runtime-control-aware source until
-        # the GPU is requalified and a new profile is trusted.
-        pass
-    else:
-        _require_exact_keys(settings, expected_keys, f"{label}.settings")
+    _require_exact_keys(settings, expected_keys, f"{label}.settings")
     batch_size = settings.get("batch_size")
     _require_positive_integer(batch_size, f"{label}.settings.batch_size")
     if settings["memory_tier"] != memory_tier:
@@ -783,15 +781,14 @@ def _validate_tier_stage(
             )
         for key in ("attention_backend", "mm_encoder_attn_backend"):
             _require_text(settings[key], f"{label}.settings.{key}")
-        if set(settings) == _DEEPSEEK_TIER_SETTING_KEYS:
-            moe_backend = _require_text(
-                settings["moe_backend"],
-                f"{label}.settings.moe_backend",
+        moe_backend = _require_text(
+            settings["moe_backend"],
+            f"{label}.settings.moe_backend",
+        )
+        if moe_backend != _QUALIFIED_DEEPSEEK_MOE_BACKEND:
+            raise OcrProfileError(
+                f"{label}.settings.moe_backend must be triton"
             )
-            if moe_backend != _QUALIFIED_DEEPSEEK_MOE_BACKEND:
-                raise OcrProfileError(
-                    f"{label}.settings.moe_backend must be triton"
-                )
         if (
             settings["max_tokens"] != 8192
             or settings["ngram_size"] != 10
@@ -838,7 +835,6 @@ def _validate_memory_tiers(
     memory_model: str,
     total_memory_bytes: int,
     pipeline_stages: Mapping[str, Mapping[str, Any]],
-    profile_stages: Mapping[str, Mapping[str, Any]],
 ) -> set[str]:
     tiers = _require_mapping(value, "memory_tiers")
     if set(tiers) != set(MEMORY_TIERS):
@@ -852,10 +848,7 @@ def _validate_memory_tiers(
             "hardware_selector.memory_model must be dedicated or unified "
             "for canonical memory tiers"
         ) from exc
-    expected_reserve = min(
-        policy["reserve_bytes"],
-        total_memory_bytes - 1,
-    )
+    expected_reserve = policy["reserve_bytes"]
     expected_fractions = {
         "25": 0.25,
         "50": 0.5,
@@ -883,7 +876,7 @@ def _validate_memory_tiers(
             raise OcrProfileError(
                 f"{label}.budget_fraction must be {expected_fraction}"
             )
-        budget = _require_positive_integer(
+        budget = _require_nonnegative_integer(
             tier["budget_bytes"], f"{label}.budget_bytes"
         )
         reserve = _require_positive_integer(
@@ -894,9 +887,10 @@ def _validate_memory_tiers(
                 f"{label}.reserve_bytes must be {expected_reserve} for "
                 f"{memory_model} memory"
             )
-        expected_budget = min(
-            int(total_memory_bytes * expected_fraction),
-            total_memory_bytes - expected_reserve,
+        expected_budget = canonical_memory_budget(
+            total_memory_bytes,
+            expected_fraction,
+            expected_reserve,
         )
         if budget != expected_budget:
             raise OcrProfileError(
@@ -906,6 +900,10 @@ def _validate_memory_tiers(
         stage_settings = _require_mapping(tier["stages"], f"{label}.stages")
         reason = tier["reason"]
         if tier["supported"]:
+            if budget == 0:
+                raise OcrProfileError(
+                    f"{label}.budget_bytes must be positive when supported"
+                )
             supported_tiers.add(tier_name)
             if reason is not None:
                 raise OcrProfileError(
@@ -920,9 +918,6 @@ def _validate_memory_tiers(
                     stage_settings[stage_id],
                     f"{label}.stages.{stage_id}",
                     backend_id=pipeline_stages[stage_id]["backend_id"],
-                    implementation_sha256=profile_stages[stage_id][
-                        "runtime_selector"
-                    ]["implementation_sha256"],
                     memory_tier=tier_name,
                     budget_bytes=budget,
                     total_memory_bytes=total_memory_bytes,
@@ -1076,7 +1071,6 @@ def _validate_profile_payload(
         memory_model=selector["memory_model"],
         total_memory_bytes=selector["total_memory_bytes"],
         pipeline_stages=pipeline_stages,
-        profile_stages=profile["stages"],
     )
     _validate_qualification(
         profile["qualification"], supported_tiers=supported_tiers
@@ -1206,7 +1200,20 @@ def write_execution_profile(
     destination = Path(path).expanduser()
     if not destination.is_absolute():
         raise OcrProfileError("execution profile output must be absolute")
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        reject_protected_corpus_overlap(
+            destination,
+            label="execution profile output",
+        )
+        parent = prepare_trusted_directory(
+            destination.parent,
+            label="execution profile output parent",
+        )
+    except TrustedPathError as exc:
+        raise OcrProfileError(
+            f"could not prepare execution profile output: {exc}"
+        ) from exc
+    destination = parent / destination.name
     payload = (
         json.dumps(
             profile,
@@ -1217,6 +1224,7 @@ def write_execution_profile(
         + b"\n"
     )
     temporary = None
+    linked = False
     try:
         descriptor, name = tempfile.mkstemp(
             dir=destination.parent,
@@ -1230,16 +1238,28 @@ def write_execution_profile(
             os.fsync(handle.fileno())
         try:
             os.link(temporary, destination)
+            linked = True
         except FileExistsError as exc:
             raise OcrProfileError(
                 f"refusing to replace existing profile: {destination}"
             ) from exc
+    except OcrProfileError:
+        raise
+    except OSError as exc:
+        raise OcrProfileError(
+            "could not write execution profile"
+        ) from exc
     finally:
         if temporary is not None:
             try:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
+            except OSError as exc:
+                if linked:
+                    raise OcrProfileError(
+                        "could not clean up execution profile candidate"
+                    ) from exc
     return copy.deepcopy(profile)
 
 
@@ -1409,15 +1429,51 @@ def profile_match_report(
         raise OcrProfileError(
             "memory_tier must be one of: " + ", ".join(MEMORY_TIERS)
         )
+    tier = value["memory_tiers"][memory_tier]
     observed = _require_mapping(observation, "execution observation")
     hardware_value = observed.get("hardware", observed)
+    hardware_value = _require_mapping(
+        hardware_value,
+        "execution observation.hardware",
+    )
     hardware = hardware_selector_from_observation(
-        _require_mapping(hardware_value, "execution observation.hardware")
+        hardware_value
     )
+    expected_hardware = dict(value["hardware_selector"])
+    observed_hardware = dict(hardware)
+    unified_class = (
+        expected_hardware.get("memory_model") == "unified"
+        and observed_hardware.get("memory_model") == "unified"
+    )
+    if unified_class:
+        # Shared system-memory totals can move across kernels and cgroups;
+        # product, PCI ID, and compute capability identify the hardware class.
+        # Capacity is instead checked against the selected tier below and
+        # live free memory is checked immediately before production execution.
+        expected_hardware.pop("total_memory_bytes", None)
+        observed_hardware.pop("total_memory_bytes", None)
     reasons = _selector_mismatches(
-        value["hardware_selector"], hardware, "hardware"
+        expected_hardware,
+        observed_hardware,
+        "hardware",
     )
-    tier = value["memory_tiers"][memory_tier]
+    if unified_class:
+        memory = hardware_value.get("memory")
+        live_total = (
+            memory.get("total_memory_bytes")
+            if isinstance(memory, Mapping)
+            else hardware.get("total_memory_bytes")
+        )
+        required_capacity = tier["budget_bytes"] + tier["reserve_bytes"]
+        if (
+            not isinstance(live_total, int)
+            or isinstance(live_total, bool)
+            or live_total < required_capacity
+        ):
+            reasons.append(
+                "hardware.total_memory_bytes is below selected tier "
+                "requirement"
+            )
     observed_stages = observed.get("stages")
     if not isinstance(observed_stages, Mapping):
         reasons.append("stages are missing")
@@ -1542,11 +1598,11 @@ def auto_select_execution_profile(
         return copy.deepcopy(matched[0])
     if len(matched) > 1:
         identifiers = ", ".join(item["profile_id"] for item in matched)
-        raise OcrProfileSelectionError(
+        raise OcrProfileAmbiguityError(
             "multiple OCR execution profiles match exactly: " + identifiers
         )
     if not candidates:
-        raise OcrProfileSelectionError(
+        raise OcrProfileNoMatchError(
             "no OCR profiles are registered for pipeline "
             f"{canonical_pipeline}; "
             "run the GPU tuning workflow to onboard this hardware"
@@ -1555,7 +1611,7 @@ def auto_select_execution_profile(
         f"{report['profile_id']}: {', '.join(report['reasons'])}"
         for report in reports
     )
-    raise OcrProfileSelectionError(
+    raise OcrProfileNoMatchError(
         "no OCR execution profile matches this hardware/runtime/tier; "
         "run the GPU tuning workflow to onboard it. " + diagnostics
     )
@@ -1568,6 +1624,8 @@ __all__ = [
     "MINIMUM_QUALIFICATION_REPEATS",
     "OcrProfileError",
     "OcrProfileNotFoundError",
+    "OcrProfileAmbiguityError",
+    "OcrProfileNoMatchError",
     "OcrProfileSelectionError",
     "PROFILE_KIND",
     "QUALIFICATION_STATES",

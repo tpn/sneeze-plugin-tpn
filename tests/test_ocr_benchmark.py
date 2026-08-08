@@ -442,7 +442,10 @@ def test_prepare_run_rejects_fixture_drift(
         )
 
 
-def test_prepare_run_rejects_unsafe_or_nonempty_destination(tmp_path):
+def test_prepare_run_rejects_unsafe_or_nonempty_destination(
+    tmp_path,
+    monkeypatch,
+):
     from sneeze.tpn.ocr_benchmark import load_manifest, prepare_run
 
     manifest_path, input_root, _case = _write_manifest(tmp_path)
@@ -461,6 +464,19 @@ def test_prepare_run_rejects_unsafe_or_nonempty_destination(tmp_path):
     with pytest.raises(ValueError, match="(?i)(nonempty|must be empty)"):
         prepare_run(manifest, str(input_root), str(nonempty))
     assert (nonempty / "owned-by-user").read_text() == "preserve"
+
+    protected = tmp_path / "canonical" / "papers"
+    protected.mkdir(parents=True)
+    config_home = tmp_path / "config"
+    policy = config_home / "sneeze" / "tpn" / "ocr-protected-roots"
+    policy.parent.mkdir(parents=True)
+    policy.write_text(f"{protected}\n", encoding="utf-8")
+    policy.chmod(0o600)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    protected_output = protected / "benchmark-output"
+    with pytest.raises(ValueError, match="protected corpora"):
+        prepare_run(manifest, str(input_root), str(protected_output))
+    assert not protected_output.exists()
 
 
 def test_load_provider_spec_keeps_argv_and_exact_revision(tmp_path):
@@ -710,6 +726,40 @@ def test_git_provenance_handles_missing_git_without_leaking_error(
     assert diff["returncode"] is None
     recorded = json.dumps({"repository": metadata, "git_diff": diff})
     assert sensitive_detail not in recorded
+
+
+def test_git_provenance_resolves_executable_before_sanitizing_path(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.ocr_benchmark as benchmark
+
+    repository = tmp_path / "repository"
+    _init_git_repository(repository)
+    wrapper = tmp_path / "custom-git"
+    wrapper.write_text('#!/bin/sh\nexec git "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o700)
+    monkeypatch.setattr(
+        benchmark.shutil,
+        "which",
+        lambda _name, path=None: str(wrapper),
+    )
+    calls = []
+    real_run = subprocess.run
+
+    def recording_run(argv, *args, **kwargs):
+        calls.append((tuple(argv), dict(kwargs["env"])))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(benchmark.subprocess, "run", recording_run)
+    context = benchmark._git_repository_context(repository)
+    metadata = benchmark._git_metadata(repository, context=context)
+
+    assert metadata["available"] is True
+    assert calls
+    assert all(call[0][0] == str(wrapper.resolve()) for call in calls)
+    assert all(call[1]["PATH"] == os.defpath for call in calls)
+    assert str(wrapper) not in json.dumps(metadata)
 
 
 def test_later_git_launch_error_is_a_detail_free_benchmark_error(
@@ -2094,6 +2144,32 @@ def test_assertions_can_be_scoped_to_provider_lanes(tmp_path):
     _write_jsonl(manifest_path, [case])
     with pytest.raises(ValueError, match="nonempty unique list"):
         load_manifest(manifest_path)
+
+    case["assertions"][0]["lanes"] = [["best"]]
+    _write_jsonl(manifest_path, [case])
+    with pytest.raises(ValueError, match=r"lanes\[1\]"):
+        load_manifest(manifest_path)
+
+
+@pytest.mark.parametrize(
+    "lanes",
+    (pytest.param([], id="empty"), pytest.param([["best"]], id="nested")),
+)
+def test_benchmark_rejects_invalid_selected_lanes(tmp_path, lanes):
+    from sneeze.tpn.ocr_benchmark import BenchmarkError, run_benchmark
+
+    manifest_path, input_root, _case = _write_manifest(tmp_path)
+    spec_path, _provider_path = _write_provider_spec(tmp_path)
+
+    with pytest.raises(BenchmarkError, match="lanes"):
+        run_benchmark(
+            manifest_path=manifest_path,
+            input_root=input_root,
+            provider_spec_path=spec_path,
+            dest_dir=tmp_path / "invalid-lanes-run",
+            lanes=lanes,
+            repeats=1,
+        )
 
 
 def test_benchmark_does_not_vacuously_pass_uncovered_lane(tmp_path):

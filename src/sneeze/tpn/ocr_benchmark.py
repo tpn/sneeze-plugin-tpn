@@ -24,7 +24,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .ocr_path_security import TrustedPathError, prepare_private_directory
+from .ocr_path_security import (
+    TrustedPathError,
+    prepare_private_directory,
+    reject_protected_corpus_overlap,
+)
 from .ocr_process_lifecycle import isolated_subprocess_signal_guard
 from .ocr_vllm import (
     analyze_markdown_quality,
@@ -468,16 +472,18 @@ def _validate_assertion(assertion: Any, label: str) -> None:
         raise BenchmarkError(f"{label} must be an object")
     lanes = assertion.get("lanes")
     if lanes is not None:
-        if (
-            not isinstance(lanes, list)
-            or not lanes
-            or len(lanes) != len(set(lanes))
-        ):
+        if not isinstance(lanes, list) or not lanes:
             raise BenchmarkError(
                 f"{label}.lanes must be a nonempty unique list"
             )
-        for index, lane in enumerate(lanes, 1):
+        normalized_lanes = [
             _safe_component(lane, f"{label}.lanes[{index}]")
+            for index, lane in enumerate(lanes, 1)
+        ]
+        if len(normalized_lanes) != len(set(normalized_lanes)):
+            raise BenchmarkError(
+                f"{label}.lanes must be a nonempty unique list"
+            )
     kind = assertion.get("type") or assertion.get("kind")
     if kind == "quality_status":
         expected = assertion.get("equals", assertion.get("value", "pass"))
@@ -722,6 +728,10 @@ def _validate_destination(input_root: Path, dest_dir: Path) -> Path:
             "Benchmark destination must be separate from the input root"
         )
     try:
+        reject_protected_corpus_overlap(
+            resolved_dest,
+            label="benchmark destination",
+        )
         return prepare_private_directory(
             dest_dir,
             label="benchmark destination",
@@ -1900,13 +1910,33 @@ def _git_probe_environment() -> dict[str, str]:
     }
 
 
+def _git_probe_executable() -> str | None:
+    candidate = shutil.which("git", path=os.defpath) or shutil.which("git")
+    if candidate is None:
+        return None
+    try:
+        resolved = Path(candidate).resolve(strict=True)
+    except OSError:
+        return None
+    return str(resolved) if resolved.is_file() else None
+
+
 def _git_repository_context(path: Path) -> dict[str, Any]:
     declared_root = path.resolve(strict=True)
     environment = _git_probe_environment()
+    executable = _git_probe_executable()
+    if executable is None:
+        return {
+            "available": False,
+            "root": declared_root,
+            "environment": environment,
+            "executable": None,
+            "unavailable_reason": "git_probe_launch_failed",
+        }
     try:
         completed = subprocess.run(
             [
-                "git",
+                executable,
                 "--no-pager",
                 "-c",
                 "core.fsmonitor=false",
@@ -1924,6 +1954,7 @@ def _git_repository_context(path: Path) -> dict[str, Any]:
             "available": False,
             "root": declared_root,
             "environment": environment,
+            "executable": executable,
             "unavailable_reason": "git_probe_launch_failed",
         }
     if completed.returncode != 0 or not completed.stdout.strip():
@@ -1931,6 +1962,7 @@ def _git_repository_context(path: Path) -> dict[str, Any]:
             "available": False,
             "root": declared_root,
             "environment": environment,
+            "executable": executable,
             "unavailable_reason": "git_toplevel_unavailable",
         }
     try:
@@ -1942,12 +1974,14 @@ def _git_repository_context(path: Path) -> dict[str, Any]:
             "available": False,
             "root": declared_root,
             "environment": environment,
+            "executable": executable,
             "unavailable_reason": "git_toplevel_mismatch",
         }
     return {
         "available": True,
         "root": declared_root,
         "environment": environment,
+        "executable": executable,
         "unavailable_reason": None,
     }
 
@@ -1963,7 +1997,7 @@ def _run_git_probe(
     try:
         return subprocess.run(
             [
-                "git",
+                context["executable"],
                 "--no-pager",
                 "-c",
                 "core.fsmonitor=false",
@@ -2624,8 +2658,14 @@ def run_benchmark(
         provider_spec_source,
         _source_bytes=provider_spec_source_bytes,
     )
-    selected_lanes = list(lanes or spec["lanes"])
-    if not selected_lanes or len(set(selected_lanes)) != len(selected_lanes):
+    selected_lanes = list(spec["lanes"] if lanes is None else lanes)
+    if not selected_lanes:
+        raise BenchmarkError("lanes must be unique and nonempty")
+    selected_lanes = [
+        _safe_component(lane, f"lanes[{index}]")
+        for index, lane in enumerate(selected_lanes, 1)
+    ]
+    if len(set(selected_lanes)) != len(selected_lanes):
         raise BenchmarkError("lanes must be unique and nonempty")
     unknown_lanes = set(selected_lanes) - set(spec["lanes"])
     if unknown_lanes:
