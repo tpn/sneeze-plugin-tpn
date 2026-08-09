@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -20,11 +22,13 @@ from pathlib import Path
 from typing import Any
 
 from .ocr_backends import OcrBackendDefinition
+from .ocr_process_lifecycle import isolated_subprocess_signal_guard
 
 SCHEMA_VERSION = 1
 DEFAULT_TORCH_BACKEND = "cu130"
+VLLM_BUILD_COMMIT = "4ff865c38eac3c3602c064fd43b00836805cd0a4"
 DEFAULT_CUDA_130_VLLM_WHEEL_INDEX = (
-    "https://wheels.vllm.ai/nightly/cu130/"
+    f"https://wheels.vllm.ai/{VLLM_BUILD_COMMIT}/cu130/"
 )
 _PYTORCH_WHEEL_INDEX = "https://download.pytorch.org/whl/{backend}"
 _SECRET_FIELD_RE = re.compile(
@@ -34,6 +38,8 @@ _SECRET_FIELD_RE = re.compile(
 )
 _SECRET_VALUE_RES = (
     re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bhf_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bBearer\s+\S+", re.IGNORECASE),
     re.compile(r"-----BEGIN [A-Z ]+ PRIVATE KEY-----"),
     re.compile(
@@ -110,9 +116,7 @@ def _assert_receipt_safe(value: Any, path: str = "receipt") -> None:
     elif isinstance(value, str) and any(
         pattern.search(value) for pattern in _SECRET_VALUE_RES
     ):
-        raise BackendSetupError(
-            f"refusing credential-like value in {path}"
-        )
+        raise BackendSetupError(f"refusing credential-like value in {path}")
 
 
 def assert_command_plan_safe(commands: Sequence[Sequence[str]]) -> None:
@@ -265,8 +269,8 @@ def _deepseek_environment_commands(
             "uv",
             "pip",
             "install",
-            "torch==2.11.0",
-            "torchvision==0.26.0",
+            "torch==2.11.0+cu130",
+            "torchvision==0.26.0+cu130",
             "torchaudio==2.11.0+cu130",
             "--index-url",
             pytorch_index,
@@ -433,8 +437,7 @@ def model_fetch_receipt(
     snapshot = expected_snapshot_path(backend, cache_dir)
     if not dry_run and not snapshot.is_dir():
         raise BackendSetupError(
-            "model fetch completed without the pinned snapshot at "
-            f"{snapshot}"
+            f"model fetch completed without the pinned snapshot at {snapshot}"
         )
     return make_receipt(
         "ocr_backend_model",
@@ -528,17 +531,33 @@ def build_provider_spec(
             "installed provider adapter does not match the qualified "
             f"SHA-256 for {backend.backend_id}"
         )
-    timeout = timeout_seconds or backend.default_timeout_seconds
-    if timeout <= 0:
-        raise BackendSetupError("provider timeout must be positive")
+    timeout = (
+        backend.default_timeout_seconds
+        if timeout_seconds is None
+        else timeout_seconds
+    )
+    if (
+        not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or timeout <= 0
+    ):
+        raise BackendSetupError(
+            "provider timeout must be a finite positive number"
+        )
+    try:
+        timeout_is_finite = math.isfinite(timeout)
+    except OverflowError:
+        timeout_is_finite = False
+    if not timeout_is_finite:
+        raise BackendSetupError(
+            "provider timeout must be a finite positive number"
+        )
     if not cuda_visible_devices:
         raise BackendSetupError(
             "CUDA visible-device selection cannot be empty"
         )
     device_value = device or backend.default_device
-    attention_value = (
-        attention_backend or backend.default_attention_backend
-    )
+    attention_value = attention_backend or backend.default_attention_backend
     return {
         "schema_version": 1,
         "provider_id": backend.provider_id,
@@ -656,9 +675,7 @@ def write_provider_spec(
             "output_path": str(destination),
             "spec_sha256": hashlib.sha256(payload).hexdigest(),
             "adapter_sha256": file_sha256(_adapter_path(backend)),
-            "qualified_adapter_sha256": (
-                backend.qualified_adapter_sha256
-            ),
+            "qualified_adapter_sha256": (backend.qualified_adapter_sha256),
             "model": {
                 "requested": backend.model_id,
                 "revision": backend.model_revision,
@@ -755,21 +772,65 @@ def _run_bounded_probe(
 ) -> dict[str, Any]:
     """Run a probe with secret-scrubbed env and bounded retained output."""
 
+    with isolated_subprocess_signal_guard() as lifecycle:
+        return _run_bounded_probe_guarded(
+            argv,
+            cwd=cwd,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+            lifecycle=lifecycle,
+        )
+
+
+def _run_bounded_probe_guarded(
+    argv: Sequence[str],
+    *,
+    cwd: str | None,
+    environment: Mapping[str, str],
+    timeout_seconds: float,
+    lifecycle: Any,
+) -> dict[str, Any]:
+
     with (
         tempfile.TemporaryFile() as stdout,
         tempfile.TemporaryFile() as stderr,
     ):
+        process = None
+
+        def stop_process_group() -> None:
+            if process is None:
+                return
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+
         try:
-            completed = subprocess.run(
-                list(argv),
-                cwd=cwd,
-                env=dict(environment),
-                check=False,
-                stdout=stdout,
-                stderr=stderr,
-                timeout=timeout_seconds,
+            with lifecycle.spawn_window():
+                process = subprocess.Popen(
+                    list(argv),
+                    cwd=cwd,
+                    env=dict(environment),
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    start_new_session=True,
+                )
+            returncode = lifecycle.wait(
+                process,
+                timeout_seconds=timeout_seconds,
             )
-            returncode = completed.returncode
             error_type = None
         except subprocess.TimeoutExpired:
             returncode = None
@@ -777,6 +838,12 @@ def _run_bounded_probe(
         except OSError as exc:
             returncode = None
             error_type = type(exc).__name__
+        finally:
+            # A successful direct child can still leave multiprocessing or
+            # runtime helpers in its private group. Passive signal handlers
+            # remain installed until unconditional teardown finishes.
+            with lifecycle.cleanup_window():
+                stop_process_group()
         stdout.seek(0)
         stdout_bytes = stdout.read(_MAX_PROBE_OUTPUT_BYTES + 1)
         stderr.seek(0)
@@ -801,7 +868,14 @@ def _probe_runtime_packages(
     if not names:
         return {}, None
     completed = _run_bounded_probe(
-        [spec["argv"][0], "-c", _PACKAGE_PROBE_CODE, *names],
+        [
+            spec["argv"][0],
+            "-I",
+            "-B",
+            "-c",
+            _PACKAGE_PROBE_CODE,
+            *names,
+        ],
         cwd=spec.get("cwd"),
         environment=build_local_provider_environment(spec),
         timeout_seconds=120,
@@ -843,6 +917,8 @@ def _probe_model_initialization(
     completed = _run_bounded_probe(
         [
             spec["argv"][0],
+            "-I",
+            "-B",
             "-c",
             _MODEL_PROBE_CODE,
             str(snapshot),
@@ -907,8 +983,7 @@ def _probe_model_initialization(
         "error_type": error_type,
         "result": safe_result,
         "output_truncated": bool(
-            completed["stdout_truncated"]
-            or completed["stderr_truncated"]
+            completed["stdout_truncated"] or completed["stderr_truncated"]
         ),
     }
 
@@ -1018,8 +1093,7 @@ def doctor_provider_spec(
         ),
         _check(
             "model_weights_sha256",
-            snapshot_integrity["weights_sha256"]
-            == backend.weights_sha256,
+            snapshot_integrity["weights_sha256"] == backend.weights_sha256,
             "model.safetensors matches the qualified SHA-256",
         ),
     ]
@@ -1080,9 +1154,7 @@ def doctor_provider_spec(
             "spec_path": str(source),
             "spec_sha256": file_sha256(source),
             "adapter_sha256": adapter_digest,
-            "qualified_adapter_sha256": (
-                backend.qualified_adapter_sha256
-            ),
+            "qualified_adapter_sha256": (backend.qualified_adapter_sha256),
             "model": {
                 "requested": backend.model_id,
                 "revision": backend.model_revision,

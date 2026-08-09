@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,7 +18,7 @@ PROMPT = "Use the native staged parser and return Markdown."
 SETTINGS = {"batch_size": 1, "temperature": 0.0}
 
 
-FAKE_PROVIDER = r'''
+FAKE_PROVIDER = r"""
 import argparse
 import hashlib
 import json
@@ -165,7 +166,7 @@ with responses_path.open("w") as handle:
 
 if mode == "nonzero":
     raise SystemExit(3)
-'''
+"""
 
 
 def _sha256(value: bytes) -> str:
@@ -249,6 +250,171 @@ def test_load_local_provider_spec_is_strictly_local(tmp_path):
         load_local_provider_spec(bad_path)
 
 
+@pytest.mark.parametrize(
+    "timeout",
+    (
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ),
+)
+def test_local_provider_spec_rejects_nonfinite_timeout(tmp_path, timeout):
+    from sneeze.tpn.ocr_provider import (
+        ProviderError,
+        load_local_provider_spec,
+    )
+
+    spec_path = _write_provider_spec(tmp_path)
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    spec["timeout_seconds"] = timeout
+    _write_json(spec_path, spec)
+
+    with pytest.raises(ProviderError, match="finite"):
+        load_local_provider_spec(spec_path)
+
+
+@pytest.mark.parametrize(
+    ("argument", "value"),
+    tuple(
+        pytest.param(argument, value, id=f"{argument}-{label}")
+        for argument in ("timeout_seconds", "terminate_grace_seconds")
+        for label, value in (
+            ("nan", float("nan")),
+            ("positive-infinity", float("inf")),
+            ("negative-infinity", float("-inf")),
+        )
+    ),
+)
+def test_local_provider_request_rejects_nonfinite_durations(
+    tmp_path,
+    argument,
+    value,
+):
+    from sneeze.tpn.ocr_provider import (
+        ProviderError,
+        run_local_provider_batch,
+    )
+
+    run_dir = tmp_path / "run"
+    kwargs = {argument: value}
+    with pytest.raises(ProviderError, match=rf"{argument}.*finite"):
+        run_local_provider_batch(
+            spec_path=_write_provider_spec(tmp_path),
+            lane="best",
+            run_dir=run_dir,
+            pages=[_write_page(tmp_path, "page-01")],
+            **kwargs,
+        )
+
+    assert not run_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("argument", "value"),
+    tuple(
+        pytest.param(argument, value, id=f"{argument}-{label}")
+        for argument in ("timeout_seconds", "terminate_grace_seconds")
+        for label, value in (
+            ("nan", float("nan")),
+            ("positive-infinity", float("inf")),
+            ("negative-infinity", float("-inf")),
+        )
+    ),
+)
+def test_provider_process_boundary_rejects_nonfinite_durations(
+    tmp_path,
+    argument,
+    value,
+):
+    from sneeze.tpn.ocr_provider import ProviderError, _run_provider_process
+
+    kwargs = {
+        "timeout_seconds": 1.0,
+        "terminate_grace_seconds": 0.0,
+    }
+    kwargs[argument] = value
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+
+    with pytest.raises(ProviderError, match=rf"{argument}.*finite"):
+        _run_provider_process(
+            argv=[sys.executable, "-c", "raise SystemExit(0)"],
+            cwd=str(tmp_path),
+            environment={},
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            **kwargs,
+        )
+
+    assert not stdout_path.exists()
+    assert not stderr_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    (
+        pytest.param(
+            'float("nan")',
+            "non-finite JSON number",
+            id="nan",
+        ),
+        pytest.param(
+            'float("inf")',
+            "non-finite JSON number",
+            id="infinity",
+        ),
+        pytest.param(
+            "1e400",
+            "non-finite JSON number",
+            id="overflowed-exponent",
+        ),
+    ),
+)
+def test_local_provider_rejects_nonfinite_usage_json(
+    tmp_path,
+    expression,
+    expected,
+):
+    from sneeze.tpn.ocr_provider import run_local_provider_batch
+
+    spec_path = _write_provider_spec(tmp_path)
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    adapter = Path(spec["argv"][1])
+    source = adapter.read_text(encoding="utf-8")
+    adapter.write_text(
+        source.replace(
+            '"wall_seconds": 0.01,',
+            f'"wall_seconds": {expression},',
+        ),
+        encoding="utf-8",
+    )
+
+    batch = run_local_provider_batch(
+        spec_path=spec_path,
+        lane="best",
+        run_dir=tmp_path / "run",
+        pages=[_write_page(tmp_path, "page-01")],
+    )
+
+    assert batch["ok"] is False
+    assert expected in " ".join(batch["protocol_errors"])
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+        pytest.param(10**10000, id="huge-integer"),
+    ),
+)
+def test_provider_usage_validator_rejects_nonfinite_numbers(value):
+    from sneeze.tpn.ocr_provider import _is_nonnegative_number
+
+    assert _is_nonnegative_number(value) is False
+
+
 def test_load_local_provider_spec_normalizes_tilde_paths(
     tmp_path,
     monkeypatch,
@@ -305,6 +471,84 @@ def test_load_local_provider_spec_rejects_nul_argv(tmp_path):
         load_local_provider_spec(spec_path)
 
 
+def test_local_provider_spec_rejects_duplicate_json_fields(tmp_path):
+    from sneeze.tpn.ocr_provider import (
+        ProviderError,
+        load_local_provider_spec,
+    )
+
+    spec_path = _write_provider_spec(tmp_path)
+    payload = spec_path.read_text(encoding="utf-8").replace(
+        '"provider_id": "fake-local-provider",',
+        '"provider_id": "shadow",\n  "provider_id": "fake-local-provider",',
+        1,
+    )
+    spec_path.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(ProviderError, match="duplicate JSON field"):
+        load_local_provider_spec(spec_path)
+
+
+@pytest.mark.parametrize(
+    "surface",
+    ("argv", "model", "prompt", "settings", "unexpected"),
+)
+def test_local_provider_spec_rejects_credential_shaped_persisted_values(
+    tmp_path,
+    surface,
+):
+    from sneeze.tpn.ocr_provider import (
+        ProviderError,
+        run_local_provider_batch,
+    )
+
+    spec_path = _write_provider_spec(tmp_path)
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    synthetic_value = "hf_" + "x" * 20
+    if surface == "argv":
+        spec["argv"].append(synthetic_value)
+    elif surface == "model":
+        spec["model"]["requested"] = synthetic_value
+    elif surface == "prompt":
+        spec["lanes"]["best"]["prompt"] = synthetic_value
+    elif surface == "settings":
+        spec["lanes"]["best"]["settings"]["safe_value"] = synthetic_value
+    else:
+        spec["unexpected_value"] = synthetic_value
+    _write_json(spec_path, spec)
+    run_dir = tmp_path / "public-evidence"
+
+    with pytest.raises(
+        ProviderError,
+        match="credential-like|unexpected fields",
+    ) as exc_info:
+        run_local_provider_batch(
+            spec_path=spec_path,
+            lane="best",
+            run_dir=run_dir,
+            pages=[_write_page(tmp_path, "page-01")],
+        )
+
+    assert synthetic_value not in str(exc_info.value)
+    assert not run_dir.exists()
+
+
+def test_local_provider_response_rejects_duplicate_json_fields(tmp_path):
+    from sneeze.tpn.ocr_provider import _read_response_jsonl
+
+    responses = tmp_path / "responses.jsonl"
+    responses.write_text(
+        '{"status":"completed","status":"error"}\n',
+        encoding="utf-8",
+    )
+
+    values, errors = _read_response_jsonl(responses)
+
+    assert values == []
+    assert len(errors) == 1
+    assert "duplicate JSON field" in errors[0]
+
+
 def test_local_provider_environment_scrubs_secrets_and_inference_controls(
     tmp_path,
 ):
@@ -318,29 +562,177 @@ def test_local_provider_environment_scrubs_secrets_and_inference_controls(
         spec,
         base_environment={
             "PATH": "/usr/bin",
+            "HOME": "/home/example",
             "OPENAI_API_KEY": "secret",
             "SESSION_TOKEN": "secret",
+            "AWS_PROFILE": "production",
+            "AWS_CONFIG_FILE": "/home/example/.aws/config",
+            "AZURE_CONFIG_DIR": "/home/example/.azure",
+            "CLOUDSDK_CONFIG": "/home/example/.config/gcloud",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/google.json",
+            "DATABASE_URL": "postgresql://ambient.invalid/database",
+            "SENTRY_DSN": "https://ambient.invalid/1",
             "PYTHONPATH": "/parent/source",
             "VIRTUAL_ENV": "/parent/env",
             "CUDA_VISIBLE_DEVICES": "7",
             "PYTHONHASHSEED": "random",
             "VLLM_ATTENTION_BACKEND": "ambient-backend",
-            "SAFE_VALUE": "kept",
+            "SAFE_VALUE": "not-allowlisted",
+            "LANG": "C.UTF-8",
+            "TZ": "UTC",
         },
     )
 
     assert environment["PATH"] == "/usr/bin:/bin"
-    assert environment["SAFE_VALUE"] == "kept"
+    assert environment["LANG"] == "C.UTF-8"
+    assert environment["TZ"] == "UTC"
     assert environment["FAKE_PROVIDER_MODE"] == "valid"
     assert environment["HF_HUB_OFFLINE"] == "1"
     assert environment["TRANSFORMERS_OFFLINE"] == "1"
-    assert "OPENAI_API_KEY" not in environment
-    assert "SESSION_TOKEN" not in environment
-    assert "PYTHONPATH" not in environment
-    assert "VIRTUAL_ENV" not in environment
-    assert "CUDA_VISIBLE_DEVICES" not in environment
-    assert "PYTHONHASHSEED" not in environment
-    assert "VLLM_ATTENTION_BACKEND" not in environment
+    for name in (
+        "HOME",
+        "OPENAI_API_KEY",
+        "SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_CONFIG_FILE",
+        "AZURE_CONFIG_DIR",
+        "CLOUDSDK_CONFIG",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "DATABASE_URL",
+        "SENTRY_DSN",
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+        "CUDA_VISIBLE_DEVICES",
+        "PYTHONHASHSEED",
+        "VLLM_ATTENTION_BACKEND",
+        "SAFE_VALUE",
+    ):
+        assert name not in environment
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        (
+            "SAFE_OVERRIDE",
+            "https://example:not-a-real-secret@example.invalid/model",
+        ),
+        ("SAFE_OVERRIDE", "Bearer not-a-real-token-value"),
+        ("SAFE_OVERRIDE", "token=not-a-real-token-value"),
+        ("SAFE_OVERRIDE", "sk-ant-not-a-real-token-value"),
+        ("SAFE_OVERRIDE", "hf_" + "x" * 20),
+        ("SAFE_OVERRIDE", "github_pat_" + "x" * 20),
+        (
+            "SAFE_OVERRIDE",
+            "postgresql://example:not-a-real-secret@db.invalid/database",
+        ),
+        ("DATABASE_URL", "sqlite:////tmp/example.db"),
+        (
+            "SENTRY_DSN",
+            "https://public-placeholder@o0.ingest.sentry.invalid/1",
+        ),
+    ),
+)
+def test_local_provider_rejects_credential_like_environment_evidence(
+    tmp_path,
+    name,
+    value,
+):
+    from sneeze.tpn.ocr_provider import (
+        ProviderError,
+        run_local_provider_batch,
+    )
+
+    spec_path = _write_provider_spec(tmp_path)
+    spec = json.loads(spec_path.read_text())
+    spec["env"][name] = value
+    _write_json(spec_path, spec)
+    run_dir = tmp_path / "public-evidence"
+
+    with pytest.raises(ProviderError, match="credential-like") as exc_info:
+        run_local_provider_batch(
+            spec_path=spec_path,
+            lane="best",
+            run_dir=run_dir,
+            pages=[_write_page(tmp_path, "page-01")],
+        )
+
+    assert value not in str(exc_info.value)
+    assert not run_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "PATH",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONEXECUTABLE",
+        "PYTHONINSPECT",
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "LD_LIBRARY_PATH",
+        "LD_DEBUG_OUTPUT",
+        "DYLD_INSERT_LIBRARIES",
+        "GCONV_PATH",
+        "GLIBC_TUNABLES",
+    ),
+)
+def test_local_provider_rejects_execution_environment_overrides(
+    tmp_path,
+    name,
+):
+    from sneeze.tpn.ocr_provider import (
+        ProviderError,
+        load_local_provider_spec,
+    )
+
+    spec_path = _write_provider_spec(tmp_path)
+    spec = json.loads(spec_path.read_text())
+    spec["env"][name] = "/example/override"
+    _write_json(spec_path, spec)
+
+    with pytest.raises(
+        ProviderError,
+        match=f"cannot override execution variable {name}",
+    ) as exc_info:
+        load_local_provider_spec(spec_path)
+
+    assert "/example/override" not in str(exc_info.value)
+
+
+def test_local_provider_accepts_exact_forced_isolation_environment(tmp_path):
+    from sneeze.tpn.ocr_provider import load_local_provider_spec
+
+    spec_path = _write_provider_spec(tmp_path)
+    spec = json.loads(spec_path.read_text())
+    spec["env"]["PYTHONNOUSERSITE"] = "1"
+    _write_json(spec_path, spec)
+
+    loaded = load_local_provider_spec(spec_path)
+
+    assert loaded["env"]["PYTHONNOUSERSITE"] == "1"
+
+
+def test_local_provider_rejects_changed_forced_isolation_environment(
+    tmp_path,
+):
+    from sneeze.tpn.ocr_provider import (
+        ProviderError,
+        load_local_provider_spec,
+    )
+
+    spec_path = _write_provider_spec(tmp_path)
+    spec = json.loads(spec_path.read_text())
+    spec["env"]["PYTHONNOUSERSITE"] = "0"
+    _write_json(spec_path, spec)
+
+    with pytest.raises(
+        ProviderError,
+        match="local-only provider env requires PYTHONNOUSERSITE=1",
+    ):
+        load_local_provider_spec(spec_path)
 
 
 def test_validate_provider_run_dir_requires_absolute_empty_path(tmp_path):
@@ -351,12 +743,176 @@ def test_validate_provider_run_dir_requires_absolute_empty_path(tmp_path):
 
     created = validate_provider_run_dir(tmp_path / "new-run")
     assert created.is_dir()
+    assert created.stat().st_mode & 0o777 == 0o700
 
     (created / "evidence.txt").write_text("occupied")
     with pytest.raises(ProviderError, match="empty"):
         validate_provider_run_dir(created)
     with pytest.raises(ProviderError, match="absolute"):
         validate_provider_run_dir("relative-run")
+
+
+def test_validate_provider_run_dir_rejects_protected_corpus_before_write(
+    tmp_path,
+    monkeypatch,
+):
+    from sneeze.tpn.ocr_provider import (
+        ProviderError,
+        validate_provider_run_dir,
+    )
+
+    protected = tmp_path / "canonical" / "papers"
+    protected.mkdir(parents=True)
+    config_home = tmp_path / "config"
+    policy = config_home / "sneeze" / "tpn" / "ocr-protected-roots"
+    policy.parent.mkdir(parents=True)
+    policy.write_text(f"{protected}\n", encoding="utf-8")
+    policy.chmod(0o600)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    run_dir = protected / "provider-evidence"
+
+    with pytest.raises(ProviderError, match="protected corpora"):
+        validate_provider_run_dir(run_dir)
+
+    assert not run_dir.exists()
+
+
+def test_validate_provider_run_dir_rejects_final_symlink(tmp_path):
+    from sneeze.tpn.ocr_provider import (
+        ProviderError,
+        validate_provider_run_dir,
+    )
+
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    link = tmp_path / "run-link"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ProviderError, match="symlink"):
+        validate_provider_run_dir(link)
+
+
+def test_validate_provider_run_dir_rejects_unsafe_ancestry(tmp_path):
+    from sneeze.tpn.ocr_provider import (
+        ProviderError,
+        validate_provider_run_dir,
+    )
+
+    shared_parent = tmp_path / "shared-parent"
+    shared_parent.mkdir(mode=0o700)
+    shared_parent.chmod(0o777)
+
+    with pytest.raises(ProviderError, match="writable by other users"):
+        validate_provider_run_dir(shared_parent / "run")
+
+
+def test_provider_run_ancestor_rejects_arbitrary_owner(monkeypatch):
+    import sneeze.tpn.ocr_provider as ocr_provider
+
+    path_stat = os.stat_result((0o040700, 1, 1, 1, 12345, 12345, 0, 0, 0, 0))
+    monkeypatch.setattr(Path, "lstat", lambda self: path_stat)
+    monkeypatch.setattr(ocr_provider.os, "geteuid", lambda: 23456)
+
+    with pytest.raises(
+        ocr_provider.ProviderError,
+        match="owned by root or the current user",
+    ):
+        ocr_provider._validate_provider_run_ancestor(
+            Path("/synthetic-untrusted-owner")
+        )
+
+
+def test_provider_run_ancestor_allows_root_owned_sticky_directory(
+    monkeypatch,
+):
+    import sneeze.tpn.ocr_provider as ocr_provider
+
+    path_stat = os.stat_result((0o041777, 1, 1, 1, 0, 0, 0, 0, 0, 0))
+    monkeypatch.setattr(Path, "lstat", lambda self: path_stat)
+    monkeypatch.setattr(ocr_provider.os, "geteuid", lambda: 23456)
+
+    ocr_provider._validate_provider_run_ancestor(Path("/synthetic-tmp"))
+
+
+def test_validate_provider_run_dir_rejects_leaf_symlink_swap(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.ocr_provider as ocr_provider
+
+    target = tmp_path / "swap-target"
+    target.mkdir(mode=0o755)
+    target.chmod(0o755)
+    original_mkdir = os.mkdir
+    swapped = False
+
+    def replacing_mkdir(path, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is None:
+            result = original_mkdir(path, mode)
+        else:
+            result = original_mkdir(path, mode, dir_fd=dir_fd)
+        if path == "run" and dir_fd is not None:
+            os.rmdir(path, dir_fd=dir_fd)
+            os.symlink(str(target), path, dir_fd=dir_fd)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(ocr_provider.os, "mkdir", replacing_mkdir)
+
+    with pytest.raises(
+        ocr_provider.ProviderError,
+        match="could not create|symlink|safely open",
+    ):
+        ocr_provider.validate_provider_run_dir(tmp_path / "run")
+
+    assert swapped is True
+    assert target.stat().st_mode & 0o777 == 0o755
+
+
+@pytest.mark.parametrize("mode", (0o755, 0o600))
+def test_validate_provider_run_dir_rejects_non_private_or_unusable_mode(
+    tmp_path,
+    mode,
+):
+    from sneeze.tpn.ocr_provider import (
+        ProviderError,
+        validate_provider_run_dir,
+    )
+
+    run_dir = tmp_path / "existing-run"
+    run_dir.mkdir(mode=0o700)
+    run_dir.chmod(mode)
+
+    with pytest.raises(ProviderError, match="private usable permissions"):
+        validate_provider_run_dir(run_dir)
+
+
+def test_validate_provider_run_dir_rejects_wrong_owner(
+    tmp_path,
+    monkeypatch,
+):
+    import sneeze.tpn.ocr_provider as ocr_provider
+
+    run_dir = tmp_path / "existing-run"
+    run_dir.mkdir(mode=0o700)
+    owner = run_dir.stat().st_uid
+    monkeypatch.setattr(ocr_provider.os, "geteuid", lambda: owner + 1)
+
+    with pytest.raises(ocr_provider.ProviderError, match="current user"):
+        ocr_provider.validate_provider_run_dir(run_dir)
+
+
+def test_validate_provider_run_dir_creation_ignores_ambient_umask(tmp_path):
+    from sneeze.tpn.ocr_provider import validate_provider_run_dir
+
+    previous_umask = os.umask(0o777)
+    try:
+        created = validate_provider_run_dir(tmp_path / "new-run")
+    finally:
+        os.umask(previous_umask)
+
+    assert created.stat().st_mode & 0o777 == 0o700
 
 
 def test_local_provider_runs_one_process_for_batch_and_normalizes_metadata(
@@ -392,9 +948,7 @@ def test_local_provider_runs_one_process_for_batch_and_normalizes_metadata(
     result = first["results"][0]
     metadata = result["normalized_metadata"]
     assert result["output_text"].startswith("# page-01")
-    assert result["output_sha256"] == _sha256(
-        result["output_text"].encode()
-    )
+    assert result["output_sha256"] == _sha256(result["output_text"].encode())
     assert metadata["backend"] == "local_provider"
     assert metadata["prompt_mode"] == "provider:best"
     assert metadata["generated_token_count"] == 8
@@ -404,8 +958,9 @@ def test_local_provider_runs_one_process_for_batch_and_normalizes_metadata(
         "max_tokens": False,
     }
     assert metadata["model"]["revision"] == MODEL_REVISION
-    assert metadata["provider"]["provider_environment_sha256"] == (
-        first["hashes"]["provider_environment_sha256"]
+    assert (
+        metadata["provider"]["provider_environment_sha256"]
+        == (first["hashes"]["provider_environment_sha256"])
     )
     assert Path(first["paths"]["requests_jsonl"]).is_file()
     assert Path(first["paths"]["responses_jsonl"]).is_file()
@@ -413,7 +968,7 @@ def test_local_provider_runs_one_process_for_batch_and_normalizes_metadata(
     assert Path(first["paths"]["provider_spec_source"]).read_bytes() == (
         spec_path.read_bytes()
     )
-    assert first["provider_environment"] == {
+    expected_environment = {
         "FAKE_PROVIDER_MODE": "valid",
         "HF_HUB_DISABLE_TELEMETRY": "1",
         "HF_HUB_OFFLINE": "1",
@@ -423,6 +978,14 @@ def test_local_provider_runs_one_process_for_batch_and_normalizes_metadata(
         "TRANSFORMERS_OFFLINE": "1",
         "no_proxy": "127.0.0.1,localhost",
     }
+    expected_environment.update(
+        {
+            name: value
+            for name, value in os.environ.items()
+            if name in {"LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ"}
+        }
+    )
+    assert first["provider_environment"] == expected_environment
     assert first["hashes"]["provider_environment_sha256"]
 
     second = run_local_provider_batch(
@@ -503,13 +1066,13 @@ def test_response_mapping_handles_duplicate_missing_and_malformed_records(
 
     assert batch["ok"] is False
     assert {
-        index for index, result in enumerate(batch["results"])
+        index
+        for index, result in enumerate(batch["results"])
         if not result["valid"]
     } == invalid_indexes
     if protocol_fragment:
         assert any(
-            protocol_fragment in error
-            for error in batch["protocol_errors"]
+            protocol_fragment in error for error in batch["protocol_errors"]
         )
 
 

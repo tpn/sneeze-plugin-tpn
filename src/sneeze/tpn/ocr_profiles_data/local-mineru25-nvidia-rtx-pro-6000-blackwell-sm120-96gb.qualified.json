@@ -1,0 +1,210 @@
+{
+  "display_name": "NVIDIA RTX PRO 6000 Blackwell 96 GB local MinerU 2.5",
+  "hardware_selector": {
+    "compute_capability": [
+      12,
+      0
+    ],
+    "memory_model": "dedicated",
+    "pci_device_id": "0x2bb110de",
+    "product_name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "schema_version": 1,
+    "total_memory_bytes": 102641958912,
+    "vendor": "nvidia"
+  },
+  "kind": "ocr_execution_profile",
+  "memory_tiers": {
+    "25": {
+      "budget_bytes": 25660489728,
+      "budget_fraction": 0.25,
+      "reason": null,
+      "reserve_bytes": 2147483648,
+      "stages": {
+        "grounded_ocr": {
+          "confirmed_pages_per_second": 0.06735672161077187,
+          "observed_peak_memory_bytes": 22367502336,
+          "settings": {
+            "attention_backend": "auto",
+            "batch_size": 1,
+            "enable_chunked_prefill": true,
+            "engine_overhead_headroom_bytes": 4294967296,
+            "gpu_memory_utilization": 0.20815583,
+            "gpu_memory_utilization_denominator_bytes": 102641958912,
+            "max_num_batched_tokens": 8192,
+            "max_num_seqs": 1,
+            "max_tokens": 8192,
+            "memory_budget_bytes": 25660489728,
+            "memory_tier": "25",
+            "mm_encoder_attn_backend": "auto",
+            "moe_backend": "triton",
+            "ngram_size": 10,
+            "temperature": 0.0,
+            "window_size": 50
+          }
+        },
+        "markdown": {
+          "confirmed_pages_per_second": 0.05449509434070843,
+          "observed_peak_memory_bytes": 4563402752,
+          "settings": {
+            "backend": "official-two-step-transformers",
+            "batch_size": 2,
+            "image_analysis": false,
+            "memory_budget_bytes": 25660489728,
+            "memory_tier": "25"
+          }
+        }
+      },
+      "supported": true
+    },
+    "50": {
+      "budget_bytes": 51320979456,
+      "budget_fraction": 0.5,
+      "reason": null,
+      "reserve_bytes": 2147483648,
+      "stages": {
+        "grounded_ocr": {
+          "confirmed_pages_per_second": 0.07150004559796241,
+          "observed_peak_memory_bytes": 47493480448,
+          "settings": {
+            "attention_backend": "auto",
+            "batch_size": 3,
+            "enable_chunked_prefill": true,
+            "engine_overhead_headroom_bytes": 4294967296,
+            "gpu_memory_utilization": 0.45815583,
+            "gpu_memory_utilization_denominator_bytes": 102641958912,
+            "max_num_batched_tokens": 16384,
+            "max_num_seqs": 3,
+            "max_tokens": 8192,
+            "memory_budget_bytes": 51320979456,
+            "memory_tier": "50",
+            "mm_encoder_attn_backend": "auto",
+            "moe_backend": "triton",
+            "ngram_size": 10,
+            "temperature": 0.0,
+            "window_size": 50
+          }
+        },
+        "markdown": {
+          "confirmed_pages_per_second": 0.04874890216253608,
+          "observed_peak_memory_bytes": 6830424064,
+          "settings": {
+            "backend": "official-two-step-transformers",
+            "batch_size": 4,
+            "image_analysis": false,
+            "memory_budget_bytes": 51320979456,
+            "memory_tier": "50"
+          }
+        }
+      },
+      "supported": true
+    },
+    "max": {
+      "budget_bytes": 92377763020,
+      "budget_fraction": 0.9,
+      "reason": "tier_not_tuned",
+      "reserve_bytes": 2147483648,
+      "stages": {},
+      "supported": false
+    }
+  },
+  "pipeline_definition_sha256": "3f438a3f6c83ede025bb5e1f302750300a0a2236203271145af5712aead1fa47",
+  "pipeline_id": "local-mineru25",
+  "profile_id": "local-mineru25-nvidia-rtx-pro-6000-blackwell-sm120-96gb",
+  "profile_sha256": "368531b003418d2cb0749949e8e842a6db929d8bb7e71b62ddaac0e3d2af2c51",
+  "qualification": {
+    "evidence": [
+      {
+        "all_pass": true,
+        "experiment_sha256": "d7254c1a2a27cf35d47f06918f2ff3076106e9497b69228ed12dac1cc7cb1aea",
+        "manifest_sha256": "750775d33387ba5387b6ae96d558b9c82aaeb6c0ae67c76c5c74a31c2a3ca8dc",
+        "memory_tier": "25",
+        "provenance_complete": true,
+        "repeats": 5,
+        "suite_id": "cuphoton-three-page-smoke",
+        "summary_sha256": "1f95d971cd4c4bb3d0c5b17f070c397b464f297b58a42aabd7142638e398e3fe"
+      },
+      {
+        "all_pass": true,
+        "experiment_sha256": "bf06d24575210234f20e4b47642a91ccb151ef2281346250aa1946ecade724ee",
+        "manifest_sha256": "750775d33387ba5387b6ae96d558b9c82aaeb6c0ae67c76c5c74a31c2a3ca8dc",
+        "memory_tier": "50",
+        "provenance_complete": true,
+        "repeats": 5,
+        "suite_id": "cuphoton-three-page-smoke",
+        "summary_sha256": "9f98b80fb38df4e1d4f67a4173f08452639740a569ff6de1661ee5a40ddbc63d"
+      }
+    ],
+    "policy_sha256": "ab65f1f22b4a75005c81f511fdfeee213ff1f0c1c1c1810329cf6ff3fd266d87",
+    "required_suites": [
+      "cuphoton-three-page-smoke"
+    ],
+    "state": "qualified"
+  },
+  "schema_version": 1,
+  "stages": {
+    "grounded_ocr": {
+      "backend_id": "deepseek-vllm",
+      "batch_semantics": "page_batch",
+      "capability": "grounded_ocr",
+      "model": {
+        "requested": "deepseek-ai/DeepSeek-OCR",
+        "revision": "9f30c71f441d010e5429c532364a86705536c53a",
+        "snapshot_files_sha256": "d3441a0d86320dbaaf7d3fce072e0f7be2f698975de42974fe987a320f3ef9d2"
+      },
+      "runtime_selector": {
+        "attention_backend": "FLASH_ATTN",
+        "dtype": "bfloat16",
+        "engine": "vllm",
+        "engine_version": "0.21.1rc1.dev438+g4ff865c38",
+        "implementation_sha256": "57a50cdd0812a0ad1f406d11200850ed69e05a4df1d22f5b2f6164904cd34aac",
+        "installed_distributions_count": 196,
+        "installed_distributions_sha256": "c8cee951b2ae2795c211d39ef625984ed8a8b13170c7cf51bd8be4a333ac3c10",
+        "packages": {
+          "huggingface-hub": "1.17.0",
+          "pdf2image": "1.17.0",
+          "pillow": "12.2.0",
+          "torch": "2.11.0+cu130",
+          "torchaudio": "2.11.0+cu130",
+          "torchvision": "0.26.0+cu130",
+          "tqdm": "4.67.3",
+          "transformers": "5.9.0",
+          "vllm": "0.21.1rc1.dev438+g4ff865c38"
+        },
+        "python": "3.12.13",
+        "torch": "2.11.0+cu130",
+        "torch_cuda": "13.0"
+      }
+    },
+    "markdown": {
+      "backend_id": "mineru25-pro-2605",
+      "batch_semantics": "layout_block_batch",
+      "capability": "markdown",
+      "model": {
+        "requested": "opendatalab/MinerU2.5-Pro-2605-1.2B",
+        "revision": "bff20d4ae2bf202df9f45284b4d43681555a97ed",
+        "snapshot_files_sha256": "d817d96ca8d0fda357b67054840c86664e5c26bbbfa9eedc05387978d3a157ef"
+      },
+      "runtime_selector": {
+        "attention_backend": "sdpa",
+        "dtype": "bfloat16",
+        "engine": "transformers",
+        "engine_version": "4.57.6",
+        "implementation_sha256": "688020ba33a8f381ea63fc8f9a9c7bac2bc81dd2c093b8836c6b2464850e887e",
+        "installed_distributions_count": 63,
+        "installed_distributions_sha256": "4ad3bace0cd29e63647f492b7e2003feddf4bae578e06a36a9c9c67cda72b7db",
+        "packages": {
+          "accelerate": "1.14.0",
+          "huggingface-hub": "0.36.2",
+          "mineru-vl-utils": "1.0.5",
+          "pillow": "12.2.0",
+          "torch": "2.11.0+cu130",
+          "torchvision": "0.26.0+cu130",
+          "transformers": "4.57.6"
+        },
+        "python": "3.12.13",
+        "torch": "2.11.0+cu130",
+        "torch_cuda": "13.0"
+      }
+    }
+  }
+}

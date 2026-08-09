@@ -3,7 +3,10 @@ import json
 import os
 import subprocess
 import sys
+import time
+from dataclasses import replace
 from io import StringIO
+from pathlib import Path
 
 import pytest
 
@@ -55,7 +58,7 @@ def test_registry_has_only_pinned_initial_backends():
     assert mineru.model_revision == MINERU_MODEL_REVISION
     assert mineru.capability_status("markdown") == "qualified"
     assert mineru.qualified_adapter_sha256 == (
-        "2ed21528fe34a01d5e897e1e50fe8162a71b14947dc1b6bf62f8120314db20d2"
+        "0e64a995532b598315a82b711cf739af46ae64131dd9654e4730af3ba6ef2696"
     )
     assert mineru.snapshot_identity_sha256
     assert mineru.weights_sha256
@@ -69,9 +72,88 @@ def test_registry_has_only_pinned_initial_backends():
         "batch_size": 1,
         "image_analysis": False,
     }
-    assert get_backend("deepseek-vllm").capability_status("markdown") == (
-        "guarded"
+    deepseek = get_backend("deepseek-vllm")
+    assert deepseek.capability_status("markdown") == "guarded"
+    assert deepseek.snapshot_identity_sha256
+    assert "modeling_deepseekocr.py" in deepseek.snapshot_required_files
+    assert "README.md" in deepseek.snapshot_ignored_files
+    assert not set(deepseek.snapshot_required_files) & set(
+        deepseek.snapshot_ignored_files
     )
+
+
+def test_backend_implementation_attests_profile_validation_logic():
+    from sneeze.tpn.ocr_backends import list_backends
+
+    critical_components = {
+        "ocr_backend_setup.py",
+        "ocr_implementation.py",
+        "ocr_profiles.py",
+    }
+    for backend in list_backends():
+        components = set(backend.implementation_relative_paths)
+        assert critical_components <= components
+        # The reviewed profile hashes cannot be part of the implementation
+        # digest because every profile binds that digest itself.
+        assert "ocr_profile_trust.py" not in components
+
+
+def test_reviewed_backend_implementation_constants_match_current_source():
+    from sneeze.tpn.ocr_backends import list_backends
+    from sneeze.tpn.ocr_implementation import backend_implementation_record
+    from sneeze.tpn.providers import mineru25
+
+    for backend in list_backends():
+        assert (
+            backend_implementation_record(backend.backend_id)["sha256"]
+            == backend.qualified_implementation_sha256
+        )
+    mineru = next(
+        item
+        for item in list_backends()
+        if item.backend_id == "mineru25-pro-2605"
+    )
+    assert mineru25.sha256_path(Path(mineru25.__file__)) == (
+        mineru.qualified_adapter_sha256
+    )
+
+
+def test_backend_implementation_binds_definition_without_self_seal(
+    monkeypatch,
+):
+    from sneeze.tpn import ocr_backends
+    from sneeze.tpn.ocr_implementation import backend_implementation_record
+
+    backend = ocr_backends.get_backend("deepseek-vllm")
+    baseline = backend_implementation_record(backend.backend_id)
+    assert baseline["schema_version"] == 2
+    assert "qualified_implementation_sha256" not in baseline["definition"]
+    assert baseline["definition"]["default_attention_backend"] == (
+        backend.default_attention_backend
+    )
+
+    changed_definition = replace(
+        backend,
+        default_attention_backend="FLASH_ATTN",
+    )
+    monkeypatch.setattr(
+        ocr_backends,
+        "get_backend",
+        lambda _backend_id: changed_definition,
+    )
+    changed = backend_implementation_record(backend.backend_id)
+    assert changed["sha256"] != baseline["sha256"]
+
+    changed_only_self_seal = replace(
+        backend,
+        qualified_implementation_sha256="0" * 64,
+    )
+    monkeypatch.setattr(
+        ocr_backends,
+        "get_backend",
+        lambda _backend_id: changed_only_self_seal,
+    )
+    assert backend_implementation_record(backend.backend_id) == baseline
 
 
 def test_registry_rejects_unknown_backend():
@@ -165,7 +247,10 @@ def test_mineru_environment_rejects_unqualified_torch_backend():
 
 
 def test_deepseek_environment_plan_pins_qualified_runtime():
-    from sneeze.tpn.ocr_backend_setup import build_environment_commands
+    from sneeze.tpn.ocr_backend_setup import (
+        VLLM_BUILD_COMMIT,
+        build_environment_commands,
+    )
     from sneeze.tpn.ocr_backends import get_backend
 
     commands = build_environment_commands(
@@ -179,13 +264,16 @@ def test_deepseek_environment_plan_pins_qualified_runtime():
     for requirement in (
         "python=3.12.13",
         "poppler=26.05.0",
-        "torch==2.11.0",
-        "torchvision==0.26.0",
+        "torch==2.11.0+cu130",
+        "torchvision==0.26.0+cu130",
         "torchaudio==2.11.0+cu130",
         "transformers==5.9.0",
         "vllm==0.21.1rc1.dev438+g4ff865c38",
     ):
         assert requirement in flattened
+    wheel_index = f"https://wheels.vllm.ai/{VLLM_BUILD_COMMIT}/cu130/"
+    assert wheel_index in flattened
+    assert not any("wheels.vllm.ai/nightly" in part for part in flattened)
 
     with pytest.raises(
         ValueError,
@@ -326,6 +414,56 @@ def test_generated_mineru_spec_passes_production_loader(tmp_path):
     assert spec["env"]["TRANSFORMERS_OFFLINE"] == "1"
 
 
+@pytest.mark.parametrize(
+    "timeout",
+    (
+        pytest.param(True, id="boolean"),
+        pytest.param("30", id="string"),
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ),
+)
+def test_generated_mineru_spec_rejects_invalid_timeout(tmp_path, timeout):
+    from sneeze.tpn.ocr_backend_setup import (
+        BackendSetupError,
+        build_provider_spec,
+    )
+    from sneeze.tpn.ocr_backends import get_backend
+
+    backend = get_backend("mineru25")
+    cache, _ = _make_cache(tmp_path, backend)
+
+    with pytest.raises(BackendSetupError, match="finite positive"):
+        build_provider_spec(
+            backend,
+            python_executable=sys.executable,
+            cache_dir=cache.resolve(),
+            timeout_seconds=timeout,
+        )
+
+
+def test_generated_mineru_spec_preserves_positive_fractional_timeout(
+    tmp_path,
+):
+    from sneeze.tpn.ocr_backend_setup import build_provider_spec
+    from sneeze.tpn.ocr_backends import get_backend
+
+    backend = get_backend("mineru25")
+    cache, _ = _make_cache(tmp_path, backend)
+
+    spec = build_provider_spec(
+        backend,
+        python_executable=sys.executable,
+        cache_dir=cache.resolve(),
+        timeout_seconds=0.5,
+    )
+
+    assert spec["timeout_seconds"] == 0.5
+
+
 def test_write_provider_spec_is_atomic_hashed_and_no_overwrite(tmp_path):
     from sneeze.tpn.ocr_backend_setup import (
         file_sha256,
@@ -424,6 +562,7 @@ def test_doctor_passes_without_importing_runtime_and_scrubs_secrets(
     assert "must-not-appear" not in rendered
     assert "UNIT_TEST_SECRET_TOKEN" not in rendered
     assert len(captured["calls"]) == 1
+    assert captured["calls"][0][1:4] == ["-I", "-B", "-c"]
     assert receipt["model_probe"]["requested"] is False
     _assert_receipt_hash(receipt)
 
@@ -519,10 +658,57 @@ def test_doctor_load_model_runs_exact_gpu_initialization_probe(
     model_call = next(
         call for call in calls if ocr_backend_setup._MODEL_PROBE_CODE in call
     )
+    assert all(call[1:4] == ["-I", "-B", "-c"] for call in calls)
     assert str(snapshot) in model_call
     assert "cuda:0" in model_call
     assert "sdpa" in model_call
     _assert_receipt_hash(receipt)
+
+
+def test_bounded_doctor_probe_timeout_kills_descendant(tmp_path):
+    from sneeze.tpn.ocr_backend_setup import _run_bounded_probe
+
+    child_pid_path = tmp_path / "doctor-child.pid"
+    child_code = "import time; time.sleep(60)"
+    parent_code = "\n".join(
+        (
+            "import pathlib",
+            "import subprocess",
+            "import sys",
+            "import time",
+            "child = subprocess.Popen([sys.executable, '-c', sys.argv[2]])",
+            "pathlib.Path(sys.argv[1]).write_text(str(child.pid))",
+            "time.sleep(60)",
+        )
+    )
+
+    result = _run_bounded_probe(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            parent_code,
+            str(child_pid_path),
+            child_code,
+        ],
+        cwd=None,
+        environment={"PATH": os.defpath},
+        timeout_seconds=1.0,
+    )
+
+    assert result["error_type"] == "TimeoutExpired"
+    assert result["returncode"] is None
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        if time.monotonic() >= deadline:
+            pytest.fail("doctor probe descendant survived process-group kill")
+        time.sleep(0.05)
 
 
 def test_doctor_fails_when_qualified_adapter_hash_drifts(

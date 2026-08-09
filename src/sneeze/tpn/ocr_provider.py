@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -14,6 +15,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .ocr_path_security import (
+    TrustedPathError,
+    reject_protected_corpus_overlap,
+)
+from .ocr_process_lifecycle import isolated_subprocess_signal_guard
+
 SCHEMA_VERSION = 1
 _PROTOCOL_ARGUMENTS = (
     "--requests-jsonl",
@@ -24,28 +31,32 @@ _SECRET_ENV_RE = re.compile(
     r"(?:AUTH|COOKIE|CREDENTIAL|KEY|PASS(?:WORD)?|SECRET|TOKEN)",
     re.IGNORECASE,
 )
+_SENSITIVE_LOCAL_ENV_RE = re.compile(
+    r"^(?:DATABASE_URL|SENTRY_DSN|HOME|USERPROFILE|"
+    r"AWS_(?:CONFIG_FILE|DEFAULT_PROFILE|PROFILE|"
+    r"SHARED_CREDENTIALS_FILE)|AZURE_CONFIG_DIR|CLOUDSDK_CONFIG|"
+    r"GCP_PROFILE|GOOGLE_APPLICATION_CREDENTIALS|GOOGLE_PROFILE)$",
+    re.IGNORECASE,
+)
+_LOCAL_DSN_RE = re.compile(
+    r"^(?:amqps?|cassandra|clickhouse|cockroachdb|mariadb|mongodb"
+    r"(?:\+srv)?|mssql|mysql|oracle|postgres(?:ql)?|rediss?|snowflake)://",
+    re.IGNORECASE,
+)
+_LOCAL_CREDENTIAL_URL_RE = re.compile(
+    r"^[a-z][a-z0-9+.-]*://[^/@\s]+@",
+    re.IGNORECASE,
+)
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REVISION_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_INFERENCE_ENV_RE = re.compile(
-    r"^(?:(?:ACCELERATE|BITSANDBYTES|CUDA|CUBLAS|CUDNN|FLASH|HF|HIP|"
-    r"HSA|KMP|MKL|NCCL|NUMBA|NVIDIA|OMP|PADDLE|PYTORCH|RAY|ROCR|"
-    r"SAFETENSORS|TOKENIZERS|TORCH|TRANSFORMERS|TRITON|VLLM|"
-    r"XFORMERS)(?:_|$)|LD_LIBRARY_PATH$|PATH$|PYTHONHASHSEED$)",
-    re.IGNORECASE,
-)
-_BASE_ENV_DROP = frozenset(
+_LOCAL_AMBIENT_ENV_ALLOWLIST = frozenset(
     {
-        "ALL_PROXY",
-        "CONDA_PREFIX",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "PYTHONHOME",
-        "PYTHONPATH",
-        "VIRTUAL_ENV",
-        "all_proxy",
-        "http_proxy",
-        "https_proxy",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
     }
 )
 _FORCED_LOCAL_ENV = {
@@ -54,10 +65,133 @@ _FORCED_LOCAL_ENV = {
     "PYTHONNOUSERSITE": "1",
     "TRANSFORMERS_OFFLINE": "1",
 }
+_EXECUTION_ENV_OVERRIDE_DENYLIST = frozenset(
+    {
+        "BASH_ENV",
+        "ENV",
+        "GCONV_PATH",
+        "GLIBC_TUNABLES",
+        "PATH",
+    }
+)
+_EXECUTION_ENV_OVERRIDE_DENY_PREFIXES = ("DYLD_", "LD_", "PYTHON")
+_LOCAL_SPEC_KEYS = frozenset(
+    {
+        "schema_version",
+        "provider_id",
+        "argv",
+        "cwd",
+        "egress",
+        "model",
+        "lanes",
+        "timeout_seconds",
+        "secret_env_names",
+        "env",
+    }
+)
 
 
 class ProviderError(ValueError):
     """Raised when a local OCR provider request is unsafe or malformed."""
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ProviderError("duplicate JSON field")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON number is not allowed: {value}")
+
+
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number is not allowed: {value}")
+    return parsed
+
+
+def _reject_credential_like_value(value: Any, label: str) -> None:
+    from .ocr_backend_setup import BackendSetupError, make_receipt
+
+    try:
+        make_receipt(
+            "local_ocr_provider_value_validation",
+            {"value": value},
+        )
+    except BackendSetupError as exc:
+        raise ProviderError(
+            f"{label} contains a credential-like name or value"
+        ) from exc
+
+
+def _reject_credential_like_environment(
+    environment: Mapping[str, str],
+) -> None:
+    """Reject values that would make persisted provider evidence unsafe."""
+
+    from .ocr_backend_setup import BackendSetupError, make_receipt
+
+    try:
+        # Reuse the shared receipt detector before any provider spec or
+        # environment can be copied into the public evidence bundle.
+        make_receipt(
+            "local_ocr_provider_environment_validation",
+            {"environment": dict(environment)},
+        )
+    except BackendSetupError as exc:
+        raise ProviderError(
+            "provider env contains a credential-like name or value"
+        ) from exc
+    if any(
+        _SENSITIVE_LOCAL_ENV_RE.fullmatch(name)
+        or _LOCAL_DSN_RE.match(value.strip())
+        or _LOCAL_CREDENTIAL_URL_RE.match(value.strip())
+        for name, value in environment.items()
+    ):
+        raise ProviderError(
+            "provider env contains a credential-like name or value"
+        )
+
+
+def _validate_environment_overrides(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ProviderError("provider env must be an object")
+    for key, item in value.items():
+        if not isinstance(key, str) or not _ENV_NAME_RE.fullmatch(key):
+            raise ProviderError(f"invalid provider environment name: {key!r}")
+        if not isinstance(item, str) or "\x00" in item:
+            raise ProviderError(
+                f"provider environment value for {key} must be a string"
+            )
+        if _SECRET_ENV_RE.search(key):
+            raise ProviderError(
+                "provider env cannot contain secret-looking names"
+            )
+        if key in _FORCED_LOCAL_ENV:
+            if item != _FORCED_LOCAL_ENV[key]:
+                raise ProviderError(
+                    "local-only provider env requires "
+                    f"{key}={_FORCED_LOCAL_ENV[key]}"
+                )
+            continue
+        if key in _EXECUTION_ENV_OVERRIDE_DENYLIST or key.startswith(
+            _EXECUTION_ENV_OVERRIDE_DENY_PREFIXES
+        ):
+            raise ProviderError(
+                f"provider env cannot override execution variable {key}"
+            )
+    _reject_credential_like_environment(value)
+    for key, item in _FORCED_LOCAL_ENV.items():
+        if key in value and value[key] != item:
+            raise ProviderError(
+                f"local-only provider env requires {key}={item}"
+            )
+    return value
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -66,6 +200,7 @@ def _json_bytes(value: Any) -> bytes:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
 
 
@@ -94,6 +229,7 @@ def _write_json(path: Path, value: Any) -> None:
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
+            allow_nan=False,
         )
         handle.write("\n")
 
@@ -108,10 +244,16 @@ def _write_jsonl(path: Path, values: Sequence[Mapping[str, Any]]) -> None:
 
 def _decode_json_object(payload: bytes, path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(payload)
+        value = json.loads(
+            payload,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+            parse_float=_parse_finite_json_float,
+        )
     except ValueError as exc:
-        raise ProviderError(f"Could not read provider spec {path}: {exc}") \
-            from exc
+        raise ProviderError(
+            f"Could not read provider spec {path}: {exc}"
+        ) from exc
     if not isinstance(value, dict):
         raise ProviderError("Provider spec must contain one JSON object")
     return value
@@ -121,8 +263,9 @@ def _read_json(path: Path) -> dict[str, Any]:
     try:
         payload = path.read_bytes()
     except OSError as exc:
-        raise ProviderError(f"Could not read provider spec {path}: {exc}") \
-            from exc
+        raise ProviderError(
+            f"Could not read provider spec {path}: {exc}"
+        ) from exc
     return _decode_json_object(payload, path)
 
 
@@ -134,10 +277,35 @@ def _require_string(value: Any, label: str) -> str:
     return value
 
 
+def _require_finite_duration(
+    value: Any,
+    label: str,
+    *,
+    allow_zero: bool = False,
+) -> float:
+    qualifier = "nonnegative" if allow_zero else "positive"
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ProviderError(f"{label} must be a finite {qualifier} number")
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ProviderError(
+            f"{label} must be a finite {qualifier} number"
+        ) from exc
+    if not math.isfinite(normalized) or (
+        normalized < 0 if allow_zero else normalized <= 0
+    ):
+        raise ProviderError(f"{label} must be a finite {qualifier} number")
+    return normalized
+
+
 def _validate_local_spec(spec: dict[str, Any]) -> None:
     if spec.get("schema_version") != SCHEMA_VERSION:
         raise ProviderError("Provider spec has an unsupported schema_version")
-    _require_string(spec.get("provider_id"), "provider_id")
+    if not set(spec) <= _LOCAL_SPEC_KEYS:
+        raise ProviderError("provider spec has unexpected fields")
+    provider_id = _require_string(spec.get("provider_id"), "provider_id")
+    _reject_credential_like_value(provider_id, "provider_id")
 
     argv = spec.get("argv")
     if (
@@ -148,6 +316,8 @@ def _validate_local_spec(spec: dict[str, Any]) -> None:
         raise ProviderError("provider argv must be a nonempty string list")
     if any("\x00" in argument for argument in argv):
         raise ProviderError("provider argv cannot contain a NUL byte")
+    for index, argument in enumerate(argv):
+        _reject_credential_like_value(argument, f"provider argv[{index}]")
     executable = Path(argv[0]).expanduser()
     if not executable.is_absolute():
         raise ProviderError("provider argv[0] must be an absolute path")
@@ -189,8 +359,13 @@ def _validate_local_spec(spec: dict[str, Any]) -> None:
     model = spec.get("model")
     if not isinstance(model, dict):
         raise ProviderError("provider model must be an object")
+    if set(model) != {"requested", "revision"}:
+        raise ProviderError(
+            "provider model must contain exactly requested and revision"
+        )
     _require_string(model.get("requested"), "model.requested")
     revision = _require_string(model.get("revision"), "model.revision")
+    _reject_credential_like_value(model, "provider model")
     if not _REVISION_RE.fullmatch(revision):
         raise ProviderError(
             "model.revision must be an immutable 40- or 64-character "
@@ -204,23 +379,30 @@ def _validate_local_spec(spec: dict[str, Any]) -> None:
         _require_string(lane, "lane name")
         if not isinstance(lane_spec, dict):
             raise ProviderError(f"provider lane {lane} must be an object")
-        _require_string(lane_spec.get("prompt"), f"lanes.{lane}.prompt")
+        if not set(lane_spec) <= {
+            "prompt",
+            "settings",
+            "include_raw_text",
+        }:
+            raise ProviderError(f"provider lane {lane} has unexpected fields")
+        prompt = _require_string(
+            lane_spec.get("prompt"), f"lanes.{lane}.prompt"
+        )
         settings = lane_spec.get("settings", {})
         if not isinstance(settings, dict):
             raise ProviderError(f"lanes.{lane}.settings must be an object")
+        _reject_credential_like_value(prompt, f"lanes.{lane}.prompt")
+        _reject_credential_like_value(settings, f"lanes.{lane}.settings")
         include_raw = lane_spec.get("include_raw_text", False)
         if not isinstance(include_raw, bool):
             raise ProviderError(
                 f"lanes.{lane}.include_raw_text must be boolean"
             )
 
-    timeout = spec.get("timeout_seconds", 1800)
-    if (
-        not isinstance(timeout, (int, float))
-        or isinstance(timeout, bool)
-        or timeout <= 0
-    ):
-        raise ProviderError("timeout_seconds must be a positive number")
+    _require_finite_duration(
+        spec.get("timeout_seconds", 1800),
+        "timeout_seconds",
+    )
 
     secret_names = spec.get("secret_env_names", [])
     if not isinstance(secret_names, list) or not all(
@@ -233,25 +415,7 @@ def _validate_local_spec(spec: dict[str, Any]) -> None:
             "environment variables"
         )
 
-    overrides = spec.get("env", {})
-    if not isinstance(overrides, dict):
-        raise ProviderError("provider env must be an object")
-    for key, value in overrides.items():
-        if not isinstance(key, str) or not _ENV_NAME_RE.fullmatch(key):
-            raise ProviderError(f"invalid provider environment name: {key!r}")
-        if not isinstance(value, str) or "\x00" in value:
-            raise ProviderError(
-                f"provider environment value for {key} must be a string"
-            )
-        if _SECRET_ENV_RE.search(key):
-            raise ProviderError(
-                "provider env cannot contain secret-looking names"
-            )
-    for key, value in _FORCED_LOCAL_ENV.items():
-        if key in overrides and overrides[key] != value:
-            raise ProviderError(
-                f"local-only provider env requires {key}={value}"
-            )
+    _validate_environment_overrides(spec.get("env", {}))
 
 
 def _normalize_local_spec_paths(spec: dict[str, Any]) -> None:
@@ -281,6 +445,72 @@ def load_local_provider_spec(
     return spec
 
 
+def _validate_provider_run_ancestor(path: Path) -> None:
+    """Reject ancestry that another unprivileged user could replace."""
+
+    try:
+        path_stat = path.lstat()
+    except OSError as exc:
+        raise ProviderError(
+            f"could not inspect provider run directory ancestry: {path}"
+        ) from exc
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise ProviderError(
+            "provider run directory ancestry cannot contain symlinks"
+        )
+    if not stat.S_ISDIR(path_stat.st_mode):
+        raise ProviderError(
+            "provider run directory ancestry must contain only directories"
+        )
+    if path_stat.st_uid not in {0, os.geteuid()}:
+        raise ProviderError(
+            "provider run directory ancestry must be owned by root or "
+            "the current user"
+        )
+    writable_by_others = stat.S_IMODE(path_stat.st_mode) & 0o022
+    if writable_by_others:
+        sticky = bool(path_stat.st_mode & stat.S_ISVTX)
+        if not sticky:
+            raise ProviderError(
+                "provider run directory ancestry is writable by other users"
+            )
+
+
+def _prepare_provider_run_parent(parent: Path) -> None:
+    """Create missing ancestors privately and validate the complete chain."""
+
+    current = Path(parent.anchor)
+    components = parent.parts[1:]
+    for component in components:
+        _validate_provider_run_ancestor(current)
+        current /= component
+        try:
+            current.lstat()
+        except FileNotFoundError:
+            try:
+                current.mkdir(mode=0o700)
+            except FileExistsError:
+                # A racing creator is validated below; symlinks and unsafe
+                # directories are not accepted.
+                pass
+            except OSError as exc:
+                raise ProviderError(
+                    "could not create provider run directory ancestry"
+                ) from exc
+            else:
+                try:
+                    current.chmod(0o700, follow_symlinks=False)
+                except OSError as exc:
+                    raise ProviderError(
+                        "could not secure provider run directory ancestry"
+                    ) from exc
+        except OSError as exc:
+            raise ProviderError(
+                "could not inspect provider run directory ancestry"
+            ) from exc
+    _validate_provider_run_ancestor(current)
+
+
 def validate_provider_run_dir(
     run_dir: str | os.PathLike[str],
 ) -> Path:
@@ -289,14 +519,140 @@ def validate_provider_run_dir(
     candidate = Path(run_dir).expanduser()
     if not candidate.is_absolute():
         raise ProviderError("provider run directory must be absolute")
-    if candidate.exists():
-        if not candidate.is_dir():
+    candidate = Path(os.path.abspath(candidate))
+    try:
+        reject_protected_corpus_overlap(
+            candidate,
+            label="provider run directory",
+        )
+    except TrustedPathError as exc:
+        raise ProviderError(str(exc)) from exc
+    _prepare_provider_run_parent(candidate.parent)
+
+    open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        parent_fd = os.open(candidate.parent, open_flags)
+    except OSError as exc:
+        raise ProviderError(
+            "could not safely open provider run directory parent"
+        ) from exc
+    try:
+        # Revalidate the pathname after opening it and bind all leaf creation
+        # and inspection to the verified parent descriptor.
+        _validate_provider_run_ancestor(candidate.parent)
+        parent_path_stat = candidate.parent.lstat()
+        parent_fd_stat = os.fstat(parent_fd)
+        if (
+            parent_path_stat.st_dev != parent_fd_stat.st_dev
+            or parent_path_stat.st_ino != parent_fd_stat.st_ino
+        ):
+            raise ProviderError(
+                "provider run directory ancestry changed during setup"
+            )
+
+        created = False
+        try:
+            initial_stat = os.stat(
+                candidate.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            try:
+                os.mkdir(candidate.name, mode=0o700, dir_fd=parent_fd)
+                created = True
+                os.chmod(
+                    candidate.name,
+                    0o700,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                # Validate the object that won the creation race below.
+                pass
+            except (OSError, ValueError) as exc:
+                raise ProviderError(
+                    "could not create provider run directory"
+                ) from exc
+            try:
+                initial_stat = os.stat(
+                    candidate.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise ProviderError(
+                    "could not inspect provider run directory"
+                ) from exc
+        except OSError as exc:
+            raise ProviderError(
+                "could not inspect provider run directory"
+            ) from exc
+
+        if stat.S_ISLNK(initial_stat.st_mode):
+            raise ProviderError("provider run directory cannot be a symlink")
+        if not stat.S_ISDIR(initial_stat.st_mode):
             raise ProviderError("provider run path is not a directory")
-        if any(candidate.iterdir()):
-            raise ProviderError("provider run directory must be empty")
-    else:
-        candidate.mkdir(parents=True)
-    return candidate.resolve(strict=True)
+
+        try:
+            directory_fd = os.open(
+                candidate.name,
+                open_flags,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise ProviderError(
+                "could not safely open provider run directory"
+            ) from exc
+        try:
+            directory_stat = os.fstat(directory_fd)
+            if (
+                directory_stat.st_dev != initial_stat.st_dev
+                or directory_stat.st_ino != initial_stat.st_ino
+            ):
+                raise ProviderError(
+                    "provider run directory changed during setup"
+                )
+            if directory_stat.st_uid != os.geteuid():
+                raise ProviderError(
+                    "provider run directory must be owned by the current user"
+                )
+            if created:
+                try:
+                    os.fchmod(directory_fd, 0o700)
+                except OSError as exc:
+                    raise ProviderError(
+                        "could not secure provider run directory"
+                    ) from exc
+                directory_stat = os.fstat(directory_fd)
+            if stat.S_IMODE(directory_stat.st_mode) != 0o700:
+                raise ProviderError(
+                    "provider run directory must have private usable "
+                    "permissions (0700)"
+                )
+            if os.listdir(directory_fd):
+                raise ProviderError("provider run directory must be empty")
+            final_parent_stat = candidate.parent.lstat()
+            final_stat = candidate.lstat()
+            if (
+                final_parent_stat.st_dev != parent_fd_stat.st_dev
+                or final_parent_stat.st_ino != parent_fd_stat.st_ino
+                or stat.S_ISLNK(final_stat.st_mode)
+                or final_stat.st_dev != directory_stat.st_dev
+                or final_stat.st_ino != directory_stat.st_ino
+            ):
+                raise ProviderError(
+                    "provider run directory changed during setup"
+                )
+        except OSError as exc:
+            raise ProviderError(
+                "could not validate provider run directory"
+            ) from exc
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.close(parent_fd)
+    return candidate
 
 
 def build_local_provider_environment(
@@ -304,16 +660,14 @@ def build_local_provider_environment(
     *,
     base_environment: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    """Build an isolated environment with ambient secrets removed."""
+    """Build a minimal environment from safe ambient and spec values."""
 
     source = os.environ if base_environment is None else base_environment
-    overrides = spec.get("env", {})
+    overrides = _validate_environment_overrides(spec.get("env", {}))
     environment = {
         key: value
         for key, value in source.items()
-        if key not in _BASE_ENV_DROP
-        and not _SECRET_ENV_RE.search(key)
-        and not _INFERENCE_ENV_RE.search(key)
+        if key in _LOCAL_AMBIENT_ENV_ALLOWLIST
         and "\x00" not in key
         and "\x00" not in value
     }
@@ -322,6 +676,7 @@ def build_local_provider_environment(
     environment.update(_FORCED_LOCAL_ENV)
     environment["NO_PROXY"] = "127.0.0.1,localhost"
     environment["no_proxy"] = "127.0.0.1,localhost"
+    _reject_credential_like_environment(environment)
     return environment
 
 
@@ -329,19 +684,9 @@ def _recorded_provider_environment(
     environment: Mapping[str, str],
     spec: Mapping[str, Any],
 ) -> dict[str, str]:
-    override_names = set(spec.get("env", {}))
-    recorded = {
-        key: value
-        for key, value in environment.items()
-        if (
-            _INFERENCE_ENV_RE.search(key)
-            or key in override_names
-            or key in _FORCED_LOCAL_ENV
-            or key in {"NO_PROXY", "no_proxy", "PYTHONNOUSERSITE"}
-        )
-        and not _SECRET_ENV_RE.search(key)
-    }
-    return dict(sorted(recorded.items()))
+    del spec
+    _reject_credential_like_environment(environment)
+    return dict(sorted(environment.items()))
 
 
 def _png_dimensions(path: Path) -> dict[str, int] | None:
@@ -515,18 +860,21 @@ def _safe_artifact_path(root: Path, value: Any) -> Path | None:
 
 def _is_nonnegative_integer(value: Any) -> bool:
     return (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and value >= 0
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
     )
 
 
 def _is_nonnegative_number(value: Any) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and value >= 0
-    )
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or value < 0
+    ):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def validate_provider_response(
@@ -631,12 +979,13 @@ def validate_provider_response(
             gaps.append(path)
 
     packages = _nested_value(response, "runtime.packages")
-    if not isinstance(packages, Mapping) or not packages or not all(
-        isinstance(key, str)
-        and key
-        and isinstance(value, str)
-        and value
-        for key, value in packages.items()
+    if (
+        not isinstance(packages, Mapping)
+        or not packages
+        or not all(
+            isinstance(key, str) and key and isinstance(value, str) and value
+            for key, value in packages.items()
+        )
     ):
         gaps.append("runtime.packages")
     attention_backend = _nested_value(response, "runtime.attention_backend")
@@ -656,8 +1005,7 @@ def validate_provider_response(
     if not (
         (isinstance(stop_reason, str) and bool(stop_reason))
         or (
-            isinstance(stop_reason, int)
-            and not isinstance(stop_reason, bool)
+            isinstance(stop_reason, int) and not isinstance(stop_reason, bool)
         )
     ):
         gaps.append("generation.stop_reason")
@@ -723,7 +1071,12 @@ def _read_response_jsonl(
                 if not line.strip():
                     continue
                 try:
-                    value = json.loads(line)
+                    value = json.loads(
+                        line,
+                        object_pairs_hook=_unique_json_object,
+                        parse_constant=_reject_json_constant,
+                        parse_float=_parse_finite_json_float,
+                    )
                 except ValueError as exc:
                     errors.append(
                         "malformed response JSON at line "
@@ -812,6 +1165,39 @@ def _run_provider_process(
     timeout_seconds: float,
     terminate_grace_seconds: float,
 ) -> dict[str, Any]:
+    timeout_seconds = _require_finite_duration(
+        timeout_seconds,
+        "timeout_seconds",
+    )
+    terminate_grace_seconds = _require_finite_duration(
+        terminate_grace_seconds,
+        "terminate_grace_seconds",
+        allow_zero=True,
+    )
+    with isolated_subprocess_signal_guard() as lifecycle:
+        return _run_provider_process_guarded(
+            argv=argv,
+            cwd=cwd,
+            environment=environment,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            timeout_seconds=timeout_seconds,
+            terminate_grace_seconds=terminate_grace_seconds,
+            lifecycle=lifecycle,
+        )
+
+
+def _run_provider_process_guarded(
+    *,
+    argv: list[str],
+    cwd: str | None,
+    environment: Mapping[str, str],
+    stdout_path: Path,
+    stderr_path: Path,
+    timeout_seconds: float,
+    terminate_grace_seconds: float,
+    lifecycle: Any,
+) -> dict[str, Any]:
     started = time.monotonic()
     process: subprocess.Popen[bytes] | None = None
     timed_out = False
@@ -823,43 +1209,40 @@ def _run_provider_process(
         stderr_path.open("wb") as stderr_handle,
     ):
         try:
-            process = subprocess.Popen(
-                argv,
-                cwd=cwd,
-                env=dict(environment),
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                start_new_session=True,
-            )
+            with lifecycle.spawn_window():
+                process = subprocess.Popen(
+                    argv,
+                    cwd=cwd,
+                    env=dict(environment),
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    start_new_session=True,
+                )
             try:
-                returncode = process.wait(timeout=timeout_seconds)
+                returncode = lifecycle.wait(
+                    process,
+                    timeout_seconds=timeout_seconds,
+                )
             except subprocess.TimeoutExpired:
                 timed_out = True
                 error = (
                     f"provider timed out after {timeout_seconds:g} seconds"
                 )
-                termination_signals = _terminate_process_group(
-                    process, terminate_grace_seconds
-                )
-                returncode = process.returncode
-            else:
-                # A provider may have launched a helper server. Its adapter is
-                # responsible for normal cleanup, but terminate any helper
-                # that survived the process-group leader.
-                termination_signals = _terminate_process_group(
-                    process, terminate_grace_seconds
-                )
         except OSError as exc:
             error = f"could not execute provider: {exc}"
             returncode = 127
         finally:
-            if process is not None and process.poll() is None:
-                termination_signals.extend(
-                    _terminate_process_group(
-                        process, terminate_grace_seconds
+            # Remain inside the passive signal guard until the entire private
+            # group is gone, on normal completion and on every failure path.
+            with lifecycle.cleanup_window():
+                if process is not None:
+                    termination_signals.extend(
+                        _terminate_process_group(
+                            process,
+                            terminate_grace_seconds,
+                        )
                     )
-                )
-                returncode = process.returncode
+                    returncode = process.returncode
     return {
         "argv": argv,
         "cwd": cwd,
@@ -983,20 +1366,12 @@ def run_local_provider_batch(
     timeout = spec.get("timeout_seconds", 1800)
     if timeout_seconds is not None:
         timeout = timeout_seconds
-    if (
-        not isinstance(timeout, (int, float))
-        or isinstance(timeout, bool)
-        or timeout <= 0
-    ):
-        raise ProviderError("timeout_seconds must be a positive number")
-    if (
-        not isinstance(terminate_grace_seconds, (int, float))
-        or isinstance(terminate_grace_seconds, bool)
-        or terminate_grace_seconds < 0
-    ):
-        raise ProviderError(
-            "terminate_grace_seconds must be a nonnegative number"
-        )
+    timeout = _require_finite_duration(timeout, "timeout_seconds")
+    terminate_grace_seconds = _require_finite_duration(
+        terminate_grace_seconds,
+        "terminate_grace_seconds",
+        allow_zero=True,
+    )
     destination = validate_provider_run_dir(run_dir)
 
     requests_path = destination / "requests.jsonl"
@@ -1048,8 +1423,8 @@ def run_local_provider_batch(
         environment=environment,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
-        timeout_seconds=float(timeout),
-        terminate_grace_seconds=float(terminate_grace_seconds),
+        timeout_seconds=timeout,
+        terminate_grace_seconds=terminate_grace_seconds,
     )
 
     protocol_errors = []
@@ -1177,9 +1552,7 @@ def run_local_provider_batch(
         },
         "paths": {
             "run_dir": str(destination),
-            "provider_spec_source": str(
-                destination / "provider-spec.json"
-            ),
+            "provider_spec_source": str(destination / "provider-spec.json"),
             "provider_spec_normalized": str(
                 destination / "provider-spec.normalized.json"
             ),

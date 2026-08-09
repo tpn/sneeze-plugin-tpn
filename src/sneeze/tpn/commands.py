@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import math
 import os
+import secrets
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,16 +23,70 @@ from sneeze.invariant import (
 )
 
 from .ocr_vllm import (
+    DEFAULT_DEEPSEEK_MOE_BACKEND,
     DEFAULT_MARKDOWN_WINDOW_SIZE,
     DEFAULT_OCR_MODEL,
     DEFAULT_OCR_MODEL_REVISION,
     DEFAULT_OCR_WINDOW_SIZE,
+    QUALIFIED_DEEPSEEK_MOE_BACKEND,
+    validate_deepseek_moe_backend,
 )
 
 DEFAULT_OCR_ENV_NAME = "sneeze-ocr-vllm"
 DEFAULT_TORCH_BACKEND = "cu130"
 DEFAULT_PYTHON_VERSION = "3.12"
 DEFAULT_CUDA_130_VLLM_WHEEL_INDEX = "https://wheels.vllm.ai/nightly/cu130/"
+_STRUCTURED_PROVIDER_STARTUP_ALLOWANCE_SECONDS = 600
+_STRUCTURED_PROVIDER_RUNTIME_SAFETY_FACTOR = 3.0
+_STRUCTURED_PROVIDER_MAX_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
+
+
+def _structured_markdown_timeout_seconds(
+    provider: Mapping[str, object],
+    page_count: int,
+) -> int | None:
+    execution = provider.get("execution_profile")
+    if not isinstance(execution, Mapping):
+        return None
+    profile = execution.get("profile")
+    receipt = execution.get("receipt")
+    memory_tier = execution.get("memory_tier")
+    if memory_tier is None and isinstance(receipt, Mapping):
+        memory_tier = receipt.get("memory_tier")
+    try:
+        throughput = profile["memory_tiers"][memory_tier]["stages"][
+            "markdown"
+        ]["confirmed_pages_per_second"]
+        base_timeout = provider["spec"]["timeout_seconds"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError(
+            "structured provider profile has no timeout evidence"
+        ) from exc
+    if (
+        not isinstance(page_count, int)
+        or isinstance(page_count, bool)
+        or page_count <= 0
+        or not isinstance(throughput, (int, float))
+        or isinstance(throughput, bool)
+        or not math.isfinite(float(throughput))
+        or throughput <= 0
+        or not isinstance(base_timeout, (int, float))
+        or isinstance(base_timeout, bool)
+        or base_timeout <= 0
+    ):
+        raise RuntimeError("structured provider timeout evidence is invalid")
+    projected = math.ceil(
+        _STRUCTURED_PROVIDER_STARTUP_ALLOWANCE_SECONDS
+        + _STRUCTURED_PROVIDER_RUNTIME_SAFETY_FACTOR
+        * page_count
+        / float(throughput)
+    )
+    timeout = max(math.ceil(float(base_timeout)), projected)
+    if timeout > _STRUCTURED_PROVIDER_MAX_TIMEOUT_SECONDS:
+        raise RuntimeError(
+            "structured provider projected runtime exceeds the safe bound"
+        )
+    return timeout
 
 
 @dataclass(frozen=True)
@@ -195,8 +251,7 @@ class PdfToPages(InvariantAwareCommand):
 
     class ParallelismArg(NonNegativeIntegerInvariant):
         _help = (
-            "Parallel worker count; 0 means CPU count. "
-            "[default: %default]"
+            "Parallel worker count; 0 means CPU count. [default: %default]"
         )
         _mandatory = False
         _default = 0
@@ -261,17 +316,25 @@ class PdfsToPages(PdfToPages):
 
 
 class OcrPdfPages(InvariantAwareCommand):
-    """OCR page images, optionally rendering source PDFs first.
+    """Run structured local OCR, optionally rendering source PDFs first.
 
-    Pass `--pdf-to-pages` to render PDFs from `--source-dir` into the
-    effective destination before OCR; it defaults to `--source-dir` when
-    `--dest-dir` is omitted. Otherwise render pages separately with
-    `sne pdf-to-pages`. Create a vLLM env with
-    `sne deepseek-ocr-create-env`, cache the model with
-    `sne deepseek-ocr-download-model`, and run this command inside that env.
-    Use `--prompt-mode full` to write `.ocr`, `.md`, and `.json` page
-    bundles from existing page images. HTML output is a separate
-    `--output-format html` mode, not part of `full`.
+    Recommended: select `--pipeline local-mineru25` to run registered
+    DeepSeek grounded OCR plus MinerU structured Markdown with an exact GPU
+    execution profile. The pipeline implies `--execution-profile auto`; use
+    `--memory-tier 25`, `50`, or `max` to select a qualified tier, or omit it
+    to use the profile's highest supported tier. Inspect setup with
+    `sne ocr-backend-list`, registrations with
+    `sne ocr-installation-list`, and profiles with `sne ocr-profile-list`.
+
+    Pass `--pdf-to-pages` to render PDFs from `--source-dir` before OCR. The
+    effective destination defaults to `--source-dir` when `--dest-dir` is
+    omitted; otherwise render separately with `sne pdf-to-pages`.
+
+    Legacy manual mode is selected only when `--pipeline` and
+    `--execution-profile` are omitted. It exposes the DeepSeek/vLLM model and
+    engine flags for controlled experiments; use
+    `sne deepseek-ocr-create-env` and `sne deepseek-ocr-download-model` for
+    that lower-level path. HTML is also a legacy single-output mode.
     """
 
     _verbose_ = True
@@ -335,8 +398,7 @@ class OcrPdfPages(InvariantAwareCommand):
     class PdfParallelismArg(NonNegativeIntegerInvariant):
         _arg = "--pdf-parallelism"
         _help = (
-            "PDF-render worker count; 0 means CPU count. "
-            "[default: %default]"
+            "PDF-render worker count; 0 means CPU count. [default: %default]"
         )
         _mandatory = False
         _default = 0
@@ -350,6 +412,74 @@ class OcrPdfPages(InvariantAwareCommand):
         _mandatory = False
         _default = 400
 
+    pipeline = None
+    _pipeline = None
+
+    class PipelineArg(StringInvariant):
+        _arg = "--pipeline"
+        _help = (
+            "Structured local OCR pipeline; currently local-mineru25. "
+            "Implies --execution-profile auto."
+        )
+        _mandatory = False
+
+    execution_profile = None
+    _execution_profile = None
+
+    class ExecutionProfileArg(StringInvariant):
+        _arg = "--execution-profile"
+        _help = "Portable execution profile: auto, exact ID, or JSON path."
+        _mandatory = False
+
+    profile_dir = None
+    _profile_dir = None
+
+    class ProfileDirArg(StringInvariant):
+        _arg = "--profile-dir"
+        _help = "Comma-separated absolute profile JSON files or directories."
+        _mandatory = False
+
+    installation_registry = None
+    _installation_registry = None
+
+    class InstallationRegistryArg(StringInvariant):
+        _arg = "--installation-registry"
+        _help = "Machine-local OCR installation registry path."
+        _mandatory = False
+
+    memory_tier = None
+    _memory_tier = None
+
+    class MemoryTierArg(StringInvariant):
+        _arg = "--memory-tier"
+        _help = (
+            "Structured profile memory tier: 25, 50, or max. "
+            "Defaults to the highest supported tier."
+        )
+        _mandatory = False
+
+    allow_provisional_profile = None
+
+    class AllowProvisionalProfileArg(BoolInvariant):
+        _arg = "--allow-provisional-profile"
+        _help = (
+            "Allow a provisional profile for an explicitly approved trial. "
+            "[default: %default]"
+        )
+        _mandatory = False
+        _default = False
+
+    explain_profile = None
+
+    class ExplainProfileArg(BoolInvariant):
+        _arg = "--explain-profile"
+        _help = (
+            "Resolve and print structured execution without OCR or writes. "
+            "[default: %default]"
+        )
+        _mandatory = False
+        _default = False
+
     output_format = None
     _output_format = None
 
@@ -362,7 +492,10 @@ class OcrPdfPages(InvariantAwareCommand):
     _model = None
 
     class ModelArg(StringInvariant):
-        _help = "DeepSeek OCR model name or local path. [default: %default]"
+        _help = (
+            "Legacy manual mode only: DeepSeek OCR model name or local "
+            "path; structured pipelines pin the model. [default: %default]"
+        )
         _mandatory = False
         _default = DEFAULT_OCR_MODEL
 
@@ -371,7 +504,8 @@ class OcrPdfPages(InvariantAwareCommand):
 
     class ModelRevisionArg(StringInvariant):
         _help = (
-            "Immutable Hugging Face model revision. [default: %default]"
+            "Legacy manual mode only: immutable Hugging Face model revision; "
+            "structured pipelines pin the revision. [default: %default]"
         )
         _mandatory = False
         _default = DEFAULT_OCR_MODEL_REVISION
@@ -483,6 +617,16 @@ class OcrPdfPages(InvariantAwareCommand):
         _help = "vLLM multimodal encoder attention backend override."
         _mandatory = False
 
+    moe_backend = None
+    _moe_backend = None
+
+    class MoeBackendArg(StringInvariant):
+        _help = (
+            "vLLM MoE backend: auto or triton. [default: %default]"
+        )
+        _mandatory = False
+        _default = DEFAULT_DEEPSEEK_MOE_BACKEND
+
     scheduler_delay_factor = None
     _scheduler_delay_factor = None
 
@@ -564,9 +708,8 @@ class OcrPdfPages(InvariantAwareCommand):
     _markdown_provider_lane = None
 
     class MarkdownProviderLaneArg(StringInvariant):
-        _help = "Provider lane for full-mode Markdown. [default: %default]"
+        _help = "Provider lane for full-mode Markdown. [default: best]"
         _mandatory = False
-        _default = "best"
 
     markdown_provider_run_dir = None
     _markdown_provider_run_dir = None
@@ -580,6 +723,7 @@ class OcrPdfPages(InvariantAwareCommand):
     def run(self):
         from .ocr_vllm import (
             DeepSeekOcrOfflineProcessor,
+            StructuredOutputReuseError,
             collect_ocr_full_items,
             collect_ocr_tasks,
             resolve_scan_workers,
@@ -591,10 +735,22 @@ class OcrPdfPages(InvariantAwareCommand):
             private_first=True,
         )
         dest_option = _option_value(self, "dest_dir", private_first=True)
-        dest_dir = os.path.abspath(
-            dest_option or source_dir
+        dest_dir = os.path.abspath(dest_option or source_dir)
+        explicit_text_source_dir = _option_value(
+            self,
+            "text_source_dir",
+            private_first=True,
         )
-
+        if (
+            self.pdf_to_pages
+            and explicit_text_source_dir is not None
+            and os.path.realpath(explicit_text_source_dir)
+            != os.path.realpath(dest_dir)
+        ):
+            raise CommandError(
+                "--text-source-dir must equal the effective destination "
+                "when --pdf-to-pages is enabled"
+            )
         output_format = _option_value(self, "output_format", "md")
         output_format = output_format.lower().strip()
         if output_format not in {"md", "html", "ocr"}:
@@ -610,6 +766,22 @@ class OcrPdfPages(InvariantAwareCommand):
                 "--prompt-mode full writes .ocr, .md, and .json and "
                 "requires --output-format md"
             )
+        structured = self._resolve_structured_execution(
+            prompt_mode=prompt_mode,
+            output_format=output_format,
+        )
+        if structured is not None:
+            prompt_mode = "full"
+            output_format = "md"
+            if self.explain_profile:
+                from .ocr_backend_setup import json_bytes
+
+                self._out(
+                    json_bytes(structured["receipt"], pretty=True)
+                    .decode("utf-8")
+                    .rstrip()
+                )
+                return
         scheduler_delay_factor = _maybe_float(
             _option_value(self, "scheduler_delay_factor")
         )
@@ -621,11 +793,18 @@ class OcrPdfPages(InvariantAwareCommand):
             default=0.0,
         )
         page_source_dir = dest_dir if self.pdf_to_pages else source_dir
-        markdown_provider = self._prepare_markdown_provider(
-            prompt_mode=prompt_mode,
-            source_dir=page_source_dir,
-            dest_dir=dest_dir,
-        )
+        if structured is not None:
+            markdown_provider = self._prepare_profile_markdown_provider(
+                structured,
+                source_dir=page_source_dir,
+                dest_dir=dest_dir,
+            )
+        else:
+            markdown_provider = self._prepare_markdown_provider(
+                prompt_mode=prompt_mode,
+                source_dir=page_source_dir,
+                dest_dir=dest_dir,
+            )
         os.makedirs(dest_dir, exist_ok=True)
         pdf_pages_result = None
         if self.pdf_to_pages:
@@ -647,11 +826,7 @@ class OcrPdfPages(InvariantAwareCommand):
                     f"PDF rendering failed before OCR: {exc}"
                 ) from exc
         output_ext = "ocr" if output_format == "ocr" else output_format
-        text_source_dir = _option_value(
-            self,
-            "text_source_dir",
-            private_first=True,
-        )
+        text_source_dir = explicit_text_source_dir
         if text_source_dir is None and os.path.isdir(
             f"{page_source_dir}.txt"
         ):
@@ -663,30 +838,38 @@ class OcrPdfPages(InvariantAwareCommand):
         self._out(f"Scanning page images under {page_source_dir}...")
         items = []
         if prompt_mode == "full":
-            items, pdf_count = collect_ocr_full_items(
-                source_dir=page_source_dir,
-                dest_dir=dest_dir,
-                text_source_dir=text_source_dir,
-                allowed_image_paths=(
-                    pdf_pages_result.image_paths
-                    if pdf_pages_result is not None
-                    else None
-                ),
-                refresh_image_paths=(
-                    pdf_pages_result.rendered_image_paths
-                    if pdf_pages_result is not None
-                    else None
-                ),
-                refresh_metadata_image_paths=(
-                    pdf_pages_result.rendered_text_image_paths
-                    if pdf_pages_result is not None
-                    else None
-                ),
-                verify_input_freshness=bool(self.pdf_to_pages),
-                force=bool(self.force),
-                scan_parallelism=scan_workers,
-                out=self._out,
-            )
+            try:
+                items, pdf_count = collect_ocr_full_items(
+                    source_dir=page_source_dir,
+                    dest_dir=dest_dir,
+                    text_source_dir=text_source_dir,
+                    allowed_image_paths=(
+                        pdf_pages_result.image_paths
+                        if pdf_pages_result is not None
+                        else None
+                    ),
+                    refresh_image_paths=(
+                        pdf_pages_result.rendered_image_paths
+                        if pdf_pages_result is not None
+                        else None
+                    ),
+                    refresh_metadata_image_paths=(
+                        pdf_pages_result.rendered_text_image_paths
+                        if pdf_pages_result is not None
+                        else None
+                    ),
+                    verify_input_freshness=bool(self.pdf_to_pages),
+                    force=bool(self.force),
+                    scan_parallelism=scan_workers,
+                    out=self._out,
+                    expected_execution_receipt=(
+                        structured["receipt"]
+                        if structured is not None
+                        else None
+                    ),
+                )
+            except StructuredOutputReuseError as exc:
+                raise CommandError(str(exc)) from exc
             if self._offset:
                 items = items[self._offset :]
             if self._limit:
@@ -727,20 +910,58 @@ class OcrPdfPages(InvariantAwareCommand):
 
         self._out(f"Found {work_count} page(s) across {pdf_count} PDF(s).")
         self._out(f"Writing OCR output to {dest_dir}.")
+        structured_environment = None
         try:
-            window_size = self._window_size or DEFAULT_OCR_WINDOW_SIZE
+            grounded_settings = (
+                structured["tier"]["stages"]["grounded_ocr"]["settings"]
+                if structured is not None
+                else {}
+            )
+            window_size = grounded_settings.get(
+                "window_size",
+                self._window_size or DEFAULT_OCR_WINDOW_SIZE,
+            )
             if prompt_mode == "markdown":
                 window_size = max(
                     window_size,
                     DEFAULT_MARKDOWN_WINDOW_SIZE,
                 )
-            processor = DeepSeekOcrOfflineProcessor(
-                model=_option_value(self, "model", DEFAULT_OCR_MODEL),
-                model_revision=_option_value(
+            moe_backend = validate_deepseek_moe_backend(
+                grounded_settings.get(
+                    "moe_backend",
+                    _option_value(
+                        self, "moe_backend", DEFAULT_DEEPSEEK_MOE_BACKEND
+                    ),
+                ).strip().lower()
+            )
+            if structured is not None:
+                deepseek_installation = structured["installations"][
+                    "deepseek-vllm"
+                ]
+                structured_environment = _set_process_environment(
+                    {
+                        "HF_HUB_CACHE": deepseek_installation["hf_cache"][
+                            "path"
+                        ],
+                        "HF_HUB_OFFLINE": "1",
+                        "TRANSFORMERS_OFFLINE": "1",
+                        "HF_HUB_DISABLE_TELEMETRY": "1",
+                    }
+                )
+                processor_model = deepseek_installation["snapshot"]["path"]
+                processor_revision = None
+            else:
+                processor_model = _option_value(
+                    self, "model", DEFAULT_OCR_MODEL
+                )
+                processor_revision = _option_value(
                     self,
                     "model_revision",
                     DEFAULT_OCR_MODEL_REVISION,
-                ),
+                )
+            processor = DeepSeekOcrOfflineProcessor(
+                model=processor_model,
+                model_revision=processor_revision,
                 output_format=output_format,
                 prompt=_option_value(self, "prompt"),
                 prompt_mode=(
@@ -748,22 +969,50 @@ class OcrPdfPages(InvariantAwareCommand):
                 ),
                 keep_grounding=bool(self.keep_grounding),
                 use_grounding=False if self.no_grounding else None,
-                batch_size=self._batch_size,
-                enable_chunked_prefill=bool(self.enable_chunked_prefill),
-                max_model_len=self._max_model_len,
-                max_num_batched_tokens=self._max_num_batched_tokens,
-                max_num_seqs=self._max_num_seqs,
-                attention_backend=_option_value(self, "attention_backend"),
-                mm_encoder_attn_backend=_option_value(
-                    self,
-                    "mm_encoder_attn_backend",
+                batch_size=grounded_settings.get(
+                    "batch_size", self._batch_size
                 ),
-                scheduler_delay_factor=scheduler_delay_factor,
+                enable_chunked_prefill=grounded_settings.get(
+                    "enable_chunked_prefill",
+                    bool(self.enable_chunked_prefill),
+                ),
+                max_model_len=grounded_settings.get(
+                    "max_model_len", self._max_model_len
+                ),
+                max_num_batched_tokens=grounded_settings.get(
+                    "max_num_batched_tokens",
+                    self._max_num_batched_tokens,
+                ),
+                max_num_seqs=grounded_settings.get(
+                    "max_num_seqs", self._max_num_seqs
+                ),
+                attention_backend=_profile_backend_value(
+                    grounded_settings.get(
+                        "attention_backend",
+                        _option_value(self, "attention_backend"),
+                    )
+                ),
+                mm_encoder_attn_backend=_profile_backend_value(
+                    grounded_settings.get(
+                        "mm_encoder_attn_backend",
+                        _option_value(self, "mm_encoder_attn_backend"),
+                    )
+                ),
+                moe_backend=moe_backend,
+                scheduler_delay_factor=grounded_settings.get(
+                    "scheduler_delay_factor", scheduler_delay_factor
+                ),
                 tensor_parallel_size=self._tensor_parallel_size,
-                gpu_memory_utilization=gpu_memory_utilization,
-                temperature=temperature,
-                max_tokens=self._max_tokens or 8192,
-                ngram_size=self._ngram_size or 10,
+                gpu_memory_utilization=grounded_settings.get(
+                    "gpu_memory_utilization", gpu_memory_utilization
+                ),
+                temperature=grounded_settings.get("temperature", temperature),
+                max_tokens=grounded_settings.get(
+                    "max_tokens", self._max_tokens or 8192
+                ),
+                ngram_size=grounded_settings.get(
+                    "ngram_size", self._ngram_size or 10
+                ),
                 window_size=window_size,
                 out=self._out,
                 verbose=self._verbose,
@@ -773,11 +1022,346 @@ class OcrPdfPages(InvariantAwareCommand):
                     processor,
                     items,
                     markdown_provider=markdown_provider,
+                    execution_plan=structured,
                 )
             else:
                 processor.run(tasks)
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             raise CommandError(str(exc)) from exc
+        finally:
+            if structured_environment is not None:
+                _restore_process_environment(structured_environment)
+
+    def _resolve_structured_execution(
+        self,
+        *,
+        prompt_mode: str,
+        output_format: str,
+    ) -> dict | None:
+        pipeline_name = _option_value(self, "pipeline")
+        profile_selection = _option_value(self, "execution_profile")
+        structured = bool(
+            pipeline_name
+            or profile_selection
+            or _option_value(self, "memory_tier")
+            or self.allow_provisional_profile
+            or self.explain_profile
+        )
+        if not structured:
+            return None
+        if prompt_mode not in {"markdown", "full"} or output_format != "md":
+            raise CommandError(
+                "structured OCR owns full-mode prompts and requires Markdown "
+                "output"
+            )
+        conflicts = self._structured_option_conflicts()
+        if conflicts:
+            raise CommandError(
+                "structured OCR settings come from the execution profile; "
+                "remove: " + ", ".join(conflicts)
+            )
+        ambient_vllm_controls = sorted(
+            name for name in os.environ if name.startswith("VLLM_")
+        )
+        if ambient_vllm_controls:
+            raise CommandError(
+                "structured OCR rejects unmodeled ambient vLLM controls; "
+                "unset: " + ", ".join(ambient_vllm_controls)
+            )
+        from .ocr_backend_setup import make_receipt
+        from .ocr_execution import (
+            OcrExecutionError,
+            assert_in_process_deepseek_installation,
+            build_execution_observation,
+            profile_search_paths,
+            resolve_execution_profile,
+        )
+        from .ocr_hardware import HardwareProbeError, probe_nvidia_hardware
+        from .ocr_installations import (
+            InstallationRegistryError,
+            load_installation_registry,
+            validate_single_gpu_cuda_binding,
+        )
+        from .ocr_profiles import OcrProfileError, load_execution_profile
+
+        raw_memory_tier = _option_value(self, "memory_tier")
+        memory_tier = (
+            raw_memory_tier.lower() if raw_memory_tier is not None else None
+        )
+        if memory_tier is not None and memory_tier not in {"25", "50", "max"}:
+            raise CommandError("--memory-tier must be 25, 50, or max")
+        try:
+            if profile_selection and profile_selection != "auto":
+                candidate = Path(profile_selection).expanduser()
+                if (
+                    candidate.is_absolute()
+                    or profile_selection.startswith((".", "~"))
+                    or "/" in profile_selection
+                    or profile_selection.endswith(".json")
+                ):
+                    inferred = load_execution_profile(candidate)[
+                        "pipeline_id"
+                    ]
+                    pipeline_name = pipeline_name or inferred
+            if pipeline_name is None:
+                raise OcrExecutionError(
+                    "--execution-profile by ID requires --pipeline"
+                )
+            from .ocr_profiles import get_pipeline_definition
+
+            pipeline = get_pipeline_definition(pipeline_name)
+            if pipeline["pipeline_id"] != "local-mineru25":
+                raise OcrExecutionError(
+                    "structured production currently supports only "
+                    "local-mineru25; DeepSeek Markdown tuning is withheld"
+                )
+            profile_selection = profile_selection or "auto"
+            registry = load_installation_registry(
+                _option_value(self, "installation_registry"),
+                validate_current=True,
+                missing_ok=False,
+            )
+            installations = registry["installations"]
+            deepseek = installations.get("deepseek-vllm")
+            mineru = installations.get("mineru25-pro-2605")
+            if not isinstance(deepseek, dict) or not isinstance(mineru, dict):
+                raise OcrExecutionError(
+                    "local-mineru25 requires registered DeepSeek and MinerU "
+                    "installations"
+                )
+            visible, _ = validate_single_gpu_cuda_binding(
+                deepseek.get("cuda"),
+                label="deepseek-vllm.cuda",
+            )
+            mineru_visible, _ = validate_single_gpu_cuda_binding(
+                mineru.get("cuda"),
+                label="mineru25-pro-2605.cuda",
+            )
+            if mineru_visible != visible:
+                raise OcrExecutionError(
+                    "pipeline installations select different physical GPUs"
+                )
+            assert_in_process_deepseek_installation(deepseek)
+            hardware = probe_nvidia_hardware(
+                torch_python=deepseek["python_executable"]["path"],
+                visible_devices=visible,
+                cuda_device_order="PCI_BUS_ID",
+            )
+            observation = build_execution_observation(
+                pipeline_id=pipeline["pipeline_id"],
+                hardware=hardware,
+                installations=installations,
+            )
+            resolved = resolve_execution_profile(
+                profile_selection,
+                pipeline_id=pipeline["pipeline_id"],
+                memory_tier=memory_tier,
+                observation=observation,
+                search_paths=profile_search_paths(
+                    _option_value(self, "profile_dir")
+                ),
+                allow_provisional=bool(self.allow_provisional_profile),
+            )
+            memory_tier = resolved["memory_tier"]
+            profile = resolved["profile"]
+            tier = profile["memory_tiers"][memory_tier]
+            grounded_settings = tier["stages"]["grounded_ocr"]["settings"]
+            torch_total = (
+                hardware["memory"].get("total_sources", {}).get("torch_cuda")
+            )
+            if not isinstance(torch_total, int) or torch_total <= 0:
+                torch_total = profile["hardware_selector"][
+                    "total_memory_bytes"
+                ]
+            expected_denominator = max(
+                profile["hardware_selector"]["total_memory_bytes"],
+                torch_total,
+            )
+            if (
+                grounded_settings.get(
+                    "gpu_memory_utilization_denominator_bytes"
+                )
+                != expected_denominator
+            ):
+                raise OcrExecutionError(
+                    "selected profile GPU-memory denominator differs from "
+                    "the live CUDA capacity"
+                )
+            free_bytes = hardware["memory"].get("free_memory_bytes")
+            reserve_bytes = tier["reserve_bytes"]
+            required_bytes = tier["budget_bytes"] + reserve_bytes
+            if not isinstance(free_bytes, int) or free_bytes < required_bytes:
+                raise OcrExecutionError(
+                    "selected profile tier is not currently available: "
+                    f"needs budget+reserve {required_bytes} bytes, observed "
+                    f"{free_bytes!r} bytes free"
+                )
+            receipt = make_receipt(
+                "ocr_structured_execution",
+                {
+                    "pipeline_id": pipeline["pipeline_id"],
+                    "pipeline_definition_sha256": pipeline[
+                        "definition_sha256"
+                    ],
+                    "profile_id": profile["profile_id"],
+                    "profile_sha256": profile["profile_sha256"],
+                    "qualification_state": profile["qualification"]["state"],
+                    "allow_provisional_profile": bool(
+                        self.allow_provisional_profile
+                    ),
+                    "memory_tier": memory_tier,
+                    "memory_budget_bytes": tier["budget_bytes"],
+                    "reserve_bytes": reserve_bytes,
+                    "hardware_selector": profile["hardware_selector"],
+                    "match": resolved["match"],
+                    "stage_settings": {
+                        stage_id: stage_record["settings"]
+                        for stage_id, stage_record in tier["stages"].items()
+                    },
+                    "attention_backend": {
+                        "requested": grounded_settings.get(
+                            "attention_backend"
+                        ),
+                        "qualified_selected": profile["stages"][
+                            "grounded_ocr"
+                        ]["runtime_selector"]["attention_backend"],
+                        "selected_verification": (
+                            "deferred_until_engine_initialization"
+                        ),
+                    },
+                    "installation_record_sha256": {
+                        key: installations[key]["record_sha256"]
+                        for key in ("deepseek-vllm", "mineru25-pro-2605")
+                    },
+                    "deepseek_snapshot": {
+                        "revision": deepseek["model"]["revision"],
+                        "files_sha256": deepseek["snapshot"]["files_sha256"],
+                    },
+                },
+            )
+        except (
+            OcrExecutionError,
+            OcrProfileError,
+            HardwareProbeError,
+            InstallationRegistryError,
+            OSError,
+        ) as exc:
+            raise CommandError(str(exc)) from exc
+        return {
+            **resolved,
+            "pipeline": pipeline,
+            "tier": tier,
+            "memory_tier": memory_tier,
+            "installations": installations,
+            "receipt": receipt,
+        }
+
+    def _structured_option_conflicts(self) -> list[str]:
+        conflicts = []
+        exact_defaults = (
+            ("model", DEFAULT_OCR_MODEL, "--model"),
+            (
+                "model_revision",
+                DEFAULT_OCR_MODEL_REVISION,
+                "--model-revision",
+            ),
+            ("temperature", "0.0", "--temperature"),
+            ("max_tokens", 8192, "--max-tokens"),
+            ("ngram_size", 10, "--ngram-size"),
+            ("window_size", DEFAULT_OCR_WINDOW_SIZE, "--window-size"),
+            (
+                "moe_backend",
+                DEFAULT_DEEPSEEK_MOE_BACKEND,
+                "--moe-backend",
+            ),
+        )
+        for name, expected, option in exact_defaults:
+            value = _option_value(self, name, expected)
+            if value != expected:
+                conflicts.append(option)
+        optional = (
+            ("prompt", "--prompt"),
+            ("batch_size", "--batch-size"),
+            ("max_model_len", "--max-model-len"),
+            ("max_num_batched_tokens", "--max-num-batched-tokens"),
+            ("max_num_seqs", "--max-num-seqs"),
+            ("attention_backend", "--attention-backend"),
+            ("mm_encoder_attn_backend", "--mm-encoder-attn-backend"),
+            ("scheduler_delay_factor", "--scheduler-delay-factor"),
+            ("tensor_parallel_size", "--tensor-parallel-size"),
+            ("gpu_memory_utilization", "--gpu-memory-utilization"),
+            ("markdown_provider_spec", "--markdown-provider-spec"),
+            ("markdown_provider_lane", "--markdown-provider-lane"),
+        )
+        for name, option in optional:
+            if _option_value(self, name) not in (None, ""):
+                conflicts.append(option)
+        if self.keep_grounding:
+            conflicts.append("--keep-grounding")
+        if self.no_grounding:
+            conflicts.append("--no-grounding")
+        return conflicts
+
+    def _prepare_profile_markdown_provider(
+        self,
+        execution: dict,
+        *,
+        source_dir: str,
+        dest_dir: str,
+    ) -> dict:
+        from .ocr_backend_setup import _atomic_write_new_bytes, json_bytes
+        from .ocr_execution import build_profile_provider_spec
+        from .ocr_profiles import write_execution_profile
+
+        requested_run_dir = _option_value(self, "markdown_provider_run_dir")
+        if requested_run_dir:
+            run_dir_path = _preflight_markdown_provider_run_dir(
+                requested_run_dir,
+                source_dir=source_dir,
+                dest_dir=dest_dir,
+            )
+            parent = run_dir_path.parent
+            run_dir = str(run_dir_path)
+        else:
+            parent = Path(tempfile.gettempdir()).resolve()
+            run_dir = None
+        runtime_root = _create_profile_runtime_root(
+            parent,
+            source_dir=source_dir,
+            dest_dir=dest_dir,
+        )
+        if run_dir is None:
+            run_dir_path = _preflight_markdown_provider_run_dir(
+                runtime_root / "provider-evidence",
+                source_dir=source_dir,
+                dest_dir=dest_dir,
+            )
+            run_dir = str(run_dir_path)
+            self._out(
+                f"Profile provider evidence will be preserved at {run_dir}."
+            )
+        profile_path = runtime_root / "execution-profile.json"
+        write_execution_profile(execution["profile"], profile_path)
+        spec = build_profile_provider_spec(
+            profile=execution["profile"],
+            profile_path=profile_path,
+            memory_tier=execution["memory_tier"],
+            installation=execution["installations"]["mineru25-pro-2605"],
+            allow_provisional=bool(self.allow_provisional_profile),
+        )
+        spec_path = runtime_root / "provider-spec.json"
+        _atomic_write_new_bytes(spec_path, json_bytes(spec, pretty=True))
+        provider = self._prepare_markdown_provider(
+            prompt_mode="full",
+            source_dir=source_dir,
+            dest_dir=dest_dir,
+            spec_path_override=str(spec_path),
+            run_dir_override=run_dir,
+            lane_override="best",
+        )
+        provider["execution_profile"] = execution
+        provider["runtime_root"] = str(runtime_root)
+        return provider
 
     def _prepare_markdown_provider(
         self,
@@ -785,9 +1369,16 @@ class OcrPdfPages(InvariantAwareCommand):
         prompt_mode: str,
         source_dir: str,
         dest_dir: str,
+        spec_path_override: str | None = None,
+        run_dir_override: str | None = None,
+        lane_override: str | None = None,
     ) -> dict | None:
-        spec_path = _option_value(self, "markdown_provider_spec")
-        run_dir = _option_value(self, "markdown_provider_run_dir")
+        spec_path = spec_path_override or _option_value(
+            self, "markdown_provider_spec"
+        )
+        run_dir = run_dir_override or _option_value(
+            self, "markdown_provider_run_dir"
+        )
         if not spec_path:
             if run_dir:
                 raise CommandError(
@@ -805,44 +1396,28 @@ class OcrPdfPages(InvariantAwareCommand):
                 "--markdown-provider-spec requires "
                 "--markdown-provider-run-dir"
             )
-        from .ocr_benchmark import PROTECTED_CORPUS_ROOTS
         from .ocr_provider import (
             ProviderError,
             load_local_provider_spec,
             validate_provider_run_dir,
         )
 
-        lane = _option_value(self, "markdown_provider_lane", "best")
-        if not os.path.isabs(run_dir):
-            raise CommandError(
-                "Markdown provider evidence directory must be absolute"
-            )
-        candidate_dir = os.path.realpath(run_dir)
-        for label, root in (
-            ("source", source_dir),
-            ("destination", dest_dir),
-        ):
-            if _paths_overlap(candidate_dir, os.path.abspath(root)):
-                raise CommandError(
-                    "Markdown provider evidence directory must be "
-                    f"separate from the OCR {label} directory"
-                )
-        for protected_root in PROTECTED_CORPUS_ROOTS:
-            if _paths_overlap(candidate_dir, str(protected_root)):
-                raise CommandError(
-                    "Markdown provider evidence directory must be "
-                    "separate from protected canonical corpora"
-                )
+        lane = lane_override or _option_value(
+            self, "markdown_provider_lane", "best"
+        )
+        candidate_dir = _preflight_markdown_provider_run_dir(
+            run_dir,
+            source_dir=source_dir,
+            dest_dir=dest_dir,
+        )
         try:
             resolved_spec_path = (
                 Path(spec_path).expanduser().resolve(strict=True)
             )
             spec = load_local_provider_spec(resolved_spec_path)
             if lane not in spec["lanes"]:
-                raise ProviderError(
-                    f"provider does not define lane: {lane}"
-                )
-            evidence_dir = validate_provider_run_dir(run_dir)
+                raise ProviderError(f"provider does not define lane: {lane}")
+            evidence_dir = validate_provider_run_dir(candidate_dir)
         except (OSError, ProviderError) as exc:
             raise CommandError(str(exc)) from exc
         return {
@@ -858,6 +1433,7 @@ class OcrPdfPages(InvariantAwareCommand):
         items,
         *,
         markdown_provider: dict | None = None,
+        execution_plan: dict | None = None,
     ) -> None:
         from .ocr_vllm import (
             OcrPageTask,
@@ -890,16 +1466,62 @@ class OcrPdfPages(InvariantAwareCommand):
             processor.init_progressbar(total=total_actions)
             if ocr_tasks or (markdown_tasks and markdown_provider is None):
                 llm, sampling_params = processor.prepare_engine()
+                if execution_plan is not None:
+                    from .ocr_execution import (
+                        deepseek_engine_identity_mismatches,
+                    )
+
+                    deepseek_installation = execution_plan["installations"][
+                        "deepseek-vllm"
+                    ]
+                    execution_settings = execution_plan["tier"]["stages"][
+                        "grounded_ocr"
+                    ]["settings"]
+                    mismatches = deepseek_engine_identity_mismatches(
+                        execution_plan["profile"],
+                        installation=deepseek_installation,
+                        engine_metadata=getattr(
+                            processor,
+                            "_engine_metadata",
+                            {},
+                        ),
+                        execution_settings=execution_settings,
+                    )
+                    if mismatches:
+                        raise RuntimeError(
+                            "DeepSeek engine identity differs from the "
+                            "selected execution profile: "
+                            + "; ".join(mismatches)
+                        )
             if ocr_tasks:
                 processor.output_format = "ocr"
                 processor.prompt_mode = "plain_ocr"
                 processor.use_grounding = True
                 processor.keep_grounding = True
-                processor.run(
-                    ocr_tasks,
-                    llm=llm,
-                    sampling_params=sampling_params,
-                )
+                grounded_candidates = {}
+                grounded_run_tasks = ocr_tasks
+                if execution_plan is not None:
+                    (
+                        grounded_run_tasks,
+                        grounded_candidates,
+                    ) = _stage_grounded_ocr_tasks(ocr_tasks)
+                try:
+                    processor.run(
+                        grounded_run_tasks,
+                        llm=llm,
+                        sampling_params=sampling_params,
+                    )
+                except BaseException as exc:
+                    _discard_grounded_ocr_candidates(
+                        grounded_candidates,
+                        original_error=exc,
+                    )
+                    raise
+                if grounded_candidates:
+                    _finalize_grounded_ocr_candidates(
+                        processor,
+                        grounded_candidates,
+                    )
             provider_failures = []
             if markdown_tasks and markdown_provider is not None:
                 if llm is not None:
@@ -952,6 +1574,11 @@ class OcrPdfPages(InvariantAwareCommand):
                     )
                     if path in all_metadata
                 }
+                if execution_plan is not None:
+                    for metadata in generation_metadata.values():
+                        metadata["execution_profile"] = execution_plan[
+                            "receipt"
+                        ]
                 payload = write_ocr_page_bundle(
                     item,
                     generation_metadata=generation_metadata,
@@ -965,8 +1592,33 @@ class OcrPdfPages(InvariantAwareCommand):
                     if not required:
                         continue
                     metadata = all_metadata.get(path)
+                    validation = (
+                        metadata.get("validation")
+                        if isinstance(metadata, Mapping)
+                        else None
+                    )
+                    if isinstance(validation, Mapping):
+                        metadata_flags = validation.get("flags")
+                        if isinstance(metadata_flags, list):
+                            flags.extend(
+                                value
+                                for value in metadata_flags
+                                if isinstance(value, str)
+                            )
                     if not metadata or metadata.get("status") != "completed":
                         flags.append(f"{label}_generation_failed")
+                    elif execution_plan is not None:
+                        termination = metadata.get("termination")
+                        if (
+                            not isinstance(termination, Mapping)
+                            or termination.get("eos") is not True
+                        ):
+                            flags.append(f"{label}_non_eos_termination")
+                        if (
+                            isinstance(termination, Mapping)
+                            and termination.get("max_tokens") is True
+                        ):
+                            flags.append(f"{label}_max_tokens_termination")
                     if not os.path.isfile(path):
                         flags.append(f"{label}_output_missing")
                 if item.need_markdown and quality.get("status") != "pass":
@@ -977,9 +1629,9 @@ class OcrPdfPages(InvariantAwareCommand):
                 elif quality.get("status") == "fail":
                     flags.extend(quality.get("flags", []))
                 if flags:
-                    page_failures.setdefault(
-                        item.markdown_path, []
-                    ).extend(flags)
+                    page_failures.setdefault(item.markdown_path, []).extend(
+                        flags
+                    )
                 processor.update_progressbar(1)
             page_failures = {
                 path: list(dict.fromkeys(flags))
@@ -1043,12 +1695,17 @@ class OcrPdfPages(InvariantAwareCommand):
                 }
             )
         try:
+            timeout_seconds = _structured_markdown_timeout_seconds(
+                provider,
+                len(pages),
+            )
             batch = run_local_provider_batch(
                 spec_path=provider["spec_path"],
                 lane=provider["lane"],
                 run_dir=provider["run_dir"],
                 pages=pages,
                 out=self._out,
+                timeout_seconds=timeout_seconds,
             )
         except (OSError, ProviderError) as exc:
             message = f"provider launch failed: {exc}"
@@ -1072,6 +1729,12 @@ class OcrPdfPages(InvariantAwareCommand):
                 for item in item_by_id.values()
             ]
 
+        batch_protocol_flags = list(
+            dict.fromkeys(
+                "provider_batch_protocol_error: " + error
+                for error in batch.get("protocol_errors", [])
+            )
+        )
         failures = []
         returned_ids = set()
         for result in batch["results"]:
@@ -1084,6 +1747,54 @@ class OcrPdfPages(InvariantAwareCommand):
             output_text = result.get("output_text")
             persisted_before = file_sha256(item.markdown_path)
             flags = list(result.get("errors") or [])
+            flags.extend(batch_protocol_flags)
+            execution = provider.get("execution_profile")
+            if execution is not None:
+                from .ocr_execution import (
+                    stage_model_mismatches,
+                    stage_runtime_mismatches,
+                )
+
+                runtime = metadata.get("runtime")
+                if not isinstance(runtime, dict):
+                    flags.append("provider_runtime_missing")
+                else:
+                    flags.extend(
+                        "provider_runtime_mismatch: " + reason
+                        for reason in stage_runtime_mismatches(
+                            execution["profile"],
+                            stage_id="markdown",
+                            runtime=runtime,
+                        )
+                    )
+                model = metadata.get("model")
+                if not isinstance(model, dict):
+                    flags.append("provider_model_missing")
+                else:
+                    flags.extend(
+                        "provider_model_mismatch: " + reason
+                        for reason in stage_model_mismatches(
+                            execution["profile"],
+                            stage_id="markdown",
+                            model=model,
+                        )
+                    )
+                observed_profile = (
+                    runtime.get("execution_profile")
+                    if isinstance(runtime, dict)
+                    else None
+                )
+                expected_profile = execution["receipt"]
+                if not isinstance(observed_profile, dict) or any(
+                    observed_profile.get(key) != expected_profile[key]
+                    for key in (
+                        "profile_id",
+                        "profile_sha256",
+                        "qualification_state",
+                        "memory_tier",
+                    )
+                ):
+                    flags.append("provider_execution_profile_mismatch")
             if not result.get("valid"):
                 flags.append("provider_response_invalid")
             if not isinstance(output_text, str) or not output_text.strip():
@@ -1091,8 +1802,16 @@ class OcrPdfPages(InvariantAwareCommand):
                 output_text = (
                     output_text if isinstance(output_text, str) else ""
                 )
-            termination = metadata.get("termination") or {}
-            if termination.get("max_tokens") is True:
+            termination = metadata.get("termination")
+            if (
+                not isinstance(termination, Mapping)
+                or termination.get("eos") is not True
+            ):
+                flags.append("provider_non_eos_termination")
+            if (
+                isinstance(termination, Mapping)
+                and termination.get("max_tokens") is True
+            ):
                 flags.append("provider_max_tokens_termination")
             quality = analyze_markdown_quality(
                 output_text,
@@ -1126,9 +1845,7 @@ class OcrPdfPages(InvariantAwareCommand):
                 "promoted": promoted,
                 "candidate_sha256": candidate_sha256,
                 "persisted_output_sha256_before": persisted_before,
-                "persisted_output_sha256": file_sha256(
-                    item.markdown_path
-                ),
+                "persisted_output_sha256": file_sha256(item.markdown_path),
             }
             if flags:
                 metadata["status"] = "error"
@@ -1139,7 +1856,7 @@ class OcrPdfPages(InvariantAwareCommand):
         for page_id, item in item_by_id.items():
             if page_id in returned_ids:
                 continue
-            flags = ["provider_result_missing"]
+            flags = ["provider_result_missing", *batch_protocol_flags]
             processor.generation_metadata[item.markdown_path] = {
                 "status": "error",
                 "backend": "local_provider",
@@ -1155,14 +1872,11 @@ class OcrPdfPages(InvariantAwareCommand):
             }
             failures.append((item.markdown_path, flags))
             processor.update_progressbar(1)
-        if batch.get("protocol_errors"):
+        if batch_protocol_flags:
             failures.append(
                 (
                     provider["run_dir"],
-                    [
-                        "provider_batch_protocol_error: " + error
-                        for error in batch["protocol_errors"]
-                    ],
+                    batch_protocol_flags,
                 )
             )
         return failures
@@ -1219,8 +1933,7 @@ class OcrBenchmark(InvariantAwareCommand):
 
     class AllowExternalArg(BoolInvariant):
         _help = (
-            "Permit a separately approved external plan. "
-            "[default: %default]"
+            "Permit a separately approved external plan. [default: %default]"
         )
         _mandatory = False
         _default = False
@@ -1247,9 +1960,7 @@ class OcrBenchmark(InvariantAwareCommand):
         external_plan = _option_value(self, "external_plan")
         lanes_value = _option_value(self, "lanes")
         repeats_value = _option_value(self, "repeats")
-        if external_plan and (
-            lanes_value is None or repeats_value is None
-        ):
+        if external_plan and (lanes_value is None or repeats_value is None):
             try:
                 from .ocr_external import validate_external_upload_plan
 
@@ -1264,13 +1975,10 @@ class OcrBenchmark(InvariantAwareCommand):
                 ) from exc
             if lanes_value is None:
                 lanes_value = ",".join(
-                    lane["lane_id"]
-                    for lane in external_plan_record["lanes"]
+                    lane["lane_id"] for lane in external_plan_record["lanes"]
                 )
             if repeats_value is None:
-                repeats_value = external_plan_record["execution"][
-                    "repeats"
-                ]
+                repeats_value = external_plan_record["execution"]["repeats"]
         lanes = (
             [lane.strip() for lane in lanes_value.split(",")]
             if lanes_value is not None
@@ -1566,8 +2274,7 @@ class OcrExternalApprove(InvariantAwareCommand):
 
     class ValidHoursArg(PositiveIntegerInvariant):
         _help = (
-            "Approval lifetime, capped by plan expiry. "
-            "[default: %default]"
+            "Approval lifetime, capped by plan expiry. [default: %default]"
         )
         _mandatory = False
         _default = 24
@@ -1637,6 +2344,1078 @@ class OcrBackendList(InvariantAwareCommand):
             )
 
 
+class OcrInstallationRegister(InvariantAwareCommand):
+    """Register one pinned local OCR backend installation.
+
+    The machine-local registry binds a portable backend definition to an
+    exact Python executable, model snapshot, adapter, and CUDA selection.
+    Registration validates and hashes every binding before writing it.
+    """
+
+    backend = None
+    _backend = None
+
+    class BackendArg(StringInvariant):
+        _arg = "--backend"
+        _help = "Built-in OCR backend ID or alias."
+
+    python_executable = None
+    _python_executable = None
+
+    class PythonExecutableArg(StringInvariant):
+        _arg = "--python-executable"
+        _help = "Absolute Python executable in the backend environment."
+
+    cache_dir = None
+    _cache_dir = None
+
+    class CacheDirArg(DirectoryInvariant):
+        _arg = "--cache-dir"
+        _help = "Absolute Hugging Face cache containing the pinned model."
+
+    installation_registry = None
+    _installation_registry = None
+
+    class InstallationRegistryArg(StringInvariant):
+        _arg = "--installation-registry"
+        _help = "Registry path; defaults to the machine-local XDG path."
+        _mandatory = False
+
+    cuda_visible_devices = None
+    _cuda_visible_devices = None
+
+    class CudaVisibleDevicesArg(StringInvariant):
+        _arg = "--cuda-visible-devices"
+        _help = "Exact physical GPU selection. [default: %default]"
+        _mandatory = False
+        _default = "0"
+
+    device = None
+    _device = None
+
+    class DeviceArg(StringInvariant):
+        _arg = "--device"
+        _help = (
+            "Logical device inside the backend process. [default: %default]"
+        )
+        _mandatory = False
+        _default = "cuda:0"
+
+    attention_backend = None
+    _attention_backend = None
+
+    class AttentionBackendArg(StringInvariant):
+        _arg = "--attention-backend"
+        _help = "Optional backend-specific attention implementation."
+        _mandatory = False
+
+    def run(self):
+        from .ocr_backend_setup import make_receipt, receipt_text
+        from .ocr_backends import get_backend
+        from .ocr_installations import (
+            InstallationRegistryError,
+            default_installation_registry_path,
+            register_backend_installation,
+        )
+
+        registry_value = _option_value(self, "installation_registry")
+        registry_path = (
+            default_installation_registry_path()
+            if registry_value is None
+            else Path(registry_value).expanduser()
+        )
+        try:
+            backend = get_backend(_option_value(self, "backend"))
+            registry = register_backend_installation(
+                backend.backend_id,
+                python_executable=_option_value(
+                    self, "python_executable", private_first=True
+                ),
+                hf_cache=_option_value(self, "cache_dir", private_first=True),
+                cuda_visible_devices=_option_value(
+                    self, "cuda_visible_devices", "0"
+                ),
+                device=_option_value(self, "device", "cuda:0"),
+                attention_backend=_option_value(self, "attention_backend"),
+                path=registry_value,
+            )
+            receipt = make_receipt(
+                "ocr_backend_installation_registration",
+                {
+                    "registry_path": str(registry_path),
+                    "registry_content_sha256": registry["content_sha256"],
+                    "installation": registry["installations"][
+                        backend.backend_id
+                    ],
+                },
+            )
+        except (OSError, ValueError, InstallationRegistryError) as exc:
+            raise CommandError(str(exc)) from exc
+        self._out(receipt_text(receipt))
+
+
+class OcrInstallationList(InvariantAwareCommand):
+    """List and revalidate machine-local OCR backend installations."""
+
+    installation_registry = None
+    _installation_registry = None
+
+    class InstallationRegistryArg(StringInvariant):
+        _arg = "--installation-registry"
+        _help = "Registry path; defaults to the machine-local XDG path."
+        _mandatory = False
+
+    format = None
+    _format = None
+
+    class FormatArg(StringInvariant):
+        _arg = "--format"
+        _help = "Output format: text or json. [default: %default]"
+        _mandatory = False
+        _default = "text"
+
+    def run(self):
+        from .ocr_backend_setup import make_receipt, receipt_text
+        from .ocr_installations import (
+            InstallationRegistryError,
+            default_installation_registry_path,
+            load_installation_registry,
+        )
+
+        output_format = _option_value(self, "format", "text").strip().lower()
+        if output_format not in {"text", "json"}:
+            raise CommandError("--format must be text or json")
+        registry_value = _option_value(self, "installation_registry")
+        registry_path = (
+            default_installation_registry_path()
+            if registry_value is None
+            else Path(registry_value).expanduser()
+        )
+        try:
+            registry = load_installation_registry(
+                registry_value,
+                validate_current=True,
+                missing_ok=True,
+            )
+        except (OSError, ValueError, InstallationRegistryError) as exc:
+            raise CommandError(str(exc)) from exc
+        installations = [
+            registry["installations"][key]
+            for key in sorted(registry["installations"])
+        ]
+        if output_format == "json":
+            receipt = make_receipt(
+                "ocr_backend_installation_registry",
+                {
+                    "registry_path": str(registry_path),
+                    "registry_content_sha256": registry["content_sha256"],
+                    "installations": installations,
+                },
+            )
+            self._out(receipt_text(receipt))
+            return
+        if not installations:
+            self._out("No OCR backend installations are registered.")
+            return
+        for record in installations:
+            cuda = record["cuda"]
+            self._out(
+                f"{record['backend_id']}: "
+                f"{record['model']['id']}@{record['model']['revision']}; "
+                f"python={record['python_executable']['path']}; "
+                f"cuda={cuda['visible_devices']}:{cuda['device']}; "
+                f"record={record['record_sha256']}"
+            )
+
+
+class OcrPipelineList(InvariantAwareCommand):
+    """List built-in OCR pipelines and structured-execution support."""
+
+    format = None
+    _format = None
+
+    class FormatArg(StringInvariant):
+        _arg = "--format"
+        _help = "Output format: text or json. [default: %default]"
+        _mandatory = False
+        _default = "text"
+
+    def run(self):
+        from .ocr_backend_setup import make_receipt, receipt_text
+        from .ocr_profiles import list_pipeline_definitions
+
+        output_format = _option_value(self, "format", "text").strip().lower()
+        if output_format not in {"text", "json"}:
+            raise CommandError("--format must be text or json")
+        pipelines = []
+        for definition in list_pipeline_definitions():
+            record = dict(definition)
+            enabled = record["pipeline_id"] == "local-mineru25"
+            record["structured_execution"] = {
+                "enabled": enabled,
+                "reason": (
+                    "supported"
+                    if enabled
+                    else (
+                        "withheld until the true ungrounded Markdown lane "
+                        "is implemented and tuned"
+                    )
+                ),
+            }
+            pipelines.append(record)
+        if output_format == "json":
+            receipt = make_receipt(
+                "ocr_pipeline_registry",
+                {"pipelines": pipelines},
+            )
+            self._out(receipt_text(receipt))
+            return
+        for pipeline in pipelines:
+            stages = " -> ".join(
+                f"{stage['stage_id']}:{stage['backend_id']}"
+                for stage in pipeline["stages"]
+            )
+            support = (
+                "enabled"
+                if pipeline["structured_execution"]["enabled"]
+                else "withheld"
+            )
+            self._out(
+                f"{pipeline['pipeline_id']}: {stages}; structured={support}"
+            )
+
+
+def _profile_plugin_status(
+    profile,
+    *,
+    trusted_profile_sha256s,
+):
+    """Describe source-controlled trust without changing profile content."""
+
+    digest = profile["profile_sha256"]
+    qualification_state = profile["qualification"]["state"]
+    trusted = digest in trusted_profile_sha256s
+    production_eligible = qualification_state == "qualified" and trusted
+    if qualification_state != "qualified":
+        reason = "profile qualification is provisional"
+    elif not trusted:
+        reason = "profile hash is not trusted by this plugin build"
+    else:
+        reason = None
+    return {
+        "profile_id": profile["profile_id"],
+        "profile_sha256": digest,
+        "qualification_state": qualification_state,
+        "trusted_by_current_plugin": trusted,
+        "production_eligible": production_eligible,
+        "production_ineligibility_reason": reason,
+    }
+
+
+class OcrProfileList(InvariantAwareCommand):
+    """List validated profiles and their current-plugin trust status."""
+
+    # OcrPipelineList owns the conventional ``opl`` abbreviation.
+    _shortname_ = "oprl"
+
+    profile_dir = None
+    _profile_dir = None
+
+    class ProfileDirArg(StringInvariant):
+        _arg = "--profile-dir"
+        _help = (
+            "Comma-separated profile paths; defaults to bundled profiles "
+            "first, then the XDG directory."
+        )
+        _mandatory = False
+
+    format = None
+    _format = None
+
+    class FormatArg(StringInvariant):
+        _arg = "--format"
+        _help = "Output format: text or json. [default: %default]"
+        _mandatory = False
+        _default = "text"
+
+    def run(self):
+        from .ocr_backend_setup import make_receipt, receipt_text
+        from .ocr_execution import (
+            OcrExecutionError,
+            profile_search_paths,
+        )
+        from .ocr_profiles import (
+            TRUSTED_QUALIFIED_PROFILE_SHA256S,
+            OcrProfileError,
+            list_execution_profiles,
+        )
+
+        output_format = _option_value(self, "format", "text").strip().lower()
+        if output_format not in {"text", "json"}:
+            raise CommandError("--format must be text or json")
+        configured = _option_value(self, "profile_dir")
+        try:
+            paths = profile_search_paths(configured)
+            sources = tuple(path for path in paths if path.exists())
+            profiles = list_execution_profiles(paths=sources)
+        except (
+            OSError,
+            ValueError,
+            OcrExecutionError,
+            OcrProfileError,
+        ) as exc:
+            raise CommandError(str(exc)) from exc
+        statuses = tuple(
+            _profile_plugin_status(
+                profile,
+                trusted_profile_sha256s=(TRUSTED_QUALIFIED_PROFILE_SHA256S),
+            )
+            for profile in profiles
+        )
+        if output_format == "json":
+            receipt = make_receipt(
+                "ocr_execution_profile_registry",
+                {
+                    "search_paths": [str(path) for path in paths],
+                    "profiles": list(profiles),
+                    "profile_statuses": list(statuses),
+                },
+            )
+            self._out(receipt_text(receipt))
+            return
+        if not profiles:
+            self._out("No OCR execution profiles were found.")
+            return
+        for profile, status in zip(profiles, statuses, strict=True):
+            supported = ",".join(
+                tier
+                for tier, value in profile["memory_tiers"].items()
+                if value["supported"]
+            )
+            self._out(
+                f"{profile['profile_id']}: "
+                f"pipeline={profile['pipeline_id']}; "
+                f"qualification={profile['qualification']['state']}; "
+                f"tiers={supported or 'none'}; "
+                "trusted_by_current_plugin="
+                f"{'yes' if status['trusted_by_current_plugin'] else 'no'}; "
+                "production_eligible="
+                f"{'yes' if status['production_eligible'] else 'no'}; "
+                f"sha256={profile['profile_sha256']}"
+            )
+
+
+class OcrProfileShow(InvariantAwareCommand):
+    """Show one validated profile and its plugin trust status as JSON."""
+
+    profile_id = None
+    _profile_id = None
+
+    class ProfileIdArg(StringInvariant):
+        _arg = "--profile-id"
+        _help = "Exact portable execution-profile ID."
+
+    profile_dir = None
+    _profile_dir = None
+
+    class ProfileDirArg(StringInvariant):
+        _arg = "--profile-dir"
+        _help = (
+            "Comma-separated profile paths; defaults to bundled profiles "
+            "first, then the XDG directory."
+        )
+        _mandatory = False
+
+    def run(self):
+        from .ocr_backend_setup import make_receipt, receipt_text
+        from .ocr_execution import OcrExecutionError, profile_search_paths
+        from .ocr_profiles import (
+            TRUSTED_QUALIFIED_PROFILE_SHA256S,
+            OcrProfileError,
+            show_execution_profile,
+        )
+
+        try:
+            paths = profile_search_paths(_option_value(self, "profile_dir"))
+            profile = show_execution_profile(
+                _option_value(self, "profile_id"),
+                paths=tuple(path for path in paths if path.exists()),
+            )
+        except (
+            OSError,
+            ValueError,
+            OcrExecutionError,
+            OcrProfileError,
+        ) as exc:
+            raise CommandError(str(exc)) from exc
+        receipt = make_receipt(
+            "ocr_execution_profile_detail",
+            {
+                "profile": profile,
+                "profile_status": _profile_plugin_status(
+                    profile,
+                    trusted_profile_sha256s=(
+                        TRUSTED_QUALIFIED_PROFILE_SHA256S
+                    ),
+                ),
+            },
+        )
+        self._out(receipt_text(receipt))
+
+
+class OcrProfileQualify(InvariantAwareCommand):
+    """Create a source-review candidate from a provisional GPU profile.
+
+    Qualification is deliberately two-step. This command verifies complete
+    repeated evidence and writes a sealed qualified candidate; production
+    trust still requires checking that profile and its exact hash into the
+    plugin's reviewed profile registry.
+    """
+
+    profile = None
+    _profile = None
+
+    class ProfileArg(StringInvariant):
+        _help = "Absolute path to a sealed provisional execution profile."
+
+    output = None
+    _output = None
+
+    class OutputArg(StringInvariant):
+        _help = "New absolute path for the qualified review candidate."
+
+    reviewed_evidence = None
+
+    class ReviewedEvidenceArg(BoolInvariant):
+        _arg = "--reviewed-evidence"
+        _help = (
+            "Acknowledge manual review of the referenced immutable tuning "
+            "evidence. [default: %default]"
+        )
+        _mandatory = False
+        _default = False
+
+    def run(self):
+        from .ocr_backend_setup import make_receipt, receipt_text
+        from .ocr_profiles import (
+            TRUSTED_QUALIFIED_PROFILE_SHA256S,
+            OcrProfileError,
+            load_execution_profile,
+            qualify_execution_profile,
+            write_execution_profile,
+        )
+
+        if not self.reviewed_evidence:
+            raise CommandError(
+                "--reviewed-evidence is required after manually reviewing "
+                "the immutable tuning summaries and artifacts"
+            )
+        source = Path(_option_value(self, "profile")).expanduser()
+        destination = Path(_option_value(self, "output")).expanduser()
+        if not source.is_absolute() or not destination.is_absolute():
+            raise CommandError("profile qualification paths must be absolute")
+        try:
+            provisional = load_execution_profile(source)
+            qualified = qualify_execution_profile(provisional)
+            written = write_execution_profile(qualified, destination)
+        except (OSError, ValueError, OcrProfileError) as exc:
+            raise CommandError(str(exc)) from exc
+        digest = written["profile_sha256"]
+        receipt = make_receipt(
+            "ocr_execution_profile_qualification_candidate",
+            {
+                "source_path": str(source.resolve(strict=True)),
+                "source_profile_sha256": provisional["profile_sha256"],
+                "output_path": str(destination.resolve(strict=True)),
+                "qualified_profile_sha256": digest,
+                "trusted_by_current_plugin": (
+                    digest in TRUSTED_QUALIFIED_PROFILE_SHA256S
+                ),
+                "next_gate": (
+                    "review and check in the profile, then add its exact "
+                    "hash to TRUSTED_QUALIFIED_PROFILE_SHA256S"
+                ),
+            },
+        )
+        self._out(receipt_text(receipt))
+
+
+class OcrHardwareProbe(InvariantAwareCommand):
+    """Probe one NVIDIA GPU and calculate 25%, 50%, and max OCR budgets.
+
+    The probe imports no model runtime in the CLI process. When
+    `--torch-python` is supplied it launches that interpreter in an isolated,
+    secret-scrubbed subprocess. Multi-GPU hosts must select exactly one
+    device.
+    """
+
+    torch_python = None
+    _torch_python = None
+
+    class TorchPythonArg(StringInvariant):
+        _help = (
+            "Backend Python used for an isolated memory-topology probe; "
+            "without it tier budgets remain unavailable."
+        )
+        _mandatory = False
+
+    cuda_visible_devices = None
+    _cuda_visible_devices = None
+
+    class CudaVisibleDevicesArg(StringInvariant):
+        _help = "Exact CUDA_VISIBLE_DEVICES selection; defaults to ambient."
+        _mandatory = False
+
+    output = None
+    _output = None
+
+    class OutputArg(StringInvariant):
+        _help = "Optional new absolute path for the JSON receipt."
+        _mandatory = False
+
+    def run(self):
+        from .ocr_backend_setup import _atomic_write_new_bytes, json_bytes
+        from .ocr_hardware import (
+            HardwareProbeError,
+            calculate_memory_tiers,
+            make_hardware_receipt,
+            probe_nvidia_hardware,
+        )
+        from .ocr_path_security import (
+            TrustedPathError,
+            prepare_trusted_directory,
+            reject_protected_corpus_overlap,
+        )
+
+        visible_devices = _option_value(
+            self,
+            "cuda_visible_devices",
+        )
+        try:
+            output = _option_value(self, "output")
+            output_path = Path(output).expanduser() if output else None
+            if output_path is not None:
+                reject_protected_corpus_overlap(
+                    output_path,
+                    label="hardware probe output",
+                )
+                output_parent = prepare_trusted_directory(
+                    output_path.parent,
+                    label="hardware probe output parent",
+                )
+                output_path = output_parent / output_path.name
+            observation = probe_nvidia_hardware(
+                torch_python=_option_value(self, "torch_python"),
+                visible_devices=visible_devices,
+                cuda_device_order=(
+                    "PCI_BUS_ID" if visible_devices is not None else None
+                ),
+            )
+            budgets = calculate_memory_tiers(observation)
+            receipt = make_hardware_receipt(
+                observation,
+                memory_budgets=budgets,
+            )
+            if output_path is not None:
+                _atomic_write_new_bytes(
+                    output_path,
+                    json_bytes(receipt, pretty=True),
+                )
+        except (
+            OSError,
+            ValueError,
+            HardwareProbeError,
+            TrustedPathError,
+        ) as exc:
+            raise CommandError(str(exc)) from exc
+        self._out(json_bytes(receipt, pretty=True).decode("utf-8").rstrip())
+
+
+class OcrProfileTune(InvariantAwareCommand):
+    """Tune local OCR execution profiles on one previously unknown GPU.
+
+    Candidate processes use immutable scratch directories and may be resumed.
+    The checked-in three-page suite produces provisional hardware evidence;
+    it does not by itself create a new model-quality qualification.
+    """
+
+    _verbose_ = True
+
+    pipeline = None
+    _pipeline = None
+
+    class PipelineArg(StringInvariant):
+        _help = "Pipeline to tune. [default: %default]"
+        _mandatory = False
+        _default = "local-mineru25"
+
+    manifest = None
+    _manifest = None
+
+    class ManifestArg(StringInvariant):
+        _help = "Hash-pinned benchmark manifest JSONL."
+
+    input_root = None
+    _input_root = None
+
+    class InputRootArg(DirectoryInvariant):
+        _help = "Read-only benchmark input root."
+
+    dest_dir = None
+    _dest_dir = None
+
+    class DestDirArg(StringInvariant):
+        _help = "Absolute empty or matching resumable scratch directory."
+
+    installation_registry = None
+    _installation_registry = None
+
+    class InstallationRegistryArg(StringInvariant):
+        _arg = "--installation-registry"
+        _help = (
+            "Validated machine-local OCR installation registry; defaults "
+            "to the XDG registry."
+        )
+        _mandatory = False
+
+    deepseek_python = None
+    _deepseek_python = None
+
+    class DeepseekPythonArg(StringInvariant):
+        _help = "Explicit raw-fallback DeepSeek/vLLM Python executable."
+        _mandatory = False
+
+    deepseek_cache_dir = None
+    _deepseek_cache_dir = None
+
+    class DeepseekCacheDirArg(DirectoryInvariant):
+        _help = "Explicit raw-fallback DeepSeek Hugging Face cache."
+        _mandatory = False
+
+    mineru_python = None
+    _mineru_python = None
+
+    class MineruPythonArg(StringInvariant):
+        _help = "Explicit raw-fallback MinerU Python executable."
+        _mandatory = False
+
+    mineru_cache_dir = None
+    _mineru_cache_dir = None
+
+    class MineruCacheDirArg(DirectoryInvariant):
+        _help = "Explicit raw-fallback MinerU Hugging Face cache."
+        _mandatory = False
+
+    cuda_visible_devices = None
+    _cuda_visible_devices = None
+
+    class CudaVisibleDevicesArg(StringInvariant):
+        _help = (
+            "Raw fallback only: single physical GPU selection. "
+            "[raw-fallback default: 0]"
+        )
+        _mandatory = False
+
+    device = None
+    _device = None
+
+    class DeviceArg(StringInvariant):
+        _help = (
+            "Raw fallback only: CUDA device within each isolated process. "
+            "[raw-fallback default: cuda:0]"
+        )
+        _mandatory = False
+
+    deepseek_attention_backend = None
+    _deepseek_attention_backend = None
+
+    class DeepseekAttentionBackendArg(StringInvariant):
+        _help = (
+            "Raw fallback only: DeepSeek attention backend or auto. "
+            "[raw-fallback default: auto]"
+        )
+        _mandatory = False
+
+    deepseek_moe_backend = None
+    _deepseek_moe_backend = None
+
+    class DeepseekMoeBackendArg(StringInvariant):
+        _help = (
+            "DeepSeek MoE backend to qualify; must be triton. "
+            "[default: %default]"
+        )
+        _mandatory = False
+        _default = QUALIFIED_DEEPSEEK_MOE_BACKEND
+
+    mineru_attention_backend = None
+    _mineru_attention_backend = None
+
+    class MineruAttentionBackendArg(StringInvariant):
+        _help = (
+            "Raw fallback only: MinerU attention backend. "
+            "[raw-fallback default: sdpa]"
+        )
+        _mandatory = False
+
+    memory_tiers = None
+    _memory_tiers = None
+
+    class MemoryTiersArg(StringInvariant):
+        _help = "Comma-separated memory tiers. [default: %default]"
+        _mandatory = False
+        _default = "25,50,max"
+
+    batch_sizes = None
+    _batch_sizes = None
+
+    class BatchSizesArg(StringInvariant):
+        _help = (
+            "Ascending comma-separated candidate batches. [default: %default]"
+        )
+        _mandatory = False
+        _default = "1,2,4,8"
+
+    discovery_repeats = None
+    _discovery_repeats = None
+
+    class DiscoveryRepeatsArg(PositiveIntegerInvariant):
+        _help = "Cold repeats per discovery candidate. [default: %default]"
+        _mandatory = False
+        _default = 1
+
+    confirmation_repeats = None
+    _confirmation_repeats = None
+
+    class ConfirmationRepeatsArg(PositiveIntegerInvariant):
+        _help = "Required repeats for later confirmation. [default: %default]"
+        _mandatory = False
+        _default = 5
+
+    timeout_seconds = None
+    _timeout_seconds = None
+
+    class TimeoutSecondsArg(PositiveIntegerInvariant):
+        _help = "Per-candidate process timeout. [default: %default]"
+        _mandatory = False
+        _default = 3600
+
+    profile_output = None
+    _profile_output = None
+
+    class ProfileOutputArg(StringInvariant):
+        _arg = "--profile-output"
+        _help = "Absolute output path for the sealed provisional profile."
+        _mandatory = False
+
+    profile_id = None
+    _profile_id = None
+
+    class ProfileIdArg(StringInvariant):
+        _arg = "--profile-id"
+        _help = "Portable ID for the provisional execution profile."
+        _mandatory = False
+
+    profile_display_name = None
+    _profile_display_name = None
+
+    class ProfileDisplayNameArg(StringInvariant):
+        _arg = "--profile-display-name"
+        _help = "Human-readable provisional execution-profile name."
+        _mandatory = False
+
+    dry_run = None
+
+    class DryRunArg(BoolInvariant):
+        _help = (
+            "Print the exact plan without GPU inference. [default: %default]"
+        )
+        _mandatory = False
+        _default = False
+
+    def run(self):
+        from .ocr_backend_setup import json_bytes
+        from .ocr_hardware import (
+            HardwareProbeError,
+            calculate_memory_tiers,
+            probe_nvidia_hardware,
+        )
+        from .ocr_installations import (
+            InstallationRegistryError,
+            build_backend_installation,
+            load_installation_registry,
+        )
+        from .ocr_profiles import get_pipeline_definition
+        from .ocr_tuning import (
+            TuningError,
+            build_tuning_plan,
+            run_tuning_session,
+        )
+
+        try:
+            pipeline = get_pipeline_definition(
+                _option_value(self, "pipeline", "local-mineru25")
+            )["pipeline_id"]
+            if pipeline == "deepseek-vllm-full":
+                raise TuningError(
+                    "deepseek-vllm-full tuning is withheld until its true "
+                    "ungrounded Markdown lane is implemented"
+                )
+            profile_output = _option_value(self, "profile_output")
+            profile_id = _option_value(self, "profile_id")
+            profile_display_name = _option_value(self, "profile_display_name")
+            profile_values = (
+                profile_output,
+                profile_id,
+                profile_display_name,
+            )
+            if any(value is not None for value in profile_values) and not all(
+                value is not None for value in profile_values
+            ):
+                raise TuningError(
+                    "--profile-output, --profile-id, and "
+                    "--profile-display-name must be supplied together"
+                )
+            if (
+                profile_output is not None
+                and not Path(profile_output).expanduser().is_absolute()
+            ):
+                raise TuningError("--profile-output must be an absolute path")
+
+            raw_paths = {
+                "deepseek_python": _option_value(
+                    self, "deepseek_python", private_first=True
+                ),
+                "deepseek_cache_dir": _option_value(
+                    self, "deepseek_cache_dir", private_first=True
+                ),
+                "mineru_python": _option_value(
+                    self, "mineru_python", private_first=True
+                ),
+                "mineru_cache_dir": _option_value(
+                    self, "mineru_cache_dir", private_first=True
+                ),
+            }
+            supplied_raw = {
+                name for name, value in raw_paths.items() if value is not None
+            }
+            registry_path = _option_value(self, "installation_registry")
+            if registry_path is not None and supplied_raw:
+                raise TuningError(
+                    "--installation-registry cannot be combined with raw "
+                    "Python/cache fallback options"
+                )
+            if supplied_raw and len(supplied_raw) != len(raw_paths):
+                missing = sorted(set(raw_paths) - supplied_raw)
+                raise TuningError(
+                    "raw installation fallback requires all Python/cache "
+                    "options; missing " + ", ".join(missing)
+                )
+            runtime_overrides = (
+                ("cuda_visible_devices", "--cuda-visible-devices"),
+                ("device", "--device"),
+                (
+                    "deepseek_attention_backend",
+                    "--deepseek-attention-backend",
+                ),
+                (
+                    "mineru_attention_backend",
+                    "--mineru-attention-backend",
+                ),
+            )
+            if not supplied_raw:
+                rejected = [
+                    option
+                    for name, option in runtime_overrides
+                    if _option_value(self, name) is not None
+                ]
+                if rejected:
+                    raise TuningError(
+                        "registry-backed tuning uses the registered CUDA "
+                        "and attention settings; remove: "
+                        + ", ".join(rejected)
+                    )
+            if supplied_raw:
+                visible = _option_value(self, "cuda_visible_devices", "0")
+                device = _option_value(self, "device", "cuda:0")
+                records = {
+                    "deepseek-vllm": build_backend_installation(
+                        "deepseek-vllm",
+                        python_executable=raw_paths["deepseek_python"],
+                        hf_cache=raw_paths["deepseek_cache_dir"],
+                        cuda_visible_devices=visible,
+                        device=device,
+                        attention_backend=_option_value(
+                            self,
+                            "deepseek_attention_backend",
+                            "auto",
+                        ),
+                    ),
+                    "mineru25-pro-2605": build_backend_installation(
+                        "mineru25-pro-2605",
+                        python_executable=raw_paths["mineru_python"],
+                        hf_cache=raw_paths["mineru_cache_dir"],
+                        cuda_visible_devices=visible,
+                        device=device,
+                        attention_backend=_option_value(
+                            self,
+                            "mineru_attention_backend",
+                            "sdpa",
+                        ),
+                    ),
+                }
+            else:
+                registry = load_installation_registry(
+                    registry_path,
+                    validate_current=True,
+                    missing_ok=False,
+                )
+                records = registry["installations"]
+                required = (
+                    "deepseek-vllm",
+                    "mineru25-pro-2605",
+                )
+                missing = [
+                    backend_id
+                    for backend_id in required
+                    if backend_id not in records
+                ]
+                if missing:
+                    raise TuningError(
+                        "local-mineru25 tuning requires registered backends: "
+                        + ", ".join(missing)
+                    )
+                deepseek_record = records["deepseek-vllm"]
+                mineru_record = records["mineru25-pro-2605"]
+                visible = deepseek_record["cuda"]["visible_devices"]
+                if mineru_record["cuda"]["visible_devices"] != visible:
+                    raise TuningError(
+                        "registered pipeline backends select different GPUs"
+                    )
+            installations = {}
+            for backend_id, attention_default in (
+                ("deepseek-vllm", "auto"),
+                ("mineru25-pro-2605", "sdpa"),
+            ):
+                record = records[backend_id]
+                installations[backend_id] = {
+                    "python_executable": record["python_executable"]["path"],
+                    "cache_dir": record["hf_cache"]["path"],
+                    "cuda_visible_devices": record["cuda"]["visible_devices"],
+                    "device": record["cuda"]["device"],
+                    "attention_backend": (
+                        record["cuda"]["attention_backend"]
+                        or attention_default
+                    ),
+                    "identity": {
+                        "record_sha256": record["record_sha256"],
+                        "python_executable_sha256": record[
+                            "python_executable"
+                        ]["sha256"],
+                        "installed_distributions_count": record[
+                            "python_executable"
+                        ]["installed_distributions_count"],
+                        "installed_distributions_sha256": record[
+                            "python_executable"
+                        ]["installed_distributions_sha256"],
+                        "hf_cache_identity_sha256": record["hf_cache"][
+                            "identity_sha256"
+                        ],
+                        "snapshot_files_sha256": record["snapshot"][
+                            "files_sha256"
+                        ],
+                        "snapshot_weights_sha256": record["snapshot"][
+                            "weights_sha256"
+                        ],
+                        "adapter_sha256": (
+                            record["adapter"]["sha256"]
+                            if record["adapter"] is not None
+                            else None
+                        ),
+                        "implementation_sha256": record["implementation"][
+                            "sha256"
+                        ],
+                    },
+                }
+            observation = probe_nvidia_hardware(
+                torch_python=installations["deepseek-vllm"][
+                    "python_executable"
+                ],
+                visible_devices=visible,
+                cuda_device_order="PCI_BUS_ID",
+            )
+            budgets = calculate_memory_tiers(observation)
+            hardware = {
+                "selector": observation["selector"],
+                "memory_budgets": budgets,
+                "observation_sha256": observation["selector_sha256"],
+                "torch_cuda_total_memory_bytes": observation["memory"][
+                    "total_sources"
+                ].get("torch_cuda"),
+            }
+            tiers = tuple(
+                item.strip()
+                for item in _option_value(
+                    self, "memory_tiers", "25,50,max"
+                ).split(",")
+                if item.strip()
+            )
+            batches = tuple(
+                int(item.strip())
+                for item in _option_value(
+                    self, "batch_sizes", "1,2,4,8"
+                ).split(",")
+                if item.strip()
+            )
+            plan = build_tuning_plan(
+                pipeline_id=pipeline,
+                hardware=hardware,
+                installations=installations,
+                manifest_path=_option_value(self, "manifest"),
+                input_root=_option_value(
+                    self,
+                    "input_root",
+                    private_first=True,
+                ),
+                memory_tiers=tiers,
+                batch_sizes=batches,
+                discovery_repeats=self._discovery_repeats or 1,
+                confirmation_repeats=self._confirmation_repeats or 5,
+                timeout_seconds=self._timeout_seconds or 3600,
+                deepseek_moe_backend=_option_value(
+                    self,
+                    "deepseek_moe_backend",
+                    QUALIFIED_DEEPSEEK_MOE_BACKEND,
+                ),
+            )
+            if self.dry_run:
+                self._out(
+                    json_bytes(plan, pretty=True).decode("utf-8").rstrip()
+                )
+                return
+            summary = run_tuning_session(
+                plan=plan,
+                dest_dir=_option_value(self, "dest_dir"),
+                out=self._out,
+                profile_path=profile_output,
+                profile_id=profile_id,
+                profile_display_name=profile_display_name,
+            )
+        except (
+            OSError,
+            ValueError,
+            HardwareProbeError,
+            InstallationRegistryError,
+            TuningError,
+        ) as exc:
+            raise CommandError(str(exc)) from exc
+        self._out(json_bytes(summary, pretty=True).decode("utf-8").rstrip())
+        if not summary["complete"]:
+            raise CommandError(
+                "OCR profile tuning is incomplete; partial evidence was "
+                "preserved for a safe resume"
+            )
+
+
 class OcrBackendCreateEnv(InvariantAwareCommand):
     """Create a dedicated environment for a pinned OCR backend.
 
@@ -1685,14 +3464,20 @@ class OcrBackendCreateEnv(InvariantAwareCommand):
     _editable_root = None
 
     class EditableRootArg(StringInvariant):
-        _help = "DeepSeek only: install this plugin checkout editable."
+        _help = (
+            "DeepSeek only: install this exact checkout editable; use this "
+            "path for source-based GPU profile qualification."
+        )
         _mandatory = False
 
     package_spec = None
     _package_spec = None
 
     class PackageSpecArg(StringInvariant):
-        _help = "DeepSeek only: plugin package spec to install."
+        _help = (
+            "DeepSeek only: bootstrap package spec when --editable-root is "
+            "omitted; the mutable default is not a qualification source."
+        )
         _mandatory = False
         _default = "sneeze-plugin-tpn[pdf,ocr]"
 
@@ -1715,9 +3500,7 @@ class OcrBackendCreateEnv(InvariantAwareCommand):
 
         try:
             backend = get_backend(_option_value(self, "backend"))
-            manager = resolve_manager(
-                _option_value(self, "manager")
-            )
+            manager = resolve_manager(_option_value(self, "manager"))
             env_name = _option_value(
                 self,
                 "env_name",
@@ -2040,14 +3823,20 @@ class DeepseekOcrCreateEnv(InvariantAwareCommand):
     _editable_root = None
 
     class EditableRootArg(StringInvariant):
-        _help = "Install this plugin editable from the given repo root."
+        _help = (
+            "Install this exact checkout editable; use this path for "
+            "source-based GPU profile qualification."
+        )
         _mandatory = False
 
     package_spec = None
     _package_spec = None
 
     class PackageSpecArg(StringInvariant):
-        _help = "Package spec to install if --editable-root is not set."
+        _help = (
+            "Bootstrap package spec if --editable-root is not set; the "
+            "mutable default is not a qualification source."
+        )
         _mandatory = False
         _default = "sneeze-plugin-tpn[pdf,ocr]"
 
@@ -2140,9 +3929,7 @@ class DeepseekOcrDownloadModel(InvariantAwareCommand):
             model=self.model or self._model or DEFAULT_OCR_MODEL,
             local_dir=self._local_dir or self.local_dir,
             revision=(
-                self._revision
-                or self.revision
-                or DEFAULT_OCR_MODEL_REVISION
+                self._revision or self.revision or DEFAULT_OCR_MODEL_REVISION
             ),
             env_name=self._env_name or self.env_name,
             manager=self._manager or self.manager,
@@ -2335,16 +4122,28 @@ def _option_value(
     *,
     private_first: bool = False,
 ):
-    names = (
-        (f"_{name}", name)
-        if private_first
-        else (name, f"_{name}")
-    )
+    names = (f"_{name}", name) if private_first else (name, f"_{name}")
     for attr_name in names:
         value = getattr(command, attr_name, None)
         if value not in (None, ""):
             return value
     return default
+
+
+def _set_process_environment(
+    values: dict[str, str],
+) -> dict[str, str | None]:
+    previous = {name: os.environ.get(name) for name in values}
+    os.environ.update(values)
+    return previous
+
+
+def _restore_process_environment(values: dict[str, str | None]) -> None:
+    for name, value in values.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 def _maybe_float(value, default=None):
@@ -2356,6 +4155,12 @@ def _maybe_float(value, default=None):
         raise CommandError(f"Expected a float, got {value!r}") from exc
 
 
+def _profile_backend_value(value):
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return None
+    return value
+
+
 def _paths_overlap(left: str, right: str) -> bool:
     left = os.path.realpath(left)
     right = os.path.realpath(right)
@@ -2364,6 +4169,198 @@ def _paths_overlap(left: str, right: str) -> bool:
     except ValueError:
         return False
     return common in {left, right}
+
+
+def _preflight_markdown_provider_run_dir(
+    run_dir: str | os.PathLike[str],
+    *,
+    source_dir: str,
+    dest_dir: str,
+) -> Path:
+    """Resolve and reject unsafe evidence locations without writing."""
+
+    candidate = Path(run_dir).expanduser()
+    if not candidate.is_absolute():
+        raise CommandError(
+            "Markdown provider evidence directory must be absolute"
+        )
+    resolved = Path(os.path.realpath(candidate))
+    for label, root in (
+        ("source", source_dir),
+        ("destination", dest_dir),
+    ):
+        if _paths_overlap(str(resolved), os.path.abspath(root)):
+            raise CommandError(
+                "Markdown provider evidence directory must be "
+                f"separate from the OCR {label} directory"
+            )
+    from .ocr_path_security import (
+        TrustedPathError,
+        reject_protected_corpus_overlap,
+    )
+
+    try:
+        reject_protected_corpus_overlap(
+            resolved,
+            label="Markdown provider evidence directory",
+        )
+    except TrustedPathError as exc:
+        raise CommandError(str(exc)) from exc
+    return resolved
+
+
+def _create_profile_runtime_root(
+    parent: Path,
+    *,
+    source_dir: str,
+    dest_dir: str,
+) -> Path:
+    """Create a preflighted private directory for generated profile files."""
+
+    canonical_parent = Path(os.path.realpath(parent.expanduser()))
+    for _attempt in range(100):
+        candidate = canonical_parent / (
+            ".sneeze-ocr-profile-" + secrets.token_hex(12)
+        )
+        _preflight_markdown_provider_run_dir(
+            candidate,
+            source_dir=source_dir,
+            dest_dir=dest_dir,
+        )
+        try:
+            canonical_parent.mkdir(parents=True, exist_ok=True)
+            candidate.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise CommandError(
+                f"Could not create OCR profile runtime directory: {exc}"
+            ) from exc
+        return candidate
+    raise CommandError("Could not allocate OCR profile runtime directory")
+
+
+def _stage_grounded_ocr_tasks(tasks):
+    """Redirect structured grounded OCR into private same-filesystem files."""
+
+    from .ocr_vllm import OcrPageTask
+
+    staged = []
+    candidates: dict[str, str] = {}
+    try:
+        for task in tasks:
+            directory = os.path.dirname(task.output_path) or "."
+            os.makedirs(directory, exist_ok=True)
+            descriptor, candidate = tempfile.mkstemp(
+                dir=directory,
+                prefix=f".{os.path.basename(task.output_path)}.",
+                suffix=".grounded-candidate",
+            )
+            os.close(descriptor)
+            candidates[task.output_path] = candidate
+            staged.append(
+                OcrPageTask(
+                    image_path=task.image_path,
+                    output_path=candidate,
+                    text_source_path=task.text_source_path,
+                )
+            )
+    except BaseException as exc:
+        _discard_grounded_ocr_candidates(
+            candidates,
+            original_error=exc,
+        )
+        raise
+    return staged, candidates
+
+
+def _discard_grounded_ocr_candidates(
+    candidates,
+    *,
+    original_error: BaseException | None = None,
+) -> None:
+    """Remove unowned staged OCR files after an interrupted generation."""
+
+    for candidate in candidates.values():
+        try:
+            os.unlink(candidate)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            if original_error is not None:
+                original_error.add_note(
+                    "could not remove staged OCR candidate "
+                    f"{os.path.basename(candidate)}: {exc}"
+                )
+
+
+def _finalize_grounded_ocr_candidates(processor, candidates) -> None:
+    """Validate and atomically promote staged structured grounded OCR."""
+
+    from .ocr_vllm import file_sha256, read_optional_text
+
+    for persisted_path, candidate_path in candidates.items():
+        raw_metadata = processor.generation_metadata.pop(
+            candidate_path,
+            None,
+        )
+        metadata = (
+            dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+        )
+        flags = []
+        if metadata.get("status") != "completed":
+            flags.append("grounded_ocr_generation_failed")
+        termination = metadata.get("termination")
+        if (
+            not isinstance(termination, Mapping)
+            or termination.get("eos") is not True
+        ):
+            flags.append("grounded_ocr_non_eos_termination")
+        if (
+            isinstance(termination, Mapping)
+            and termination.get("max_tokens") is True
+        ):
+            flags.append("grounded_ocr_max_tokens_termination")
+        candidate_text = read_optional_text(candidate_path)
+        if not isinstance(candidate_text, str) or not candidate_text.strip():
+            flags.append("grounded_ocr_candidate_empty")
+        flags = list(dict.fromkeys(flags))
+        candidate_sha256 = file_sha256(candidate_path)
+        persisted_before = file_sha256(persisted_path)
+        promoted = False
+        if not flags:
+            try:
+                _atomic_write_text(persisted_path, candidate_text)
+                promoted = True
+            except OSError as exc:
+                flags.append("grounded_ocr_promotion_failed: " + str(exc))
+        candidate_retained = True
+        if promoted:
+            try:
+                os.unlink(candidate_path)
+                candidate_retained = False
+            except FileNotFoundError:
+                candidate_retained = False
+            except OSError:
+                # Promotion is already durable. A private diagnostic copy is
+                # harmless and is truthfully recorded below.
+                candidate_retained = True
+        metadata["validation"] = {
+            "status": "fail" if flags else "pass",
+            "flags": flags,
+        }
+        metadata["promotion"] = {
+            "promoted": promoted,
+            "candidate_path": (
+                candidate_path if candidate_retained else None
+            ),
+            "candidate_sha256": candidate_sha256,
+            "persisted_output_sha256_before": persisted_before,
+            "persisted_output_sha256": file_sha256(persisted_path),
+        }
+        if flags:
+            metadata["status"] = "error"
+        processor.generation_metadata[persisted_path] = metadata
 
 
 def _atomic_write_text(path: str, text: str) -> None:
