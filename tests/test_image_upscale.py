@@ -8,18 +8,42 @@ from io import StringIO
 import pytest
 
 
-def test_setup_dry_run_is_reproducible_and_does_not_write(tmp_path):
-    from sneeze.tpn.upscale.image_upscale import (
-        MODEL_SHA256,
-        MODEL_URL,
-        PYPI_INDEX_URL,
-        PYTORCH_INDEX_URL,
-        setup_upscaler,
+def _make_trusted_test_runtime(tmp_path):
+    runtime = tmp_path / "runtime"
+    python_base = tmp_path / "python-base"
+    python_home = python_base / "bin"
+    python_home.mkdir(parents=True)
+    managed_python = python_home / "python3.12"
+    managed_python.write_bytes(b"")
+    managed_python.chmod(0o700)
+    python = runtime / "bin/python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(managed_python)
+    (python.parent / "python3").symlink_to("python")
+    (runtime / "pyvenv.cfg").write_text(
+        f"home = {python_home}\n",
+        encoding="utf-8",
+    )
+    return runtime, python
+
+
+def test_setup_dry_run_is_reproducible_and_does_not_write(
+    tmp_path, monkeypatch
+):
+    from sneeze.tpn.upscale import image_upscale
+
+    uv = tmp_path / "uv-test"
+    uv.write_bytes(b"")
+    uv.chmod(0o700)
+    monkeypatch.setattr(
+        image_upscale.shutil,
+        "which",
+        lambda _executable: str(uv),
     )
 
     runtime = tmp_path / "runtime"
     models = tmp_path / "models"
-    receipt = setup_upscaler(
+    receipt = image_upscale.setup_upscaler(
         runtime_dir=runtime,
         model_cache=models,
         uv_executable="uv-test",
@@ -27,18 +51,26 @@ def test_setup_dry_run_is_reproducible_and_does_not_write(tmp_path):
     )
 
     assert receipt["dry_run"] is True
-    assert receipt["model"]["sha256"] == MODEL_SHA256
-    assert receipt["model"]["download_mirror"]["url"] == MODEL_URL
+    assert receipt["model"]["sha256"] == image_upscale.MODEL_SHA256
+    assert (
+        receipt["model"]["download_mirror"]["url"] == image_upscale.MODEL_URL
+    )
     assert receipt["model"]["upstream"]["repository"] == "XPixelGroup/HAT"
     assert "official Google Drive" in receipt["model"]["sha256_provenance"]
-    assert receipt["runtime"]["pytorch_index_url"] == PYTORCH_INDEX_URL
-    assert receipt["runtime"]["pypi_index_url"] == PYPI_INDEX_URL
+    assert (
+        receipt["runtime"]["pytorch_index_url"]
+        == image_upscale.PYTORCH_INDEX_URL
+    )
+    assert (
+        receipt["runtime"]["pypi_index_url"] == image_upscale.PYPI_INDEX_URL
+    )
     assert receipt["commands"][0] == [
-        "uv-test",
+        str(uv),
         "--no-config",
         "venv",
+        "--managed-python",
         "--python",
-        "3.12",
+        "3.12.13",
         str(runtime),
     ]
     assert "torch==2.11.0" in receipt["commands"][1]
@@ -46,14 +78,14 @@ def test_setup_dry_run_is_reproducible_and_does_not_write(tmp_path):
         receipt["commands"][1][
             receipt["commands"][1].index("--default-index") + 1
         ]
-        == PYTORCH_INDEX_URL
+        == image_upscale.PYTORCH_INDEX_URL
     )
     assert "spandrel==0.4.2" in receipt["commands"][2]
     assert (
         receipt["commands"][2][
             receipt["commands"][2].index("--default-index") + 1
         ]
-        == PYPI_INDEX_URL
+        == image_upscale.PYPI_INDEX_URL
     )
     assert not runtime.exists()
     assert not models.exists()
@@ -65,9 +97,10 @@ def test_setup_sanitizes_package_resolution_environment(
     from sneeze.tpn.upscale import image_upscale
 
     runtime = tmp_path / "runtime"
+    uv = tmp_path / "uv"
+    uv.write_bytes(b"")
+    uv.chmod(0o700)
     python = runtime / "bin/python"
-    python.parent.mkdir(parents=True)
-    python.write_bytes(b"")
     calls = []
     hostile_names = (
         "PIP_INDEX_URL",
@@ -81,9 +114,14 @@ def test_setup_sanitizes_package_resolution_environment(
     monkeypatch.setattr(
         image_upscale.shutil,
         "which",
-        lambda _executable: "/resolved/uv",
+        lambda _executable: str(uv),
     )
     monkeypatch.setattr(image_upscale, "_ensure_model", lambda _path: None)
+    monkeypatch.setattr(
+        image_upscale,
+        "_validate_upscale_trust",
+        lambda **_kwargs: None,
+    )
     monkeypatch.setattr(
         image_upscale,
         "model_identity",
@@ -93,7 +131,7 @@ def test_setup_sanitizes_package_resolution_environment(
     probe = {
         "cuda_available": True,
         "gpu": {"bfloat16_supported": True},
-        "python": "3.12.8",
+        "python": "3.12.13",
         "torch": "2.11.0+cu130",
         "torch_cuda": "13.0",
         "torchvision": "0.26.0+cu130",
@@ -104,6 +142,12 @@ def test_setup_sanitizes_package_resolution_environment(
 
     def runner(argv, **kwargs):
         calls.append((argv, kwargs))
+        if "venv" in argv:
+            created_runtime, created_python = _make_trusted_test_runtime(
+                tmp_path
+            )
+            assert created_runtime == runtime
+            assert created_python == python
         stdout = json.dumps(probe) if "--probe" in argv else ""
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
@@ -113,15 +157,124 @@ def test_setup_sanitizes_package_resolution_environment(
         command_runner=runner,
     )
 
-    assert len(calls) == 3
+    assert len(calls) == 4
     for _argv, kwargs in calls:
         assert kwargs["env"]["CUDA_VISIBLE_DEVICES"] == "0"
         for name in hostile_names:
             assert name not in kwargs["env"]
 
 
+def test_setup_rejects_untrusted_existing_runtime_before_commands(
+    tmp_path, monkeypatch
+):
+    from sneeze.tpn.upscale import image_upscale
+
+    uv = tmp_path / "uv"
+    uv.write_bytes(b"")
+    uv.chmod(0o700)
+    runtime, python = _make_trusted_test_runtime(tmp_path)
+    python.chmod(0o720)
+    called = False
+
+    monkeypatch.setattr(
+        image_upscale.shutil,
+        "which",
+        lambda _executable: str(uv),
+    )
+
+    def runner(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    with pytest.raises(image_upscale.ImageUpscaleError, match="not trusted"):
+        image_upscale.setup_upscaler(
+            runtime_dir=runtime,
+            model_cache=tmp_path / "models",
+            command_runner=runner,
+        )
+
+    assert called is False
+
+
+def test_setup_rejects_untrusted_fresh_runtime_parent_before_commands(
+    tmp_path, monkeypatch
+):
+    from sneeze.tpn.upscale import image_upscale
+
+    uv = tmp_path / "uv"
+    uv.write_bytes(b"")
+    uv.chmod(0o700)
+    unsafe_parent = tmp_path / "unsafe"
+    unsafe_parent.mkdir()
+    unsafe_parent.chmod(0o770)
+    called = False
+
+    monkeypatch.setattr(
+        image_upscale.shutil,
+        "which",
+        lambda _executable: str(uv),
+    )
+
+    def runner(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    with pytest.raises(image_upscale.ImageUpscaleError, match="not trusted"):
+        image_upscale.setup_upscaler(
+            runtime_dir=unsafe_parent / "runtime",
+            model_cache=tmp_path / "models",
+            command_runner=runner,
+        )
+
+    assert called is False
+
+
+def test_setup_secures_uv_runtime_lock_without_following_symlinks(tmp_path):
+    import stat
+
+    from sneeze.tpn.upscale import image_upscale
+
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    lock = runtime / ".lock"
+    lock.write_bytes(b"")
+    lock.chmod(0o666)
+
+    image_upscale._secure_runtime_lock(runtime)
+
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+
+    lock.unlink()
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"owned")
+    victim.chmod(0o644)
+    lock.symlink_to(victim)
+
+    with pytest.raises(image_upscale.ImageUpscaleError, match="secure"):
+        image_upscale._secure_runtime_lock(runtime)
+
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+
+
+def test_runtime_trust_rejects_external_interpreter_symlink_chain(tmp_path):
+    from sneeze.tpn.upscale import image_upscale
+
+    runtime, python = _make_trusted_test_runtime(tmp_path)
+    python.unlink()
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o770)
+    intermediate = shared / "interpreter"
+    intermediate.symlink_to("/usr/bin/python3")
+    python.symlink_to(intermediate)
+
+    with pytest.raises(image_upscale.ImageUpscaleError, match="not trusted"):
+        image_upscale._validate_runtime_trust(runtime, python)
+
+
 def test_model_download_is_hash_verified_and_atomic(tmp_path, monkeypatch):
     import hashlib
+    import stat
     from io import BytesIO
 
     from sneeze.tpn.upscale import image_upscale
@@ -135,10 +288,14 @@ def test_model_download_is_hash_verified_and_atomic(tmp_path, monkeypatch):
         "urlopen",
         lambda *_args, **_kwargs: BytesIO(payload),
     )
+    process_status = tmp_path / "proc-status"
+    process_status.write_text("Name:\ttest\nUmask:\t0027\n", encoding="ascii")
+    monkeypatch.setattr(image_upscale, "_PROC_STATUS", process_status)
 
     image_upscale._ensure_model(model)
 
     assert model.read_bytes() == payload
+    assert stat.S_IMODE(model.stat().st_mode) == 0o640
     assert not list(model.parent.glob(".*.download"))
 
 
@@ -192,7 +349,7 @@ def test_runtime_probe_requires_pinned_cuda_bf16_tuple():
     qualified = {
         "cuda_available": True,
         "gpu": {"bfloat16_supported": True},
-        "python": "3.12.8",
+        "python": "3.12.13",
         "torch": "2.11.0+cu130",
         "torch_cuda": "13.0",
         "torchvision": "0.26.0+cu130",
@@ -272,6 +429,7 @@ def test_default_output_is_non_destructive_sibling(tmp_path):
 
     source = tmp_path / "slide.png"
     assert default_output_path(source) == tmp_path / "slide-4k.png"
+    assert default_output_path(source, 2560) == tmp_path / "slide-2560w.png"
 
     target_dir = tmp_path / "shared"
     target_dir.mkdir()
@@ -323,6 +481,49 @@ def test_run_upscale_rejects_symlink_output_before_runtime(
         assert target.read_bytes() == b"unrelated"
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    (
+        ({"output": "output.jpg"}, r"\.png suffix"),
+        ({"target_width": 0}, "greater than zero"),
+        (
+            {"tile_size": 64, "tile_overlap": 64},
+            "smaller than tile size",
+        ),
+        ({"dtype": "float16"}, "Dtype must be"),
+    ),
+)
+def test_run_upscale_rejects_invalid_options_before_runtime(
+    tmp_path, kwargs, message
+):
+    from sneeze.tpn.upscale.image_upscale import (
+        ImageUpscaleError,
+        run_upscale,
+    )
+
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    invocation = dict(kwargs)
+    if "output" in invocation:
+        invocation["output"] = tmp_path / invocation["output"]
+
+    with pytest.raises(ImageUpscaleError, match=message):
+        run_upscale(source=source, **invocation)
+
+
+def test_run_upscale_rejects_source_as_output_before_runtime(tmp_path):
+    from sneeze.tpn.upscale.image_upscale import (
+        ImageUpscaleError,
+        run_upscale,
+    )
+
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+
+    with pytest.raises(ImageUpscaleError, match="must be different"):
+        run_upscale(source=source, output=source, force=True)
+
+
 def test_run_upscale_validates_model_hash_before_child(tmp_path):
     from sneeze.tpn.upscale.image_upscale import (
         ImageUpscaleError,
@@ -331,10 +532,7 @@ def test_run_upscale_validates_model_hash_before_child(tmp_path):
 
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
-    runtime = tmp_path / "runtime"
-    python = runtime / "bin/python"
-    python.parent.mkdir(parents=True)
-    python.write_bytes(b"")
+    runtime, python = _make_trusted_test_runtime(tmp_path)
     models = tmp_path / "models"
     models.mkdir()
     (models / "HAT-L_SRx2_ImageNet-pretrain.pth").write_bytes(b"wrong")
@@ -347,6 +545,45 @@ def test_run_upscale_validates_model_hash_before_child(tmp_path):
         )
 
 
+def test_run_upscale_rejects_untrusted_runtime_before_child(
+    tmp_path, monkeypatch
+):
+    from sneeze.tpn.upscale import image_upscale
+
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    runtime, python = _make_trusted_test_runtime(tmp_path)
+    python.chmod(0o720)
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / image_upscale.MODEL_FILENAME).write_bytes(b"model")
+    called = False
+
+    monkeypatch.setattr(
+        image_upscale,
+        "model_identity",
+        lambda *_args, **_kwargs: {},
+    )
+
+    def runner(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    with pytest.raises(
+        image_upscale.ImageUpscaleError,
+        match="not trusted",
+    ):
+        image_upscale.run_upscale(
+            source=source,
+            output=tmp_path / "output.png",
+            runtime_dir=runtime,
+            model_cache=models,
+            command_runner=runner,
+        )
+
+    assert called is False
+
+
 def test_run_upscale_launches_isolated_runtime_and_writes_receipt(
     tmp_path,
     monkeypatch,
@@ -356,10 +593,7 @@ def test_run_upscale_launches_isolated_runtime_and_writes_receipt(
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
     output = tmp_path / "source-4k.png"
-    runtime = tmp_path / "runtime"
-    python = runtime / "bin/python"
-    python.parent.mkdir(parents=True)
-    python.write_bytes(b"")
+    runtime, python = _make_trusted_test_runtime(tmp_path)
     models = tmp_path / "models"
     models.mkdir()
     model = models / image_upscale.MODEL_FILENAME
@@ -367,6 +601,9 @@ def test_run_upscale_launches_isolated_runtime_and_writes_receipt(
     receipt_path = tmp_path / "receipt.json"
     calls = []
     reported_dimensions = [3840, 2160]
+    reported_implementation_hash = [
+        image_upscale.file_sha256(image_upscale.runtime_script())
+    ]
     for name in ("PYTHONPATH", "PYTHONHOME", "__PYVENV_LAUNCHER__"):
         monkeypatch.setenv(name, "/hostile-parent-python-path")
 
@@ -380,6 +617,10 @@ def test_run_upscale_launches_isolated_runtime_and_writes_receipt(
         calls.append((argv, kwargs))
         output.write_bytes(b"upscaled")
         payload = {
+            "implementation": {
+                "path": str(image_upscale.runtime_script()),
+                "sha256": reported_implementation_hash[0],
+            },
             "source": {
                 "path": str(source),
                 "sha256": image_upscale.file_sha256(source),
@@ -431,6 +672,21 @@ def test_run_upscale_launches_isolated_runtime_and_writes_receipt(
             command_runner=runner,
         )
 
+    output.unlink()
+    reported_dimensions[1] = 2160
+    reported_implementation_hash[0] = "0" * 64
+    with pytest.raises(
+        image_upscale.ImageUpscaleError,
+        match="implementation identity",
+    ):
+        image_upscale.run_upscale(
+            source=source,
+            output=output,
+            runtime_dir=runtime,
+            model_cache=models,
+            command_runner=runner,
+        )
+
 
 def test_run_upscale_preserves_receipt_that_appears_during_inference(
     tmp_path,
@@ -442,10 +698,7 @@ def test_run_upscale_preserves_receipt_that_appears_during_inference(
     source.write_bytes(b"source")
     output = tmp_path / "source-4k.png"
     receipt_path = tmp_path / "receipt.json"
-    runtime = tmp_path / "runtime"
-    python = runtime / "bin/python"
-    python.parent.mkdir(parents=True)
-    python.write_bytes(b"")
+    runtime, python = _make_trusted_test_runtime(tmp_path)
     models = tmp_path / "models"
     models.mkdir()
     (models / image_upscale.MODEL_FILENAME).write_bytes(b"model")
@@ -460,6 +713,12 @@ def test_run_upscale_preserves_receipt_that_appears_during_inference(
         output.write_bytes(b"upscaled")
         receipt_path.write_text("owned", encoding="utf-8")
         payload = {
+            "implementation": {
+                "path": str(image_upscale.runtime_script()),
+                "sha256": image_upscale.file_sha256(
+                    image_upscale.runtime_script()
+                ),
+            },
             "source": {
                 "path": str(source),
                 "sha256": image_upscale.file_sha256(source),
@@ -507,13 +766,13 @@ def test_runtime_png_publish_honors_umask_and_is_atomic(
     output = tmp_path / "output.png"
     temporary.write_bytes(b"complete")
     output.write_bytes(b"owned")
-    observed_umasks = []
-
-    def fake_umask(value):
-        observed_umasks.append(value)
-        return 0o027
-
-    monkeypatch.setattr(image_upscale_runtime.os, "umask", fake_umask)
+    process_status = tmp_path / "proc-status"
+    process_status.write_text("Name:\ttest\nUmask:\t0027\n", encoding="ascii")
+    monkeypatch.setattr(
+        image_upscale_runtime,
+        "_PROC_STATUS",
+        process_status,
+    )
 
     with pytest.raises(ValueError, match="Output appeared during upscale"):
         image_upscale_runtime._publish_png(
@@ -528,7 +787,6 @@ def test_runtime_png_publish_honors_umask_and_is_atomic(
 
     assert output.read_bytes() == b"complete"
     assert stat.S_IMODE(output.stat().st_mode) == 0o640
-    assert observed_umasks == [0, 0o027, 0, 0o027]
     assert not temporary.exists()
 
     victim = tmp_path / "victim.png"
@@ -553,13 +811,9 @@ def test_receipt_publish_honors_umask(tmp_path, monkeypatch):
 
     from sneeze.tpn.upscale import image_upscale
 
-    observed_umasks = []
-
-    def fake_umask(value):
-        observed_umasks.append(value)
-        return 0o027
-
-    monkeypatch.setattr(image_upscale.os, "umask", fake_umask)
+    process_status = tmp_path / "proc-status"
+    process_status.write_text("Name:\ttest\nUmask:\t0027\n", encoding="ascii")
+    monkeypatch.setattr(image_upscale, "_PROC_STATUS", process_status)
     receipt = tmp_path / "receipt.json"
 
     image_upscale._write_json_atomic(
@@ -570,7 +824,6 @@ def test_receipt_publish_honors_umask(tmp_path, monkeypatch):
 
     assert json.loads(receipt.read_text(encoding="utf-8")) == {"kind": "test"}
     assert stat.S_IMODE(receipt.stat().st_mode) == 0o640
-    assert observed_umasks == [0, 0o027]
 
 
 def test_run_upscale_refuses_receipt_aliases_before_child(
@@ -582,10 +835,7 @@ def test_run_upscale_refuses_receipt_aliases_before_child(
     source_dir.mkdir()
     source = source_dir / "source.png"
     source.write_bytes(b"source")
-    runtime = tmp_path / "runtime"
-    python = runtime / "bin/python"
-    python.parent.mkdir(parents=True)
-    python.write_bytes(b"")
+    runtime, python = _make_trusted_test_runtime(tmp_path)
     models = tmp_path / "models"
     models.mkdir()
     model = models / image_upscale.MODEL_FILENAME
@@ -653,10 +903,7 @@ def test_run_upscale_rejects_symlink_receipt_before_child(
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
     output = tmp_path / "output.png"
-    runtime = tmp_path / "runtime"
-    python = runtime / "bin/python"
-    python.parent.mkdir(parents=True)
-    python.write_bytes(b"")
+    runtime, python = _make_trusted_test_runtime(tmp_path)
     models = tmp_path / "models"
     models.mkdir()
     (models / image_upscale.MODEL_FILENAME).write_bytes(b"model")

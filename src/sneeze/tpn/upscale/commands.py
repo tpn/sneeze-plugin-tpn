@@ -133,7 +133,10 @@ class Run(InvariantAwareCommand):
     _output = None
 
     class OutputArg(StringInvariant):
-        _help = "Output PNG; defaults to a sibling named <source>-4k.png."
+        _help = (
+            "Output PNG; defaults to <source>-4k.png at 3840 pixels "
+            "or <source>-<width>w.png otherwise."
+        )
         _mandatory = False
 
     target_width = None

@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+_PROC_STATUS = Path("/proc/self/status")
+
 
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -34,8 +36,16 @@ def _destination_path(value: str | os.PathLike[str]) -> Path:
 
 
 def _file_mode_from_umask() -> int:
-    current_umask = os.umask(0)
-    os.umask(current_umask)
+    try:
+        for line in _PROC_STATUS.read_text(encoding="ascii").splitlines():
+            name, separator, value = line.partition(":")
+            if name == "Umask" and separator:
+                current_umask = int(value.strip(), 8)
+                break
+        else:
+            raise ValueError("process status omitted Umask")
+    except (OSError, UnicodeError, ValueError):
+        return 0o600
     return 0o666 & ~current_umask
 
 

@@ -27,7 +27,7 @@ sne-tpn-upscale setup --dry-run
 sne-tpn-upscale setup
 ```
 
-The defaults use Python 3.12, PyTorch 2.11.0 with CUDA 13.0, and Spandrel
+The defaults use Python 3.12.13, PyTorch 2.11.0 with CUDA 13.0, and Spandrel
 0.4.2. The runtime is stored under
 `~/.local/share/sneeze/tpn/upscale/runtime`; the checkpoint is stored under
 `~/.cache/sneeze/tpn/upscale/models`. The setup downloads an immutable mirror
@@ -41,7 +41,13 @@ not state separate terms for the externally hosted checkpoint.
 Setup disables ambient uv configuration, resolves Torch only from the pinned
 PyTorch CUDA index, resolves the remaining packages only from PyPI, and strips
 parent `UV_*`, `PIP_*`, Python-path, virtual-environment, and secret-looking
-variables from every setup and runtime subprocess.
+variables from every setup and runtime subprocess. Fresh environments use the
+exact uv-managed Python 3.12.13 runtime. Before code is executed, setup and run
+validate ownership, write permissions, the interpreter's direct canonical
+target, and symlink confinement across the runtime and Python base. The same
+checks cover the packaged implementation and checkpoint. The parent also
+verifies the implementation hash reported by the isolated child and checks it
+again after inference.
 
 Upscale a 1920x1080 PNG to native x2 4K UHD without replacing the source:
 
@@ -79,8 +85,9 @@ production result and the HAT-L output is retained only as model evidence.
 The command writes PNG output atomically, refuses existing output and receipt
 paths unless `--force` is explicit, and rejects symlink destinations even with
 `--force`. It verifies the checkpoint hash before model loading, honors the
-caller's file-creation umask, and emits a JSON receipt with input, output,
-model, implementation, runtime, GPU, memory, and timing identities.
+caller's file-creation umask for outputs and receipts, keeps the checkpoint
+non-group-writable, and emits a JSON receipt with input, output, model,
+implementation, runtime, GPU, memory, and timing identities.
 
 ## Local OCR architecture
 
