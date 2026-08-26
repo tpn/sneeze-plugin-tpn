@@ -249,27 +249,39 @@ def test_run_upscale_preserves_receipt_that_appears_during_inference(
     assert receipt_path.read_text(encoding="utf-8") == "owned"
 
 
-def test_runtime_png_publish_is_readable_and_atomic(tmp_path):
+def test_runtime_png_publish_honors_umask_and_is_atomic(
+    tmp_path, monkeypatch
+):
     import stat
 
-    from sneeze.tpn.upscale.image_upscale_runtime import _publish_png
+    from sneeze.tpn.upscale import image_upscale_runtime
 
     temporary = tmp_path / "temporary.png"
     output = tmp_path / "output.png"
     temporary.write_bytes(b"complete")
     output.write_bytes(b"owned")
+    observed_umasks = []
+
+    def fake_umask(value):
+        observed_umasks.append(value)
+        return 0o027
+
+    monkeypatch.setattr(image_upscale_runtime.os, "umask", fake_umask)
 
     with pytest.raises(ValueError, match="Output appeared during upscale"):
-        _publish_png(str(temporary), output, force=False)
+        image_upscale_runtime._publish_png(
+            str(temporary), output, force=False
+        )
 
     assert output.read_bytes() == b"owned"
     assert temporary.read_bytes() == b"complete"
 
     output.unlink()
-    _publish_png(str(temporary), output, force=False)
+    image_upscale_runtime._publish_png(str(temporary), output, force=False)
 
     assert output.read_bytes() == b"complete"
-    assert stat.S_IMODE(output.stat().st_mode) == 0o644
+    assert stat.S_IMODE(output.stat().st_mode) == 0o640
+    assert observed_umasks == [0, 0o027, 0, 0o027]
     assert not temporary.exists()
 
 

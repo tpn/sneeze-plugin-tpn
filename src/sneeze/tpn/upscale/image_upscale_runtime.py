@@ -121,7 +121,9 @@ def _run_tiled(model, tensor, *, torch, tile_size: int, overlap: int):
 def _publish_png(temporary_path: str, output: Path, *, force: bool) -> None:
     """Publish one complete PNG without a no-clobber race."""
 
-    os.chmod(temporary_path, 0o644)
+    current_umask = os.umask(0)
+    os.umask(current_umask)
+    os.chmod(temporary_path, 0o666 & ~current_umask)
     if force:
         os.replace(temporary_path, output)
         return
