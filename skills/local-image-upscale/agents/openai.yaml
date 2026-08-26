@@ -1,0 +1,4 @@
+interface:
+  display_name: "Local Image Upscale"
+  short_description: "Create receipt-backed 4K PNGs with HAT-L on CUDA"
+  default_prompt: "Use $local-image-upscale to upscale this raster locally, preserve the source, and inspect the result."
