@@ -2,6 +2,103 @@
 
 Public Sneeze plugin package for `sneeze.tpn`.
 
+## Local 4K image upscaling
+
+Use `sne-tpn-upscale` when the only available input is a raster image. If an
+editable HTML, SVG, or design source exists, rerendering that source at the
+target resolution is the fidelity ceiling and should be preferred.
+
+The local ML path uses the classical x2
+[HAT-L super-resolution model](https://github.com/XPixelGroup/HAT) through
+[Spandrel](https://github.com/chaiNNer-org/spandrel). HAT-L was selected over
+GAN and diffusion upscalers to reduce hallucination risk on diagrams, charts,
+and text-heavy images. It can still oversharpen edges or add ringing, so the
+output must be inspected before replacing a production asset.
+
+`sne-tpn-upscale` is a branded Sneeze entry point shipped by the existing
+`sneeze-plugin-tpn` distribution. Keeping its command module separate leaves
+the sealed OCR command implementation and its qualified profiles unchanged;
+installing or removing the `tpn` plugin manages both command surfaces.
+
+Preview and then create the isolated runtime and model cache:
+
+```bash
+sne-tpn-upscale setup --dry-run
+sne-tpn-upscale setup
+```
+
+The defaults use Python 3.12.13, PyTorch 2.11.0 with CUDA 13.0, and Spandrel
+0.4.2. The runtime is stored under
+`~/.local/share/sneeze/tpn/upscale/runtime`; the checkpoint is stored under
+`~/.cache/sneeze/tpn/upscale/models`. The setup downloads an immutable mirror
+of the official `HAT-L_SRx2_ImageNet-pretrain.pth` checkpoint. Its SHA-256 was
+independently confirmed to match both the official Google Drive artifact and
+the pinned mirror revision:
+`2818c7ca8d72ec4cc5f31c93203d55252a662dd35cda34ce1a69661f97dcd38f`.
+The HAT source repository is Apache-2.0 licensed; the upstream project does
+not state separate terms for the externally hosted checkpoint.
+
+Setup disables ambient uv configuration, resolves Torch only from the pinned
+PyTorch CUDA index, resolves the remaining packages only from PyPI, and strips
+parent package-manager, Python, dynamic-loader, CUDA injection, Torch cache,
+proxy, CA override, virtual-environment, and secret-looking variables from
+every setup and runtime subprocess. Fresh environments use the exact
+uv-managed Python 3.12.13 runtime. Before code is
+executed, setup and run validate ownership, write permissions, the
+interpreter's direct canonical target, and symlink confinement across the
+runtime and Python base. The same checks cover the packaged implementation and
+checkpoint. The parent also verifies the implementation hash reported by the
+isolated child and checks it again after inference.
+
+Upscale a 1920x1080 PNG to native x2 4K UHD without replacing the source:
+
+```bash
+sne-tpn-upscale run \
+  --source ./image.png \
+  --output ./image-4k-hat-l.png \
+  --receipt ./image-4k-hat-l.json
+```
+
+Inputs must use an 8-bit `RGB` or `RGBA` mode; other modes are rejected rather
+than silently converted. HAT-L processes RGB only. For `RGBA` input, the alpha
+channel is resized separately with Lanczos and that handling is recorded in the
+receipt. The target may be the model's native x2 width or a smaller upscale;
+targets beyond native x2 are rejected rather than enlarged a second time.
+
+The Blackwell-qualified defaults select physical GPU 0, expose it as
+`cuda:0`, use BF16, and process the full frame without tiling. On the RTX PRO
+6000 Blackwell Workstation Edition, three full-frame runs were byte-for-byte
+deterministic with a 12.85-second median. That inference timing excludes the
+intentional per-run trust scans, hashes, model load, and PNG publication. Peak
+CUDA memory was 38.85 GiB
+allocated and 54.45 GiB reserved. BF16 agreed with FP32 at 58.14 dB PSNR on
+the qualification crop. Use `--dtype float32` for the conservative numerical
+path. Use `--tile-size 512 --tile-overlap 64` only when the full frame cannot
+fit; that lower-memory path is available but is not part of the full-frame
+Blackwell qualification.
+
+For the text-heavy 1920x1080 qualification image, comparison against a native
+4K rerender showed the expected tradeoff:
+
+| Candidate | PSNR | RGB SSIM | Edge correlation |
+|---|---:|---:|---:|
+| HAT-L x2 BF16 | 23.219 dB | 0.94175 | 0.6150 |
+| Lanczos x2 | 23.969 dB | 0.94025 | 0.6499 |
+
+HAT-L restored sharper type and slightly improved SSIM, but introduced visible
+chromatic ringing around small text. Lanczos was softer and cleaner. These are
+comparative metrics because the native render is not an exact downsample
+ancestor of the source raster. For that asset, the native 4K rerender is the
+production result and the HAT-L output is retained only as model evidence.
+
+The command writes PNG output atomically, refuses existing output and receipt
+paths unless `--force` is explicit, and rejects symlink destinations even with
+`--force`. It verifies the checkpoint hash before model loading, honors the
+caller's group/other file-creation restrictions while preserving owner
+read/write access, keeps the checkpoint non-group-writable, and emits a JSON
+receipt with input, output, model, implementation, runtime, GPU, memory, and
+timing identities.
+
 ## Local OCR architecture
 
 The supported structured pipeline is `local-mineru25`:
