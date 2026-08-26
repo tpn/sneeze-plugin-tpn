@@ -33,6 +33,12 @@ def _destination_path(value: str | os.PathLike[str]) -> Path:
     return lexical.parent.resolve() / lexical.name
 
 
+def _file_mode_from_umask() -> int:
+    current_umask = os.umask(0)
+    os.umask(current_umask)
+    return 0o666 & ~current_umask
+
+
 def probe() -> dict[str, Any]:
     import torch
 
@@ -130,9 +136,7 @@ def _publish_png(temporary_path: str, output: Path, *, force: bool) -> None:
 
     if output.is_symlink():
         raise ValueError(f"Output path must not be a symbolic link: {output}")
-    current_umask = os.umask(0)
-    os.umask(current_umask)
-    os.chmod(temporary_path, 0o666 & ~current_umask)
+    os.chmod(temporary_path, _file_mode_from_umask())
     if force:
         if output.is_symlink():
             raise ValueError(

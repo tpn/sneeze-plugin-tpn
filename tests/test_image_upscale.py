@@ -120,6 +120,69 @@ def test_setup_sanitizes_package_resolution_environment(
             assert name not in kwargs["env"]
 
 
+def test_model_download_is_hash_verified_and_atomic(tmp_path, monkeypatch):
+    import hashlib
+    from io import BytesIO
+
+    from sneeze.tpn.upscale import image_upscale
+
+    payload = b"verified-checkpoint"
+    expected = hashlib.sha256(payload).hexdigest()
+    model = tmp_path / "models" / image_upscale.MODEL_FILENAME
+    monkeypatch.setattr(image_upscale, "MODEL_SHA256", expected)
+    monkeypatch.setattr(
+        image_upscale.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: BytesIO(payload),
+    )
+
+    image_upscale._ensure_model(model)
+
+    assert model.read_bytes() == payload
+    assert not list(model.parent.glob(".*.download"))
+
+
+def test_model_download_mismatch_removes_partial_file(tmp_path, monkeypatch):
+    from io import BytesIO
+
+    from sneeze.tpn.upscale import image_upscale
+
+    model = tmp_path / "models" / image_upscale.MODEL_FILENAME
+    monkeypatch.setattr(image_upscale, "MODEL_SHA256", "0" * 64)
+    monkeypatch.setattr(
+        image_upscale.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: BytesIO(b"tampered"),
+    )
+
+    with pytest.raises(image_upscale.ImageUpscaleError, match="mismatch"):
+        image_upscale._ensure_model(model)
+
+    assert not model.exists()
+    assert not list(model.parent.glob(".*.download"))
+
+
+def test_model_cache_rejects_corrupt_file_and_directory(
+    tmp_path, monkeypatch
+):
+    from sneeze.tpn.upscale import image_upscale
+
+    model = tmp_path / image_upscale.MODEL_FILENAME
+    model.write_bytes(b"corrupt")
+    monkeypatch.setattr(image_upscale, "MODEL_SHA256", "0" * 64)
+
+    with pytest.raises(image_upscale.ImageUpscaleError, match="mismatch"):
+        image_upscale._ensure_model(model)
+
+    model.unlink()
+    model.mkdir()
+    with pytest.raises(
+        image_upscale.ImageUpscaleError,
+        match="not a regular file",
+    ):
+        image_upscale._ensure_model(model)
+
+
 def test_runtime_probe_requires_pinned_cuda_bf16_tuple():
     from sneeze.tpn.upscale.image_upscale import (
         ImageUpscaleError,
@@ -208,6 +271,13 @@ def test_default_output_is_non_destructive_sibling(tmp_path):
     from sneeze.tpn.upscale.image_upscale import default_output_path
 
     source = tmp_path / "slide.png"
+    assert default_output_path(source) == tmp_path / "slide-4k.png"
+
+    target_dir = tmp_path / "shared"
+    target_dir.mkdir()
+    target = target_dir / "target.png"
+    target.write_bytes(b"target")
+    source.symlink_to(target)
     assert default_output_path(source) == tmp_path / "slide-4k.png"
 
 
@@ -476,6 +546,31 @@ def test_runtime_png_publish_honors_umask_and_is_atomic(
     assert symlink_output.is_symlink()
     assert victim.read_bytes() == b"victim"
     assert replacement.read_bytes() == b"replacement"
+
+
+def test_receipt_publish_honors_umask(tmp_path, monkeypatch):
+    import stat
+
+    from sneeze.tpn.upscale import image_upscale
+
+    observed_umasks = []
+
+    def fake_umask(value):
+        observed_umasks.append(value)
+        return 0o027
+
+    monkeypatch.setattr(image_upscale.os, "umask", fake_umask)
+    receipt = tmp_path / "receipt.json"
+
+    image_upscale._write_json_atomic(
+        receipt,
+        {"kind": "test"},
+        force=False,
+    )
+
+    assert json.loads(receipt.read_text(encoding="utf-8")) == {"kind": "test"}
+    assert stat.S_IMODE(receipt.stat().st_mode) == 0o640
+    assert observed_umasks == [0, 0o027]
 
 
 def test_run_upscale_refuses_receipt_aliases_before_child(

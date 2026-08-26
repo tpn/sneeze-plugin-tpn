@@ -110,7 +110,7 @@ def resolve_model_path(value: str | os.PathLike[str] | None) -> Path:
 
 
 def default_output_path(source: str | os.PathLike[str]) -> Path:
-    source_path = _absolute_path(source)
+    source_path = _destination_path(source)
     return source_path.with_name(f"{source_path.stem}-4k.png")
 
 
@@ -293,9 +293,7 @@ def run_upscale(
         raise ImageUpscaleError(f"Source image does not exist: {source_path}")
     source_hash = file_sha256(source_path)
     output_path = (
-        _destination_path(output)
-        if output
-        else default_output_path(source_path)
+        _destination_path(output) if output else default_output_path(source)
     )
     if _paths_alias(output_path, source_path):
         raise ImageUpscaleError("Source and output paths must be different")
@@ -651,6 +649,12 @@ def _reject_symlink_destination(path: Path, label: str) -> None:
         )
 
 
+def _file_mode_from_umask() -> int:
+    current_umask = os.umask(0)
+    os.umask(current_umask)
+    return 0o666 & ~current_umask
+
+
 def _write_json_atomic(
     path: Path,
     payload: Mapping[str, Any],
@@ -674,6 +678,7 @@ def _write_json_atomic(
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(temporary_path, _file_mode_from_umask())
         if force:
             _reject_symlink_destination(path, "Receipt")
             # Replacing the directory entry does not follow a final symlink
