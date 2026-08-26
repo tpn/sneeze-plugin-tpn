@@ -40,14 +40,15 @@ not state separate terms for the externally hosted checkpoint.
 
 Setup disables ambient uv configuration, resolves Torch only from the pinned
 PyTorch CUDA index, resolves the remaining packages only from PyPI, and strips
-parent `UV_*`, `PIP_*`, Python-path, virtual-environment, and secret-looking
-variables from every setup and runtime subprocess. Fresh environments use the
-exact uv-managed Python 3.12.13 runtime. Before code is executed, setup and run
-validate ownership, write permissions, the interpreter's direct canonical
-target, and symlink confinement across the runtime and Python base. The same
-checks cover the packaged implementation and checkpoint. The parent also
-verifies the implementation hash reported by the isolated child and checks it
-again after inference.
+parent package-manager, Python, dynamic-loader, CUDA injection, Torch cache,
+proxy, CA override, virtual-environment, and secret-looking variables from
+every setup and runtime subprocess. Fresh environments use the exact
+uv-managed Python 3.12.13 runtime. Before code is
+executed, setup and run validate ownership, write permissions, the
+interpreter's direct canonical target, and symlink confinement across the
+runtime and Python base. The same checks cover the packaged implementation and
+checkpoint. The parent also verifies the implementation hash reported by the
+isolated child and checks it again after inference.
 
 Upscale a 1920x1080 PNG to native x2 4K UHD without replacing the source:
 
@@ -58,10 +59,18 @@ sne-tpn-upscale run \
   --receipt ./image-4k-hat-l.json
 ```
 
+Inputs must use an 8-bit `RGB` or `RGBA` mode; other modes are rejected rather
+than silently converted. HAT-L processes RGB only. For `RGBA` input, the alpha
+channel is resized separately with Lanczos and that handling is recorded in the
+receipt. The target may be the model's native x2 width or a smaller upscale;
+targets beyond native x2 are rejected rather than enlarged a second time.
+
 The Blackwell-qualified defaults select physical GPU 0, expose it as
 `cuda:0`, use BF16, and process the full frame without tiling. On the RTX PRO
 6000 Blackwell Workstation Edition, three full-frame runs were byte-for-byte
-deterministic with a 12.85-second median. Peak CUDA memory was 38.85 GiB
+deterministic with a 12.85-second median. That inference timing excludes the
+intentional per-run trust scans, hashes, model load, and PNG publication. Peak
+CUDA memory was 38.85 GiB
 allocated and 54.45 GiB reserved. BF16 agreed with FP32 at 58.14 dB PSNR on
 the qualification crop. Use `--dtype float32` for the conservative numerical
 path. Use `--tile-size 512 --tile-overlap 64` only when the full frame cannot
@@ -85,9 +94,10 @@ production result and the HAT-L output is retained only as model evidence.
 The command writes PNG output atomically, refuses existing output and receipt
 paths unless `--force` is explicit, and rejects symlink destinations even with
 `--force`. It verifies the checkpoint hash before model loading, honors the
-caller's file-creation umask for outputs and receipts, keeps the checkpoint
-non-group-writable, and emits a JSON receipt with input, output, model,
-implementation, runtime, GPU, memory, and timing identities.
+caller's group/other file-creation restrictions while preserving owner
+read/write access, keeps the checkpoint non-group-writable, and emits a JSON
+receipt with input, output, model, implementation, runtime, GPU, memory, and
+timing identities.
 
 ## Local OCR architecture
 

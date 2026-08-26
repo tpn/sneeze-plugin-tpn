@@ -144,7 +144,8 @@ class Run(InvariantAwareCommand):
 
     class TargetWidthArg(PositiveIntegerInvariant):
         _help = (
-            "Target width in pixels, preserving aspect. "
+            "Target width in pixels, preserving aspect; no greater than "
+            "the model's native x2 width. "
             "[default: %default]"
         )
         _mandatory = False

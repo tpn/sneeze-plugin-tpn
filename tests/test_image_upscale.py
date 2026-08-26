@@ -10,20 +10,36 @@ import pytest
 
 def _make_trusted_test_runtime(tmp_path):
     runtime = tmp_path / "runtime"
-    python_base = tmp_path / "python-base"
+    python_base = (
+        tmp_path / "uv-managed/python" / "cpython-3.12.13-linux-x86_64-gnu"
+    )
     python_home = python_base / "bin"
     python_home.mkdir(parents=True)
+    for directory in (
+        python_base.parent.parent,
+        python_base.parent,
+        python_base,
+        python_home,
+    ):
+        directory.chmod(0o700)
+    build_identity = python_base / "BUILD"
+    build_identity.write_text("test\n", encoding="ascii")
+    build_identity.chmod(0o600)
     managed_python = python_home / "python3.12"
     managed_python.write_bytes(b"")
     managed_python.chmod(0o700)
     python = runtime / "bin/python"
     python.parent.mkdir(parents=True)
+    runtime.chmod(0o700)
+    python.parent.chmod(0o700)
     python.symlink_to(managed_python)
     (python.parent / "python3").symlink_to("python")
-    (runtime / "pyvenv.cfg").write_text(
+    config = runtime / "pyvenv.cfg"
+    config.write_text(
         f"home = {python_home}\n",
         encoding="utf-8",
     )
+    config.chmod(0o600)
     return runtime, python
 
 
@@ -103,7 +119,31 @@ def test_setup_sanitizes_package_resolution_environment(
     python = runtime / "bin/python"
     calls = []
     hostile_names = (
+        "ALL_PROXY",
+        "CUDA_INJECTION64_PATH",
+        "CURL_CA_BUNDLE",
+        "DYLD_INSERT_LIBRARIES",
+        "FTP_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "LD_AUDIT",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "NVIDIA_DRIVER_CAPABILITIES",
+        "NO_PROXY",
         "PIP_INDEX_URL",
+        "PYTHONBREAKPOINT",
+        "PYTHONEXECUTABLE",
+        "PYTHONINSPECT",
+        "PYTHONSTARTUP",
+        "PYTHONWARNINGS",
+        "PYTORCH_KERNEL_CACHE_PATH",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "TORCH_HOME",
+        "TORCH_EXTENSIONS_DIR",
+        "TRITON_CACHE_DIR",
         "UV_CONFIG_FILE",
         "UV_DEFAULT_INDEX",
         "UV_PYTHON",
@@ -158,10 +198,20 @@ def test_setup_sanitizes_package_resolution_environment(
     )
 
     assert len(calls) == 4
-    for _argv, kwargs in calls:
+    for argv, kwargs in calls:
         assert kwargs["env"]["CUDA_VISIBLE_DEVICES"] == "0"
         for name in hostile_names:
             assert name not in kwargs["env"]
+        if argv[0] == str(uv):
+            assert kwargs["umask"] == 0o077
+        else:
+            assert "umask" not in kwargs
+    probe_argv = next(argv for argv, _kwargs in calls if "--probe" in argv)
+    assert probe_argv[:3] == [
+        str(python),
+        "-P",
+        str(image_upscale.runtime_script()),
+    ]
 
 
 def test_setup_rejects_untrusted_existing_runtime_before_commands(
@@ -229,6 +279,112 @@ def test_setup_rejects_untrusted_fresh_runtime_parent_before_commands(
     assert called is False
 
 
+def test_setup_rejects_untrusted_fresh_runtime_leaf_before_commands(
+    tmp_path, monkeypatch
+):
+    from sneeze.tpn.upscale import image_upscale
+
+    uv = tmp_path / "uv"
+    uv.write_bytes(b"")
+    uv.chmod(0o700)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    runtime.chmod(0o770)
+    called = False
+
+    monkeypatch.setattr(
+        image_upscale.shutil,
+        "which",
+        lambda _executable: str(uv),
+    )
+
+    def runner(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    with pytest.raises(image_upscale.ImageUpscaleError, match="not trusted"):
+        image_upscale.setup_upscaler(
+            runtime_dir=runtime,
+            model_cache=tmp_path / "models",
+            command_runner=runner,
+        )
+
+    assert called is False
+
+
+def test_setup_prepares_model_cache_privately_under_permissive_umask(
+    tmp_path, monkeypatch
+):
+    import os
+    import stat
+
+    from sneeze.tpn.upscale import image_upscale
+
+    uv = tmp_path / "uv"
+    uv.write_bytes(b"")
+    uv.chmod(0o700)
+    runtime, _python = _make_trusted_test_runtime(tmp_path)
+    model_cache = tmp_path / "models"
+    monkeypatch.setattr(
+        image_upscale.shutil,
+        "which",
+        lambda _executable: str(uv),
+    )
+    monkeypatch.setattr(image_upscale, "_ensure_model", lambda _path: None)
+    monkeypatch.setattr(
+        image_upscale,
+        "_validate_upscale_trust",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        image_upscale,
+        "model_identity",
+        lambda *_args, **_kwargs: {},
+    )
+
+    probe = {
+        "cuda_available": True,
+        "gpu": {"bfloat16_supported": True},
+        "python": "3.12.13",
+        "torch": "2.11.0+cu130",
+        "torch_cuda": "13.0",
+        "torchvision": "0.26.0+cu130",
+        "spandrel": "0.4.2",
+        "pillow": "12.3.0",
+        "numpy": "2.5.2",
+    }
+
+    def runner(argv, **_kwargs):
+        stdout = json.dumps(probe) if "--probe" in argv else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    previous_umask = os.umask(0o002)
+    try:
+        image_upscale.setup_upscaler(
+            runtime_dir=runtime,
+            model_cache=model_cache,
+            command_runner=runner,
+        )
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE(model_cache.stat().st_mode) == 0o700
+
+
+def test_trusted_runtime_fixture_ignores_permissive_umask(tmp_path):
+    import os
+
+    from sneeze.tpn.upscale import image_upscale
+
+    previous_umask = os.umask(0o002)
+    try:
+        runtime, python = _make_trusted_test_runtime(tmp_path)
+    finally:
+        os.umask(previous_umask)
+
+    image_upscale._validate_runtime_trust(runtime, python)
+
+
 def test_setup_secures_uv_runtime_lock_without_following_symlinks(tmp_path):
     import stat
 
@@ -268,8 +424,108 @@ def test_runtime_trust_rejects_external_interpreter_symlink_chain(tmp_path):
     intermediate.symlink_to("/usr/bin/python3")
     python.symlink_to(intermediate)
 
+    with pytest.raises(
+        image_upscale.ImageUpscaleError,
+        match="must be canonical",
+    ):
+        image_upscale._validate_runtime_trust(runtime, python)
+
+
+def test_runtime_trust_rejects_non_managed_python_before_tree_walk(
+    tmp_path, monkeypatch
+):
+    from sneeze.tpn.upscale import image_upscale
+
+    runtime, python = _make_trusted_test_runtime(tmp_path)
+    python.unlink()
+    system_python = tmp_path / "system/bin/python3.12"
+    system_python.parent.mkdir(parents=True)
+    system_python.write_bytes(b"")
+    system_python.chmod(0o700)
+    python.symlink_to(system_python)
+
+    def unexpected_tree_walk(*_args, **_kwargs):
+        raise AssertionError(
+            "non-managed Python must fail before a tree walk"
+        )
+
+    monkeypatch.setattr(
+        image_upscale,
+        "validate_trusted_tree",
+        unexpected_tree_walk,
+    )
+
+    with pytest.raises(
+        image_upscale.ImageUpscaleError,
+        match="exact uv-managed Python",
+    ):
+        image_upscale._validate_runtime_trust(runtime, python)
+
+
+def test_runtime_trust_rejects_external_directory_before_tree_walk(
+    tmp_path, monkeypatch
+):
+    from sneeze.tpn.upscale import image_upscale
+
+    runtime, python = _make_trusted_test_runtime(tmp_path)
+    external = tmp_path / "external"
+    external.mkdir()
+    (runtime / "external").symlink_to(external, target_is_directory=True)
+
+    def unexpected_tree_walk(*_args, **_kwargs):
+        raise AssertionError("trusted-tree walk must follow scope validation")
+
+    monkeypatch.setattr(
+        image_upscale,
+        "validate_trusted_tree",
+        unexpected_tree_walk,
+    )
+
+    with pytest.raises(image_upscale.ImageUpscaleError, match="leaves"):
+        image_upscale._validate_runtime_trust(runtime, python)
+
+
+def test_runtime_trust_rejects_external_config_before_read(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path
+
+    from sneeze.tpn.upscale import image_upscale
+
+    runtime, python = _make_trusted_test_runtime(tmp_path)
+    config = runtime / "pyvenv.cfg"
+    config.unlink()
+    external = tmp_path / "external-config"
+    external.write_text("home = ignored\n", encoding="utf-8")
+    config.symlink_to(external)
+    original_read_text = Path.read_text
+
+    def guarded_read_text(path, *args, **kwargs):
+        if path == config:
+            raise AssertionError("config read must follow trust validation")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
     with pytest.raises(image_upscale.ImageUpscaleError, match="not trusted"):
         image_upscale._validate_runtime_trust(runtime, python)
+
+
+def test_symlink_scope_rejects_walk_errors(tmp_path, monkeypatch):
+    from sneeze.tpn.upscale import image_upscale
+
+    def failed_walk(_root, *, followlinks, onerror):
+        assert followlinks is False
+        onerror(PermissionError("unreadable"))
+        return ()
+
+    monkeypatch.setattr(image_upscale.os, "walk", failed_walk)
+
+    with pytest.raises(
+        image_upscale.ImageUpscaleError,
+        match="Could not scan",
+    ):
+        image_upscale._validate_symlink_scope(tmp_path)
 
 
 def test_model_download_is_hash_verified_and_atomic(tmp_path, monkeypatch):
@@ -283,6 +539,7 @@ def test_model_download_is_hash_verified_and_atomic(tmp_path, monkeypatch):
     expected = hashlib.sha256(payload).hexdigest()
     model = tmp_path / "models" / image_upscale.MODEL_FILENAME
     monkeypatch.setattr(image_upscale, "MODEL_SHA256", expected)
+    monkeypatch.setattr(image_upscale, "MODEL_SIZE_BYTES", len(payload))
     monkeypatch.setattr(
         image_upscale.urllib.request,
         "urlopen",
@@ -306,6 +563,7 @@ def test_model_download_mismatch_removes_partial_file(tmp_path, monkeypatch):
 
     model = tmp_path / "models" / image_upscale.MODEL_FILENAME
     monkeypatch.setattr(image_upscale, "MODEL_SHA256", "0" * 64)
+    monkeypatch.setattr(image_upscale, "MODEL_SIZE_BYTES", len(b"tampered"))
     monkeypatch.setattr(
         image_upscale.urllib.request,
         "urlopen",
@@ -313,6 +571,58 @@ def test_model_download_mismatch_removes_partial_file(tmp_path, monkeypatch):
     )
 
     with pytest.raises(image_upscale.ImageUpscaleError, match="mismatch"):
+        image_upscale._ensure_model(model)
+
+    assert not model.exists()
+    assert not list(model.parent.glob(".*.download"))
+
+
+def test_model_download_rejects_oversized_response(tmp_path, monkeypatch):
+    from io import BytesIO
+
+    from sneeze.tpn.upscale import image_upscale
+
+    model = tmp_path / "models" / image_upscale.MODEL_FILENAME
+    monkeypatch.setattr(image_upscale, "MODEL_SIZE_BYTES", 3)
+    monkeypatch.setattr(
+        image_upscale.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: BytesIO(b"oversized"),
+    )
+
+    with pytest.raises(image_upscale.ImageUpscaleError, match="exceeded"):
+        image_upscale._ensure_model(model)
+
+    assert not model.exists()
+    assert not list(model.parent.glob(".*.download"))
+
+
+def test_model_download_wraps_incomplete_response(tmp_path, monkeypatch):
+    import http.client
+
+    from sneeze.tpn.upscale import image_upscale
+
+    class IncompleteResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size):
+            raise http.client.IncompleteRead(b"partial", 1)
+
+    model = tmp_path / "models" / image_upscale.MODEL_FILENAME
+    monkeypatch.setattr(
+        image_upscale.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: IncompleteResponse(),
+    )
+
+    with pytest.raises(
+        image_upscale.ImageUpscaleError,
+        match="Could not download",
+    ):
         image_upscale._ensure_model(model)
 
     assert not model.exists()
@@ -454,6 +764,21 @@ def test_run_upscale_refuses_existing_output_before_runtime(tmp_path):
         run_upscale(source=source, output=output)
 
     assert output.read_bytes() == b"owned"
+
+
+def test_run_upscale_rejects_output_directory_before_runtime(tmp_path):
+    from sneeze.tpn.upscale.image_upscale import (
+        ImageUpscaleError,
+        run_upscale,
+    )
+
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    source.write_bytes(b"source")
+    output.mkdir()
+
+    with pytest.raises(ImageUpscaleError, match="must not be a directory"):
+        run_upscale(source=source, output=output, force=True)
 
 
 @pytest.mark.parametrize("target_exists", (False, True))
@@ -604,7 +929,26 @@ def test_run_upscale_launches_isolated_runtime_and_writes_receipt(
     reported_implementation_hash = [
         image_upscale.file_sha256(image_upscale.runtime_script())
     ]
-    for name in ("PYTHONPATH", "PYTHONHOME", "__PYVENV_LAUNCHER__"):
+    hostile_names = (
+        "CUDA_INJECTION64_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "LD_AUDIT",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "NVIDIA_DRIVER_CAPABILITIES",
+        "PYTHONBREAKPOINT",
+        "PYTHONEXECUTABLE",
+        "PYTHONHOME",
+        "PYTHONINSPECT",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PYTHONWARNINGS",
+        "PYTORCH_KERNEL_CACHE_PATH",
+        "TORCH_EXTENSIONS_DIR",
+        "TRITON_CACHE_DIR",
+        "__PYVENV_LAUNCHER__",
+    )
+    for name in hostile_names:
         monkeypatch.setenv(name, "/hostile-parent-python-path")
 
     monkeypatch.setattr(
@@ -650,12 +994,16 @@ def test_run_upscale_launches_isolated_runtime_and_writes_receipt(
     )
 
     argv, kwargs = calls[0]
-    assert argv[:2] == [str(python), str(image_upscale.runtime_script())]
+    assert argv[:3] == [
+        str(python),
+        "-P",
+        str(image_upscale.runtime_script()),
+    ]
     assert argv[argv.index("--target-width") + 1] == "3840"
     assert argv[argv.index("--dtype") + 1] == "bfloat16"
     assert kwargs["env"]["CUDA_VISIBLE_DEVICES"] == "0"
     assert kwargs["env"]["PYTHONNOUSERSITE"] == "1"
-    for name in ("PYTHONPATH", "PYTHONHOME", "__PYVENV_LAUNCHER__"):
+    for name in hostile_names:
         assert name not in kwargs["env"]
     assert receipt["receipt_path"] == str(receipt_path)
     persisted = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -663,7 +1011,10 @@ def test_run_upscale_launches_isolated_runtime_and_writes_receipt(
 
     output.unlink()
     reported_dimensions[1] = 1080
-    with pytest.raises(image_upscale.ImageUpscaleError, match="dimensions"):
+    with pytest.raises(
+        image_upscale.ImageUpscaleError,
+        match=f"dimensions.*unverified output.*{output}",
+    ):
         image_upscale.run_upscale(
             source=source,
             output=output,
@@ -824,6 +1175,24 @@ def test_receipt_publish_honors_umask(tmp_path, monkeypatch):
 
     assert json.loads(receipt.read_text(encoding="utf-8")) == {"kind": "test"}
     assert stat.S_IMODE(receipt.stat().st_mode) == 0o640
+
+
+def test_file_modes_preserve_owner_access_under_restrictive_umask(
+    tmp_path, monkeypatch
+):
+    from sneeze.tpn.upscale import image_upscale, image_upscale_runtime
+
+    process_status = tmp_path / "proc-status"
+    process_status.write_text("Name:\ttest\nUmask:\t0477\n", encoding="ascii")
+    monkeypatch.setattr(image_upscale, "_PROC_STATUS", process_status)
+    monkeypatch.setattr(
+        image_upscale_runtime,
+        "_PROC_STATUS",
+        process_status,
+    )
+
+    assert image_upscale._file_mode_from_umask() == 0o600
+    assert image_upscale_runtime._file_mode_from_umask() == 0o600
 
 
 def test_run_upscale_refuses_receipt_aliases_before_child(
@@ -1025,14 +1394,26 @@ def test_upscale_commands_are_discovered_without_runtime_import():
     sys.modules.pop("sneeze.tpn.upscale.image_upscale_runtime", None)
     cli = sneeze_cli.CLI(
         program_name="sne",
-        module_names=["sneeze", "sneeze.tpn.upscale"],
+        module_names=["-sneeze", "sneeze.tpn.upscale"],
         introspect=True,
         auto_plugins=False,
     )
 
-    assert "run" in cli._commands_by_name
-    assert "setup" in cli._commands_by_name
+    assert set(cli._commands_by_name) == {"run", "setup", "version"}
     assert "sneeze.tpn.upscale.image_upscale_runtime" not in sys.modules
+
+
+def test_branded_entry_point_runs_real_help(capfd):
+    from sneeze.tpn.upscale import cli
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["help"])
+
+    assert exc_info.value.code == 0
+    captured = capfd.readouterr()
+    output = captured.out + captured.err
+    assert "run (run)" in output
+    assert "setup (setup)" in output
 
 
 def test_upscale_has_a_branded_sneeze_entry_point():

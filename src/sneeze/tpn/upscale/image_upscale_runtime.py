@@ -46,7 +46,7 @@ def _file_mode_from_umask() -> int:
             raise ValueError("process status omitted Umask")
     except (OSError, UnicodeError, ValueError):
         return 0o600
-    return 0o666 & ~current_umask
+    return (0o666 & ~current_umask) | 0o600
 
 
 def probe() -> dict[str, Any]:
@@ -202,6 +202,24 @@ def upscale(args: argparse.Namespace) -> dict[str, Any]:
         "float32": torch.float32,
     }[args.dtype]
 
+    with Image.open(source) as opened:
+        opened.load()
+        source_info = dict(opened.info)
+        source_mode = opened.mode
+        if source_mode not in {"RGB", "RGBA"}:
+            raise ValueError(
+                "Source image mode must be 8-bit RGB or RGBA; "
+                f"got {source_mode}"
+            )
+        alpha = opened.getchannel("A") if source_mode == "RGBA" else None
+        rgb = opened.convert("RGB")
+    source_width, source_height = rgb.size
+    if args.target_width <= source_width:
+        raise ValueError(
+            f"Target width {args.target_width} does not upscale "
+            f"source width {source_width}"
+        )
+
     descriptor = ModelLoader().load_from_file(model_path)
     if not isinstance(descriptor, ImageModelDescriptor):
         raise ValueError("Checkpoint is not an image-to-image model")
@@ -211,22 +229,17 @@ def upscale(args: argparse.Namespace) -> dict[str, Any]:
         )
     if descriptor.input_channels != 3 or descriptor.output_channels != 3:
         raise ValueError("Checkpoint must accept and produce RGB images")
-    descriptor.to(device=device, dtype=dtype).eval()
+    supports_bfloat16 = bool(descriptor.supports_bfloat16)
+    if dtype is torch.bfloat16 and not supports_bfloat16:
+        raise ValueError("Checkpoint does not support bfloat16 inference")
 
-    with Image.open(source) as opened:
-        opened.load()
-        source_info = dict(opened.info)
-        source_mode = opened.mode
-        alpha = None
-        if "A" in opened.getbands():
-            alpha = opened.getchannel("A")
-        rgb = opened.convert("RGB")
-    source_width, source_height = rgb.size
-    if args.target_width <= source_width:
+    native_target_width = source_width * descriptor.scale
+    if args.target_width > native_target_width:
         raise ValueError(
-            f"Target width {args.target_width} does not upscale "
-            f"source width {source_width}"
+            f"Target width {args.target_width} exceeds the model's native "
+            f"x{descriptor.scale} width {native_target_width}"
         )
+    descriptor.to(device=device, dtype=dtype).eval()
     target_height = round(source_height * args.target_width / source_width)
     tensor = _image_to_tensor(
         rgb,
@@ -338,6 +351,7 @@ def upscale(args: argparse.Namespace) -> dict[str, Any]:
             "architecture": str(descriptor.architecture.id),
             "tags": descriptor.tags,
             "native_scale": descriptor.scale,
+            "supports_bfloat16": supports_bfloat16,
             "native_output_dimensions": native_dimensions,
         },
         "runtime": {
@@ -357,6 +371,7 @@ def upscale(args: argparse.Namespace) -> dict[str, Any]:
             "tile_overlap": args.tile_overlap,
             "post_resize": native_dimensions
             != [args.target_width, target_height],
+            "alpha_resample": "lanczos" if alpha is not None else None,
         },
         "timing": {"inference_seconds": inference_seconds},
         "implementation": {

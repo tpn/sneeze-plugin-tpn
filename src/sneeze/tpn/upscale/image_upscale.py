@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import shutil
@@ -37,6 +38,7 @@ MODEL_MIRROR_PATH = f"HAT/{MODEL_FILENAME}"
 MODEL_SHA256 = (
     "2818c7ca8d72ec4cc5f31c93203d55252a662dd35cda34ce1a69661f97dcd38f"
 )
+MODEL_SIZE_BYTES = 165_182_573
 MODEL_SHA256_PROVENANCE = (
     "independently matched the official Google Drive artifact to the "
     "immutable mirror revision"
@@ -68,14 +70,33 @@ _SECRET_ENV_MARKERS = (
     "TOKEN",
 )
 _ISOLATED_ENV_NAMES = {
-    "PYTHONHOME",
-    "PYTHONPATH",
+    "ALL_PROXY",
+    "CURL_CA_BUNDLE",
+    "FTP_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
     "VIRTUAL_ENV",
     "VIRTUAL_ENV_PROMPT",
     "__PYVENV_LAUNCHER__",
 }
-_ISOLATED_ENV_PREFIXES = ("PIP_", "UV_")
+_ISOLATED_ENV_PREFIXES = (
+    "CUDA_",
+    "DYLD_",
+    "LD_",
+    "NVIDIA_",
+    "PIP_",
+    "PYTHON",
+    "PYTORCH",
+    "TORCH",
+    "TRITON_",
+    "UV_",
+)
 _PROC_STATUS = Path("/proc/self/status")
+_SETUP_UMASK = 0o077
 
 
 class ImageUpscaleError(ValueError):
@@ -243,12 +264,21 @@ def setup_upscaler(
 
     try:
         prepare_trusted_directory(
-            runtime_path.parent,
-            label="upscale runtime parent",
+            runtime_path,
+            label="upscale runtime",
         )
     except TrustedPathError as exc:
         raise ImageUpscaleError(
-            f"Upscale runtime parent is not trusted: {exc}"
+            f"Upscale runtime is not trusted: {exc}"
+        ) from exc
+    try:
+        prepare_trusted_directory(
+            model_path.parent,
+            label="upscale model cache",
+        )
+    except TrustedPathError as exc:
+        raise ImageUpscaleError(
+            f"Upscale model cache is not trusted: {exc}"
         ) from exc
     setup_environment = _runtime_environment(cuda_visible_devices)
     if not include_venv:
@@ -262,6 +292,7 @@ def setup_upscaler(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=setup_environment,
+            umask=_SETUP_UMASK,
         )
         if completed.returncode != 0:
             output = (completed.stdout or "").strip()
@@ -283,7 +314,7 @@ def setup_upscaler(
         model_path=model_path,
         script_path=script_path,
     )
-    probe_command = [str(python_path), str(script_path), "--probe"]
+    probe_command = [str(python_path), "-P", str(script_path), "--probe"]
     completed = command_runner(
         probe_command,
         check=False,
@@ -343,6 +374,10 @@ def run_upscale(
     _reject_symlink_destination(output_path, "Output")
     if output_path.suffix.lower() != ".png":
         raise ImageUpscaleError("Upscale output must use a .png suffix")
+    if output_path.is_dir():
+        raise ImageUpscaleError(
+            f"Upscale output must not be a directory: {output_path}"
+        )
     if os.path.lexists(output_path) and not force:
         raise ImageUpscaleError(
             "Output already exists; pass --force to replace it: "
@@ -407,6 +442,7 @@ def run_upscale(
 
     command = [
         str(python_path),
+        "-P",
         str(script_path),
         "--source",
         str(source_path),
@@ -442,15 +478,17 @@ def run_upscale(
         raise ImageUpscaleError(
             "Image upscale failed" + (f": {detail[-4000:]}" if detail else "")
         )
+    unverified_output = f"; unverified output may remain at: {output_path}"
     try:
         receipt = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise ImageUpscaleError(
-            "Image upscale runtime returned invalid JSON"
+            "Image upscale runtime returned invalid JSON" + unverified_output
         ) from exc
     if not isinstance(receipt, Mapping):
         raise ImageUpscaleError(
             "Image upscale runtime returned a non-object receipt"
+            + unverified_output
         )
     implementation_receipt = receipt.get("implementation", {})
     if (
@@ -461,6 +499,7 @@ def run_upscale(
     ):
         raise ImageUpscaleError(
             "Image upscale runtime implementation identity does not match"
+            + unverified_output
         )
     source_receipt = receipt.get("source", {})
     output_receipt = receipt.get("output", {})
@@ -470,10 +509,12 @@ def run_upscale(
     ):
         raise ImageUpscaleError(
             "Image upscale runtime returned malformed image identities"
+            + unverified_output
         )
     if source_receipt.get("path") != str(source_path):
         raise ImageUpscaleError(
             "Image upscale receipt reported another source"
+            + unverified_output
         )
     if (
         source_receipt.get("sha256") != source_hash
@@ -481,10 +522,12 @@ def run_upscale(
     ):
         raise ImageUpscaleError(
             "Source image changed during upscale or its receipt is invalid"
+            + unverified_output
         )
     if output_receipt.get("path") != str(output_path):
         raise ImageUpscaleError(
             "Image upscale receipt reported another output"
+            + unverified_output
         )
     if not output_path.is_file():
         raise ImageUpscaleError(
@@ -494,6 +537,7 @@ def run_upscale(
     if output_receipt.get("sha256") != actual_output_hash:
         raise ImageUpscaleError(
             "Image upscale receipt output SHA-256 does not match the file"
+            + unverified_output
         )
     output_dimensions = output_receipt.get("dimensions")
     parameters_receipt = receipt.get("parameters", {})
@@ -512,6 +556,7 @@ def run_upscale(
     ):
         raise ImageUpscaleError(
             "Image upscale receipt output dimensions do not match the targets"
+            + unverified_output
         )
 
     if receipt_output is not None:
@@ -549,6 +594,7 @@ def model_identity(
         },
         "path": str(model_path),
         "sha256": MODEL_SHA256,
+        "expected_size_bytes": MODEL_SIZE_BYTES,
         "sha256_provenance": MODEL_SHA256_PROVENANCE,
     }
     if verify:
@@ -585,6 +631,7 @@ def _ensure_model(model_path: Path) -> None:
     )
     temporary_path: str | None = None
     digest = hashlib.sha256()
+    downloaded_size = 0
     try:
         with tempfile.NamedTemporaryFile(
             mode="wb",
@@ -596,10 +643,21 @@ def _ensure_model(model_path: Path) -> None:
             temporary_path = destination.name
             with urllib.request.urlopen(request, timeout=60) as source:
                 for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    downloaded_size += len(chunk)
+                    if downloaded_size > MODEL_SIZE_BYTES:
+                        raise ImageUpscaleError(
+                            "Downloaded model exceeded expected size of "
+                            f"{MODEL_SIZE_BYTES} bytes"
+                        )
                     destination.write(chunk)
                     digest.update(chunk)
             destination.flush()
             os.fsync(destination.fileno())
+        if downloaded_size != MODEL_SIZE_BYTES:
+            raise ImageUpscaleError(
+                "Downloaded model size mismatch: "
+                f"expected {MODEL_SIZE_BYTES}, got {downloaded_size}"
+            )
         actual = digest.hexdigest()
         if actual != MODEL_SHA256:
             raise ImageUpscaleError(
@@ -612,7 +670,7 @@ def _ensure_model(model_path: Path) -> None:
         )
         os.replace(temporary_path, model_path)
         temporary_path = None
-    except OSError as exc:
+    except (OSError, http.client.HTTPException) as exc:
         raise ImageUpscaleError(
             f"Could not download upscale model: {exc}"
         ) from exc
@@ -672,11 +730,7 @@ def _validate_runtime_probe(probe_receipt: Any) -> None:
     }
     for name, expected in expected_versions.items():
         actual = probe_receipt.get(name)
-        matches = isinstance(actual, str) and (
-            actual.startswith(expected)
-            if expected.endswith(".")
-            else actual == expected
-        )
+        matches = isinstance(actual, str) and actual == expected
         if not matches:
             raise ImageUpscaleError(
                 f"Upscale runtime probe expected {name} {expected}, "
@@ -724,7 +778,7 @@ def _file_mode_from_umask() -> int:
             raise ValueError("process status omitted Umask")
     except (OSError, UnicodeError, ValueError):
         return 0o600
-    return 0o666 & ~current_umask
+    return (0o666 & ~current_umask) | 0o600
 
 
 def _secure_runtime_lock(runtime_path: Path) -> None:
@@ -782,6 +836,10 @@ def _runtime_python_identity(
     runtime_path: Path,
     python_path: Path,
 ) -> tuple[Path, Path]:
+    if not python_path.is_relative_to(runtime_path):
+        raise ImageUpscaleError(
+            f"Upscale Python must remain within its runtime: {python_path}"
+        )
     if not python_path.is_symlink():
         raise ImageUpscaleError(
             f"Upscale Python must be the uv-managed environment link: "
@@ -796,22 +854,54 @@ def _runtime_python_identity(
                 else python_path.parent / raw_target
             )
         )
-        if target.resolve(strict=True) != target:
-            raise ImageUpscaleError(
-                f"Upscale Python target must be canonical: {target}"
-            )
+        resolved_target = target.resolve(strict=True)
     except (OSError, RuntimeError, ValueError) as exc:
         raise ImageUpscaleError(
             f"Could not resolve upscale Python target: {python_path}"
         ) from exc
+    if resolved_target != target:
+        raise ImageUpscaleError(
+            f"Upscale Python target must be canonical: {target}"
+        )
     validate_trusted_file(
         target,
         label="upscale Python interpreter",
         executable=True,
         resolve_symlinks=False,
     )
+    python_base = target.parent.parent
+    python_series = PYTHON_VERSION.rpartition(".")[0]
+    managed_prefix = f"cpython-{PYTHON_VERSION}-"
+    if (
+        target.name != f"python{python_series}"
+        or target.parent.name != "bin"
+        or not python_base.name.startswith(managed_prefix)
+        or not python_base.name.removeprefix(managed_prefix)
+        or python_base.parent.name != "python"
+    ):
+        raise ImageUpscaleError(
+            "Upscale Python must target an exact uv-managed Python "
+            f"{PYTHON_VERSION} installation: {target}"
+        )
+    validate_trusted_file(
+        python_base / "BUILD",
+        label="upscale managed Python build identity",
+        resolve_symlinks=False,
+    )
+    return python_base, target
 
+
+def _validate_runtime_python_config(
+    runtime_path: Path,
+    python_target: Path,
+) -> None:
     config_path = runtime_path / "pyvenv.cfg"
+    validate_trusted_file(
+        config_path,
+        label="upscale Python configuration",
+        resolve_symlinks=False,
+    )
+
     try:
         config_lines = config_path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as exc:
@@ -823,13 +913,12 @@ def _runtime_python_identity(
         for line in config_lines
         if line.partition("=")[0].strip() == "home"
     ]
-    expected_home = str(target.parent)
+    expected_home = str(python_target.parent)
     if homes != [expected_home]:
         raise ImageUpscaleError(
             f"Upscale Python configuration must name canonical home "
             f"{expected_home}: {config_path}"
         )
-    return target.parent.parent, target
 
 
 def _validate_symlink_scope(
@@ -838,9 +927,16 @@ def _validate_symlink_scope(
     allowed_external: Mapping[Path, Path] | None = None,
 ) -> None:
     allowed = allowed_external or {}
+
+    def raise_walk_error(error: OSError) -> None:
+        raise ImageUpscaleError(
+            f"Could not scan upscale trusted tree: {root}"
+        ) from error
+
     for directory, directory_names, file_names in os.walk(
         root,
         followlinks=False,
+        onerror=raise_walk_error,
     ):
         for name in (*directory_names, *file_names):
             path = Path(directory) / name
@@ -868,11 +964,6 @@ def _validate_symlink_scope(
 
 def _validate_runtime_trust(runtime_path: Path, python_path: Path) -> None:
     try:
-        validate_trusted_tree(
-            runtime_path,
-            label="upscale runtime",
-            symlink_root=runtime_path.anchor,
-        )
         python_base, python_target = _runtime_python_identity(
             runtime_path,
             python_path,
@@ -882,11 +973,16 @@ def _validate_runtime_trust(runtime_path: Path, python_path: Path) -> None:
             allowed_external={python_path: python_target},
         )
         validate_trusted_tree(
+            runtime_path,
+            label="upscale runtime",
+            symlink_root=runtime_path.anchor,
+        )
+        _validate_runtime_python_config(runtime_path, python_target)
+        validate_trusted_tree(
             python_base,
             label="upscale Python base",
             symlink_root=python_base,
         )
-        _validate_symlink_scope(python_base)
     except (ImageUpscaleError, TrustedPathError) as exc:
         raise ImageUpscaleError(
             f"Upscale execution path is not trusted: {exc}"
