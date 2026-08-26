@@ -26,6 +26,13 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _destination_path(value: str | os.PathLike[str]) -> Path:
+    """Resolve destination parents without following the final component."""
+
+    lexical = Path(os.path.abspath(Path(value).expanduser()))
+    return lexical.parent.resolve() / lexical.name
+
+
 def probe() -> dict[str, Any]:
     import torch
 
@@ -149,7 +156,7 @@ def upscale(args: argparse.Namespace) -> dict[str, Any]:
     from spandrel import ImageModelDescriptor, ModelLoader
 
     source = Path(args.source).expanduser().resolve()
-    output = Path(args.output).expanduser().resolve()
+    output = _destination_path(args.output)
     model_path = Path(args.model).expanduser().resolve()
     if not source.is_file():
         raise ValueError(f"Source image does not exist: {source}")

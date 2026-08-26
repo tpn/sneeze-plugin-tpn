@@ -478,12 +478,14 @@ def test_runtime_png_publish_honors_umask_and_is_atomic(
     assert replacement.read_bytes() == b"replacement"
 
 
-def test_run_upscale_refuses_receipt_alias_before_child(
+def test_run_upscale_refuses_receipt_aliases_before_child(
     tmp_path, monkeypatch
 ):
     from sneeze.tpn.upscale import image_upscale
 
-    source = tmp_path / "source.png"
+    source_dir = tmp_path / "source-dir"
+    source_dir.mkdir()
+    source = source_dir / "source.png"
     source.write_bytes(b"source")
     runtime = tmp_path / "runtime"
     python = runtime / "bin/python"
@@ -505,22 +507,47 @@ def test_run_upscale_refuses_receipt_alias_before_child(
         nonlocal called
         called = True
 
-    with pytest.raises(
-        image_upscale.ImageUpscaleError,
-        match="Receipt path must be separate",
-    ):
-        image_upscale.run_upscale(
-            source=source,
-            output=tmp_path / "output.png",
-            runtime_dir=runtime,
-            model_cache=models,
-            receipt_path=source,
-            force=True,
-            command_runner=runner,
-        )
+    source_dir_alias = tmp_path / "source-dir-alias"
+    source_dir_alias.symlink_to(source_dir, target_is_directory=True)
+    hardlink_alias = tmp_path / "source-hardlink.png"
+    hardlink_alias.hardlink_to(source)
+    receipt_aliases = (
+        source,
+        source_dir_alias / source.name,
+        hardlink_alias,
+    )
+
+    for receipt_alias in receipt_aliases:
+        with pytest.raises(
+            image_upscale.ImageUpscaleError,
+            match="Receipt path must be separate",
+        ):
+            image_upscale.run_upscale(
+                source=source,
+                output=tmp_path / "output.png",
+                runtime_dir=runtime,
+                model_cache=models,
+                receipt_path=receipt_alias,
+                force=True,
+                command_runner=runner,
+            )
 
     assert called is False
     assert source.read_bytes() == b"source"
+
+
+def test_runtime_destination_preserves_final_symlink(tmp_path):
+    from sneeze.tpn.upscale.image_upscale_runtime import _destination_path
+
+    victim = tmp_path / "victim.png"
+    victim.write_bytes(b"victim")
+    output = tmp_path / "output.png"
+    output.symlink_to(victim)
+
+    destination = _destination_path(output)
+
+    assert destination == output
+    assert destination.is_symlink()
 
 
 def test_run_upscale_rejects_symlink_receipt_before_child(

@@ -297,7 +297,7 @@ def run_upscale(
         if output
         else default_output_path(source_path)
     )
-    if source_path == output_path:
+    if _paths_alias(output_path, source_path):
         raise ImageUpscaleError("Source and output paths must be different")
     _reject_symlink_destination(output_path, "Output")
     if output_path.suffix.lower() != ".png":
@@ -342,7 +342,10 @@ def run_upscale(
             python_path,
             runtime_script(),
         }
-        if receipt_output in protected_paths:
+        if any(
+            _paths_alias(receipt_output, protected)
+            for protected in protected_paths
+        ):
             raise ImageUpscaleError(
                 "Receipt path must be separate from the source, output, "
                 "model, and runtime"
@@ -624,9 +627,21 @@ def _absolute_path(value: str | os.PathLike[str]) -> Path:
 
 
 def _destination_path(value: str | os.PathLike[str]) -> Path:
-    """Make a destination absolute without following its final symlink."""
+    """Resolve destination parents without following the final component."""
 
-    return Path(os.path.abspath(Path(value).expanduser()))
+    lexical = Path(os.path.abspath(Path(value).expanduser()))
+    return lexical.parent.resolve() / lexical.name
+
+
+def _paths_alias(first: Path, second: Path) -> bool:
+    if first == second:
+        return True
+    if not os.path.lexists(first) or not os.path.lexists(second):
+        return False
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
 
 
 def _reject_symlink_destination(path: Path, label: str) -> None:
