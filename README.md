@@ -31,11 +31,17 @@ The defaults use Python 3.12, PyTorch 2.11.0 with CUDA 13.0, and Spandrel
 0.4.2. The runtime is stored under
 `~/.local/share/sneeze/tpn/upscale/runtime`; the checkpoint is stored under
 `~/.cache/sneeze/tpn/upscale/models`. The setup downloads an immutable mirror
-of the official `HAT-L_SRx2_ImageNet-pretrain.pth` checkpoint and requires
-SHA-256
+of the official `HAT-L_SRx2_ImageNet-pretrain.pth` checkpoint. Its SHA-256 was
+independently confirmed to match both the official Google Drive artifact and
+the pinned mirror revision:
 `2818c7ca8d72ec4cc5f31c93203d55252a662dd35cda34ce1a69661f97dcd38f`.
 The HAT source repository is Apache-2.0 licensed; the upstream project does
 not state separate terms for the externally hosted checkpoint.
+
+Setup disables ambient uv configuration, resolves Torch only from the pinned
+PyTorch CUDA index, resolves the remaining packages only from PyPI, and strips
+parent `UV_*`, `PIP_*`, Python-path, virtual-environment, and secret-looking
+variables from every setup and runtime subprocess.
 
 Upscale a 1920x1080 PNG to native x2 4K UHD without replacing the source:
 
@@ -71,9 +77,10 @@ ancestor of the source raster. For that asset, the native 4K rerender is the
 production result and the HAT-L output is retained only as model evidence.
 
 The command writes PNG output atomically, refuses existing output and receipt
-paths unless `--force` is explicit, verifies the checkpoint hash before model
-loading, and emits a JSON receipt with input, output, model, implementation,
-runtime, GPU, memory, and timing identities.
+paths unless `--force` is explicit, and rejects symlink destinations even with
+`--force`. It verifies the checkpoint hash before model loading, honors the
+caller's file-creation umask, and emits a JSON receipt with input, output,
+model, implementation, runtime, GPU, memory, and timing identities.
 
 ## Local OCR architecture
 

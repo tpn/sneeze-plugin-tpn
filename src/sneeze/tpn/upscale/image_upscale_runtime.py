@@ -121,10 +121,18 @@ def _run_tiled(model, tensor, *, torch, tile_size: int, overlap: int):
 def _publish_png(temporary_path: str, output: Path, *, force: bool) -> None:
     """Publish one complete PNG without a no-clobber race."""
 
+    if output.is_symlink():
+        raise ValueError(f"Output path must not be a symbolic link: {output}")
     current_umask = os.umask(0)
     os.umask(current_umask)
     os.chmod(temporary_path, 0o666 & ~current_umask)
     if force:
+        if output.is_symlink():
+            raise ValueError(
+                f"Output path must not be a symbolic link: {output}"
+            )
+        # os.replace replaces the directory entry rather than following a
+        # final symlink that appears after the check.
         os.replace(temporary_path, output)
         return
     try:
@@ -248,6 +256,12 @@ def upscale(args: argparse.Namespace) -> dict[str, Any]:
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: str | None = None
     try:
+        save_options: dict[str, Any] = {
+            "format": "PNG",
+            "compress_level": 9,
+        }
+        if source_info.get("icc_profile"):
+            save_options["icc_profile"] = source_info["icc_profile"]
         with tempfile.NamedTemporaryFile(
             dir=output.parent,
             prefix=f".{output.name}.",
@@ -255,13 +269,9 @@ def upscale(args: argparse.Namespace) -> dict[str, Any]:
             delete=False,
         ) as handle:
             temporary_path = handle.name
-        save_options: dict[str, Any] = {
-            "format": "PNG",
-            "compress_level": 9,
-        }
-        if source_info.get("icc_profile"):
-            save_options["icc_profile"] = source_info["icc_profile"]
-        result.save(temporary_path, **save_options)
+            result.save(handle, **save_options)
+            handle.flush()
+            os.fsync(handle.fileno())
         _publish_png(temporary_path, output, force=args.force)
         temporary_path = None
     finally:

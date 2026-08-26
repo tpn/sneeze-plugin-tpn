@@ -29,6 +29,10 @@ MODEL_MIRROR_PATH = f"HAT/{MODEL_FILENAME}"
 MODEL_SHA256 = (
     "2818c7ca8d72ec4cc5f31c93203d55252a662dd35cda34ce1a69661f97dcd38f"
 )
+MODEL_SHA256_PROVENANCE = (
+    "independently matched the official Google Drive artifact to the "
+    "immutable mirror revision"
+)
 MODEL_URL = (
     f"https://huggingface.co/{MODEL_MIRROR_REPOSITORY}/resolve/"
     f"{MODEL_MIRROR_REVISION}/{MODEL_MIRROR_PATH}?download=true"
@@ -36,6 +40,7 @@ MODEL_URL = (
 
 PYTHON_VERSION = "3.12"
 PYTORCH_INDEX_URL = "https://download.pytorch.org/whl/cu130"
+PYPI_INDEX_URL = "https://pypi.org/simple"
 TORCH_PACKAGES = ("torch==2.11.0", "torchvision==0.26.0")
 RUNTIME_PACKAGES = (
     "einops==0.8.2",
@@ -54,6 +59,14 @@ _SECRET_ENV_MARKERS = (
     "SECRET",
     "TOKEN",
 )
+_ISOLATED_ENV_NAMES = {
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "VIRTUAL_ENV",
+    "VIRTUAL_ENV_PROMPT",
+    "__PYVENV_LAUNCHER__",
+}
+_ISOLATED_ENV_PREFIXES = ("PIP_", "UV_")
 
 
 class ImageUpscaleError(ValueError):
@@ -124,6 +137,7 @@ def build_setup_commands(
         commands.append(
             [
                 uv_executable,
+                "--no-config",
                 "venv",
                 "--python",
                 PYTHON_VERSION,
@@ -134,20 +148,24 @@ def build_setup_commands(
         [
             [
                 uv_executable,
+                "--no-config",
                 "pip",
                 "install",
                 "--python",
                 str(python_path),
-                "--index-url",
+                "--default-index",
                 PYTORCH_INDEX_URL,
                 *TORCH_PACKAGES,
             ],
             [
                 uv_executable,
+                "--no-config",
                 "pip",
                 "install",
                 "--python",
                 str(python_path),
+                "--default-index",
+                PYPI_INDEX_URL,
                 *RUNTIME_PACKAGES,
             ],
         ]
@@ -196,6 +214,7 @@ def setup_upscaler(
             "torch_packages": list(TORCH_PACKAGES),
             "runtime_packages": list(RUNTIME_PACKAGES),
             "pytorch_index_url": PYTORCH_INDEX_URL,
+            "pypi_index_url": PYPI_INDEX_URL,
         },
         "model": model_identity(model_path),
         "commands": commands,
@@ -204,6 +223,7 @@ def setup_upscaler(
         return receipt
 
     runtime_path.parent.mkdir(parents=True, exist_ok=True)
+    setup_environment = _runtime_environment(cuda_visible_devices)
     for command in commands:
         completed = command_runner(
             command,
@@ -211,6 +231,7 @@ def setup_upscaler(
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            env=setup_environment,
         )
         if completed.returncode != 0:
             output = (completed.stdout or "").strip()
@@ -272,13 +293,16 @@ def run_upscale(
         raise ImageUpscaleError(f"Source image does not exist: {source_path}")
     source_hash = file_sha256(source_path)
     output_path = (
-        _absolute_path(output) if output else default_output_path(source_path)
+        _destination_path(output)
+        if output
+        else default_output_path(source_path)
     )
     if source_path == output_path:
         raise ImageUpscaleError("Source and output paths must be different")
+    _reject_symlink_destination(output_path, "Output")
     if output_path.suffix.lower() != ".png":
         raise ImageUpscaleError("Upscale output must use a .png suffix")
-    if output_path.exists() and not force:
+    if os.path.lexists(output_path) and not force:
         raise ImageUpscaleError(
             "Output already exists; pass --force to replace it: "
             f"{output_path}"
@@ -309,7 +333,8 @@ def run_upscale(
 
     receipt_output = None
     if receipt_path is not None:
-        receipt_output = _absolute_path(receipt_path)
+        receipt_output = _destination_path(receipt_path)
+        _reject_symlink_destination(receipt_output, "Receipt")
         protected_paths = {
             source_path,
             output_path,
@@ -322,7 +347,7 @@ def run_upscale(
                 "Receipt path must be separate from the source, output, "
                 "model, and runtime"
             )
-        if receipt_output.exists() and not force:
+        if os.path.lexists(receipt_output) and not force:
             raise ImageUpscaleError(
                 "Receipt already exists; pass --force to replace it: "
                 f"{receipt_output}"
@@ -409,18 +434,32 @@ def run_upscale(
             "Image upscale receipt output SHA-256 does not match the file"
         )
     output_dimensions = output_receipt.get("dimensions")
+    parameters_receipt = receipt.get("parameters", {})
+    target_height = (
+        parameters_receipt.get("target_height")
+        if isinstance(parameters_receipt, Mapping)
+        else None
+    )
     if (
         not isinstance(output_dimensions, list)
         or len(output_dimensions) != 2
         or output_dimensions[0] != target_width
+        or type(target_height) is not int
+        or target_height <= 0
+        or output_dimensions[1] != target_height
     ):
         raise ImageUpscaleError(
-            "Image upscale receipt output width does not match the target"
+            "Image upscale receipt output dimensions do not match the targets"
         )
 
     if receipt_output is not None:
         receipt["receipt_path"] = str(receipt_output)
-        _write_json_atomic(receipt_output, receipt, force=force)
+        try:
+            _write_json_atomic(receipt_output, receipt, force=force)
+        except (ImageUpscaleError, OSError) as exc:
+            raise ImageUpscaleError(
+                f"{exc}; completed upscale output remains at: {output_path}"
+            ) from exc
     return receipt
 
 
@@ -448,6 +487,7 @@ def model_identity(
         },
         "path": str(model_path),
         "sha256": MODEL_SHA256,
+        "sha256_provenance": MODEL_SHA256_PROVENANCE,
     }
     if verify:
         actual = file_sha256(model_path)
@@ -529,7 +569,8 @@ def _runtime_environment(cuda_visible_devices: str) -> dict[str, str]:
     environment = {
         key: value
         for key, value in os.environ.items()
-        if key not in {"PYTHONPATH", "PYTHONHOME", "__PYVENV_LAUNCHER__"}
+        if key.upper() not in _ISOLATED_ENV_NAMES
+        and not key.upper().startswith(_ISOLATED_ENV_PREFIXES)
         and not any(marker in key.upper() for marker in _SECRET_ENV_MARKERS)
     }
     environment.update(
@@ -582,12 +623,26 @@ def _absolute_path(value: str | os.PathLike[str]) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def _destination_path(value: str | os.PathLike[str]) -> Path:
+    """Make a destination absolute without following its final symlink."""
+
+    return Path(os.path.abspath(Path(value).expanduser()))
+
+
+def _reject_symlink_destination(path: Path, label: str) -> None:
+    if path.is_symlink():
+        raise ImageUpscaleError(
+            f"{label} path must not be a symbolic link: {path}"
+        )
+
+
 def _write_json_atomic(
     path: Path,
     payload: Mapping[str, Any],
     *,
     force: bool,
 ) -> None:
+    _reject_symlink_destination(path, "Receipt")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: str | None = None
     try:
@@ -605,6 +660,9 @@ def _write_json_atomic(
             handle.flush()
             os.fsync(handle.fileno())
         if force:
+            _reject_symlink_destination(path, "Receipt")
+            # Replacing the directory entry does not follow a final symlink
+            # that appears after the check, so its target remains untouched.
             os.replace(temporary_path, path)
         else:
             try:

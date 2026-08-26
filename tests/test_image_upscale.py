@@ -12,6 +12,7 @@ def test_setup_dry_run_is_reproducible_and_does_not_write(tmp_path):
     from sneeze.tpn.upscale.image_upscale import (
         MODEL_SHA256,
         MODEL_URL,
+        PYPI_INDEX_URL,
         PYTORCH_INDEX_URL,
         setup_upscaler,
     )
@@ -29,18 +30,94 @@ def test_setup_dry_run_is_reproducible_and_does_not_write(tmp_path):
     assert receipt["model"]["sha256"] == MODEL_SHA256
     assert receipt["model"]["download_mirror"]["url"] == MODEL_URL
     assert receipt["model"]["upstream"]["repository"] == "XPixelGroup/HAT"
+    assert "official Google Drive" in receipt["model"]["sha256_provenance"]
     assert receipt["runtime"]["pytorch_index_url"] == PYTORCH_INDEX_URL
+    assert receipt["runtime"]["pypi_index_url"] == PYPI_INDEX_URL
     assert receipt["commands"][0] == [
         "uv-test",
+        "--no-config",
         "venv",
         "--python",
         "3.12",
         str(runtime),
     ]
     assert "torch==2.11.0" in receipt["commands"][1]
+    assert (
+        receipt["commands"][1][
+            receipt["commands"][1].index("--default-index") + 1
+        ]
+        == PYTORCH_INDEX_URL
+    )
     assert "spandrel==0.4.2" in receipt["commands"][2]
+    assert (
+        receipt["commands"][2][
+            receipt["commands"][2].index("--default-index") + 1
+        ]
+        == PYPI_INDEX_URL
+    )
     assert not runtime.exists()
     assert not models.exists()
+
+
+def test_setup_sanitizes_package_resolution_environment(
+    tmp_path, monkeypatch
+):
+    from sneeze.tpn.upscale import image_upscale
+
+    runtime = tmp_path / "runtime"
+    python = runtime / "bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"")
+    calls = []
+    hostile_names = (
+        "PIP_INDEX_URL",
+        "UV_CONFIG_FILE",
+        "UV_DEFAULT_INDEX",
+        "UV_PYTHON",
+        "VIRTUAL_ENV",
+    )
+    for name in hostile_names:
+        monkeypatch.setenv(name, "/hostile-package-resolution")
+    monkeypatch.setattr(
+        image_upscale.shutil,
+        "which",
+        lambda _executable: "/resolved/uv",
+    )
+    monkeypatch.setattr(image_upscale, "_ensure_model", lambda _path: None)
+    monkeypatch.setattr(
+        image_upscale,
+        "model_identity",
+        lambda *_args, **_kwargs: {},
+    )
+
+    probe = {
+        "cuda_available": True,
+        "gpu": {"bfloat16_supported": True},
+        "python": "3.12.8",
+        "torch": "2.11.0+cu130",
+        "torch_cuda": "13.0",
+        "torchvision": "0.26.0+cu130",
+        "spandrel": "0.4.2",
+        "pillow": "12.3.0",
+        "numpy": "2.5.2",
+    }
+
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        stdout = json.dumps(probe) if "--probe" in argv else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    image_upscale.setup_upscaler(
+        runtime_dir=runtime,
+        model_cache=tmp_path / "models",
+        command_runner=runner,
+    )
+
+    assert len(calls) == 3
+    for _argv, kwargs in calls:
+        assert kwargs["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+        for name in hostile_names:
+            assert name not in kwargs["env"]
 
 
 def test_runtime_probe_requires_pinned_cuda_bf16_tuple():
@@ -68,6 +145,65 @@ def test_runtime_probe_requires_pinned_cuda_bf16_tuple():
         _validate_runtime_probe(unqualified)
 
 
+def test_runtime_tiled_matches_untiled_nearest():
+    import importlib.util
+    import sys
+
+    if importlib.util.find_spec("torch") is None:
+        pytest.skip("Torch is installed only in the isolated upscale runtime")
+
+    script = """
+import torch
+
+from sneeze.tpn.upscale.image_upscale_runtime import _run_tiled
+
+
+class NearestX2:
+    scale = 2
+    output_channels = 3
+
+    def __call__(self, tensor):
+        return torch.nn.functional.interpolate(
+            tensor,
+            scale_factor=self.scale,
+            mode="nearest",
+        )
+
+
+for height, width, tile_size, overlap in (
+    (7, 11, 4, 1),
+    (3, 2, 8, 1),
+    (5, 9, 4, 3),
+):
+    tensor = torch.arange(
+        3 * height * width,
+        dtype=torch.float32,
+    ).reshape(1, 3, height, width)
+    model = NearestX2()
+    expected = model(tensor)
+    actual = _run_tiled(
+        model,
+        tensor,
+        torch=torch,
+        tile_size=tile_size,
+        overlap=overlap,
+    )
+    if not torch.equal(actual, expected):
+        raise AssertionError(
+            f"tiled mismatch for {(height, width, tile_size, overlap)}"
+        )
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    assert completed.returncode == 0, completed.stdout
+
+
 def test_default_output_is_non_destructive_sibling(tmp_path):
     from sneeze.tpn.upscale.image_upscale import default_output_path
 
@@ -90,6 +226,31 @@ def test_run_upscale_refuses_existing_output_before_runtime(tmp_path):
         run_upscale(source=source, output=output)
 
     assert output.read_bytes() == b"owned"
+
+
+@pytest.mark.parametrize("target_exists", (False, True))
+def test_run_upscale_rejects_symlink_output_before_runtime(
+    tmp_path, target_exists
+):
+    from sneeze.tpn.upscale.image_upscale import (
+        ImageUpscaleError,
+        run_upscale,
+    )
+
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    target = tmp_path / "unrelated.png"
+    if target_exists:
+        target.write_bytes(b"unrelated")
+    output = tmp_path / "output.png"
+    output.symlink_to(target)
+
+    with pytest.raises(ImageUpscaleError, match="symbolic link"):
+        run_upscale(source=source, output=output, force=True)
+
+    assert output.is_symlink()
+    if target_exists:
+        assert target.read_bytes() == b"unrelated"
 
 
 def test_run_upscale_validates_model_hash_before_child(tmp_path):
@@ -135,6 +296,7 @@ def test_run_upscale_launches_isolated_runtime_and_writes_receipt(
     model.write_bytes(b"model")
     receipt_path = tmp_path / "receipt.json"
     calls = []
+    reported_dimensions = [3840, 2160]
     for name in ("PYTHONPATH", "PYTHONHOME", "__PYVENV_LAUNCHER__"):
         monkeypatch.setenv(name, "/hostile-parent-python-path")
 
@@ -154,9 +316,10 @@ def test_run_upscale_launches_isolated_runtime_and_writes_receipt(
             },
             "output": {
                 "path": str(output),
-                "dimensions": [3840, 2160],
+                "dimensions": list(reported_dimensions),
                 "sha256": image_upscale.file_sha256(output),
             },
+            "parameters": {"target_height": 2160},
         }
         return subprocess.CompletedProcess(
             argv,
@@ -186,6 +349,17 @@ def test_run_upscale_launches_isolated_runtime_and_writes_receipt(
     assert receipt["receipt_path"] == str(receipt_path)
     persisted = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert persisted == receipt
+
+    output.unlink()
+    reported_dimensions[1] = 1080
+    with pytest.raises(image_upscale.ImageUpscaleError, match="dimensions"):
+        image_upscale.run_upscale(
+            source=source,
+            output=output,
+            runtime_dir=runtime,
+            model_cache=models,
+            command_runner=runner,
+        )
 
 
 def test_run_upscale_preserves_receipt_that_appears_during_inference(
@@ -225,6 +399,7 @@ def test_run_upscale_preserves_receipt_that_appears_during_inference(
                 "dimensions": [3840, 2160],
                 "sha256": image_upscale.file_sha256(output),
             },
+            "parameters": {"target_height": 2160},
         }
         return subprocess.CompletedProcess(
             argv,
@@ -236,7 +411,7 @@ def test_run_upscale_preserves_receipt_that_appears_during_inference(
     with pytest.raises(
         image_upscale.ImageUpscaleError,
         match="Receipt appeared while upscaling",
-    ):
+    ) as caught:
         image_upscale.run_upscale(
             source=source,
             output=output,
@@ -247,6 +422,8 @@ def test_run_upscale_preserves_receipt_that_appears_during_inference(
         )
 
     assert receipt_path.read_text(encoding="utf-8") == "owned"
+    assert output.read_bytes() == b"upscaled"
+    assert str(output) in str(caught.value)
 
 
 def test_runtime_png_publish_honors_umask_and_is_atomic(
@@ -283,6 +460,22 @@ def test_runtime_png_publish_honors_umask_and_is_atomic(
     assert stat.S_IMODE(output.stat().st_mode) == 0o640
     assert observed_umasks == [0, 0o027, 0, 0o027]
     assert not temporary.exists()
+
+    victim = tmp_path / "victim.png"
+    victim.write_bytes(b"victim")
+    symlink_output = tmp_path / "symlink-output.png"
+    symlink_output.symlink_to(victim)
+    replacement = tmp_path / "replacement.png"
+    replacement.write_bytes(b"replacement")
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        image_upscale_runtime._publish_png(
+            str(replacement), symlink_output, force=True
+        )
+
+    assert symlink_output.is_symlink()
+    assert victim.read_bytes() == b"victim"
+    assert replacement.read_bytes() == b"replacement"
 
 
 def test_run_upscale_refuses_receipt_alias_before_child(
@@ -328,6 +521,55 @@ def test_run_upscale_refuses_receipt_alias_before_child(
 
     assert called is False
     assert source.read_bytes() == b"source"
+
+
+def test_run_upscale_rejects_symlink_receipt_before_child(
+    tmp_path, monkeypatch
+):
+    from sneeze.tpn.upscale import image_upscale
+
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    output = tmp_path / "output.png"
+    runtime = tmp_path / "runtime"
+    python = runtime / "bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"")
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / image_upscale.MODEL_FILENAME).write_bytes(b"model")
+    receipt_target = tmp_path / "unrelated.json"
+    receipt_target.write_text("owned", encoding="utf-8")
+    receipt = tmp_path / "receipt.json"
+    receipt.symlink_to(receipt_target)
+    called = False
+
+    monkeypatch.setattr(
+        image_upscale,
+        "model_identity",
+        lambda *_args, **_kwargs: {},
+    )
+
+    def runner(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    with pytest.raises(
+        image_upscale.ImageUpscaleError, match="symbolic link"
+    ):
+        image_upscale.run_upscale(
+            source=source,
+            output=output,
+            runtime_dir=runtime,
+            model_cache=models,
+            receipt_path=receipt,
+            force=True,
+            command_runner=runner,
+        )
+
+    assert called is False
+    assert receipt.is_symlink()
+    assert receipt_target.read_text(encoding="utf-8") == "owned"
 
 
 def test_upscale_command_forwards_options(monkeypatch, tmp_path):
