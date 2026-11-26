@@ -18,7 +18,8 @@ class UpscaleVideo(InvariantAwareCommand):
 
     _usage_ = "%prog [options] INPUT [INPUT ...]"
     _description_ = (
-        "Double the displayed width and height of each CFR SDR input. "
+        "Upscale the displayed dimensions of each CFR SDR input "
+        "(default 2×). Choose --scale or --target-size to change them. "
         "The CPU decoder handles non-square pixels and quarter-turn "
         "rotation. Save a lossless H.264 MP4 with live frame progress. "
         "To compare the input with "
@@ -49,6 +50,27 @@ class UpscaleVideo(InvariantAwareCommand):
         _arg = "--output-dir"
         _metavar = "DIR"
         _help = "Write all outputs here. Defaults to each input's directory."
+        _mandatory = False
+
+    class ScaleArg(StringInvariant):
+        _arg = "--scale"
+        _metavar = "FACTOR"
+        _help = (
+            "Multiply both displayed dimensions by a positive decimal or "
+            "fraction (e.g. 1.5 or 3/2, default 2). Scaled dimensions "
+            "round to the nearest even pixel. Choose this or --target-size."
+        )
+        _mandatory = False
+
+    class TargetSizeArg(StringInvariant):
+        _arg = "--target-size"
+        _metavar = "WIDTHxHEIGHT"
+        _help = (
+            "Set even output dimensions matching the input's display "
+            "aspect ratio, e.g. 3840x2160. Use 3840xauto or autox2160 "
+            "to calculate the other dimension to the nearest even pixel. "
+            "Choose this or --scale."
+        )
         _mandatory = False
 
     class CompareArg(BoolInvariant):

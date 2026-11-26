@@ -11,8 +11,10 @@ from pathlib import Path
 
 if __package__:
     from .encoder_geometry import resolve_encoder
+    from .sizing import resolve_target
 else:
     from encoder_geometry import resolve_encoder
+    from sizing import resolve_target
 
 SCRIPTS = Path(__file__).resolve().parent
 WORK = Path("/output")
@@ -274,6 +276,12 @@ def main(model, source):
     decoder = os.environ.get("VSR_DECODER", "cpu")
     validate_source(v, decoder)
     width, height = display_geometry(v)
+    target_width, target_height = resolve_target(
+        width,
+        height,
+        scale=os.getenv("VSR_SCALE"),
+        target_size=os.getenv("VSR_TARGET_SIZE"),
+    )
     # OpenCV's bundled FFmpeg lacks a working software AV1 decoder here.
     # Keep the measured H.264/HEVC path for normal square-pixel material.
     if decoder == "nvdec":
@@ -294,7 +302,7 @@ def main(model, source):
         f"Input {v['codec_name']} {v['width']}x{v['height']} stored "
         f"(SAR {v.get('sample_aspect_ratio') or 'unspecified'}), "
         f"{width}x{height} displayed, {count} frames at {rate} fps; "
-        f"target {2 * width}x{2 * height} ({input_label} input)",
+        f"target {target_width}x{target_height} ({input_label} input)",
         flush=True,
     )
     audio = [t for t in tracks if t["codec_type"] == "audio"]
@@ -304,12 +312,14 @@ def main(model, source):
         VSR_ENCODER=resolve_encoder(
             os.environ.get("VSR_ENCODER", "cpu"),
             os.environ.get("VSR_ENCODER_REQUEST", "auto"),
-            2 * width,
-            2 * height,
+            target_width,
+            target_height,
             rate,
         ),
         JOB_WIDTH=str(width),
         JOB_HEIGHT=str(height),
+        JOB_TARGET_WIDTH=str(target_width),
+        JOB_TARGET_HEIGHT=str(target_height),
         JOB_RATE=str(rate),
         JOB_COUNT=str(count),
         JOB_INPUT_CODEC=v["codec_name"],
@@ -336,7 +346,8 @@ def main(model, source):
     w = video(out)
     frames, first = timestamps(dest, w, rate)
     if (
-        (w["width"], w["height"], frames) != (2 * width, 2 * height, count)
+        (w["width"], w["height"], frames)
+        != (target_width, target_height, count)
         or first != 0
         or Fraction(w["avg_frame_rate"]) != rate
         or pixel_aspect_ratio(w) != 1

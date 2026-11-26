@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Trent Nelson
-"""Render a silent, lossless 2× FlashVSR+ Turbo video."""
+"""Render a silent, lossless FlashVSR+ Turbo video."""
 
 import argparse
 import os
@@ -21,6 +21,8 @@ from inference.output import IncrementalVideoWriter
 from inference.preprocessing import input as preprocessing
 from inference.presets import model_paths_for_mode, stream_config_for_mode
 from inference.runners import stream
+from PIL import Image
+from worker_canvas import ModelCanvas, target_dimensions
 
 
 def install_cpu_encoder(rate):
@@ -53,31 +55,31 @@ def install_cpu_encoder(rate):
     video_output.imageio.get_writer = lossless_x264
 
 
-def install_io(height, width, rate, frames, decoder, encoder, lookahead):
-    # The DiT takes 128-aligned images. Pad before the 2× resize so the PIL
-    # filter and all original pixels keep their scale and center.
-    grid = INPUT_MULTIPLE // 2
-    extra_h, extra_w = -height % grid, -width % grid
-    top, left = extra_h // 2, extra_w // 2
-    resize = preprocessing.pil_center_crop_resize
+def install_io(canvas, rate, frames, decoder, encoder, lookahead):
+    def pad_resize(
+        frames,
+        target_height,
+        target_width,
+        *,
+        resample=Image.Resampling.BILINEAR,
+    ):
+        if (target_height, target_width) != (
+            canvas.padded_height,
+            canvas.padded_width,
+        ):
+            raise ValueError("Unexpected Turbo model canvas dimensions")
 
-    def pad_resize(frames, target_height, target_width, **kwargs):
-        if frames.shape[1:3] != (height, width):
-            raise ValueError(
-                f"Decoded dimensions changed to {frames.shape[1:3]}"
+        def resize_full(images, width, height):
+            return np.stack(
+                [
+                    np.asarray(
+                        Image.fromarray(rgb).resize((width, height), resample)
+                    )
+                    for rgb in images
+                ]
             )
-        if extra_h or extra_w:
-            frames = np.pad(
-                frames,
-                (
-                    (0, 0),
-                    (top, extra_h - top),
-                    (left, extra_w - left),
-                    (0, 0),
-                ),
-                mode="edge",
-            )
-        return resize(frames, target_height, target_width, **kwargs)
+
+        return canvas.prepare(frames, resize_full)
 
     preprocessing.pil_center_crop_resize = pad_resize
     av1_nvdec = decoder == "nvdec" and os.getenv("JOB_INPUT_CODEC") == "av1"
@@ -129,9 +131,8 @@ def install_io(height, width, rate, frames, decoder, encoder, lookahead):
         if encoder == "nvenc" and writer.frame_count == 0:
             # Give FFmpeg the exact CFR fraction, including NTSC rates.
             writer.writer.fps = rate
-        crop = video[
-            ..., 2 * top : 2 * (top + height), 2 * left : 2 * (left + width)
-        ]
+        rows, columns = canvas.content
+        crop = video[..., rows, columns]
         append(writer, crop, **kwargs)
         count = writer.frame_count
 
@@ -150,7 +151,6 @@ def install_io(height, width, rate, frames, decoder, encoder, lookahead):
         os.replace(encoded_video, destination)
 
     pipeline.mux_source_audio = finish_silent
-    return 2 * (height + extra_h), 2 * (width + extra_w)
 
 
 def keep_dit_resident(bundle, state, device):
@@ -207,9 +207,10 @@ def main():
     )
     sparse_fa4.install()
     stream._offload_dit = stream._restore_dit = keep_dit_resident
-    canvas_height, canvas_width = install_io(
-        height, width, rate, expected, decoder, encoder, lookahead
+    canvas = ModelCanvas(
+        width, height, *target_dimensions(width, height), INPUT_MULTIPLE
     )
+    install_io(canvas, rate, expected, decoder, encoder, lookahead)
     source_dir = Path(inference.__file__).resolve().parents[1]
     weights = Path(decoder_speed.__file__).resolve().parent / "models/turbo"
     config = stream_config_for_mode(
@@ -231,8 +232,8 @@ def main():
         InferenceRequest(
             input_path=args.input,
             output_path=args.output,
-            height=canvas_height,
-            width=canvas_width,
+            height=canvas.padded_height,
+            width=canvas.padded_width,
             fps=float(rate),
         ),
         progress=print,
@@ -244,7 +245,7 @@ def main():
         )
     print(
         f"Turbo rendered {result.frames} frames at "
-        f"{2 * width}×{2 * height}, {rate} fps",
+        f"{canvas.width}×{canvas.height}, {rate} fps",
         flush=True,
     )
 

@@ -13,6 +13,11 @@ from contextlib import contextmanager
 from fractions import Fraction
 from pathlib import Path
 
+if __package__:
+    from .worker_canvas import ModelCanvas, target_dimensions
+else:
+    from worker_canvas import ModelCanvas, target_dimensions
+
 # Distilled LTX-2.5's published eight-step Euler schedule.
 SIGMAS = (
     1.0,
@@ -26,12 +31,6 @@ SIGMAS = (
     0.0,
 )
 TILE_FRAMES = 97
-
-
-def spatial_padding(width, height):
-    # LTX compresses 32 output pixels into one latent. Pad before 2x Lanczos.
-    pw, ph = -width % 16, -height % 16
-    return pw // 2, ph // 2, pw - pw // 2, ph - ph // 2
 
 
 def padded_frames(count):
@@ -133,7 +132,7 @@ def load_models(root, prompt, strength, rate):
     return model, vae, positive, negative
 
 
-def guide_latents(frames, models, width, height):
+def guide_latents(frames, models, canvas):
     import cv2
     import nodes
     import torch
@@ -141,22 +140,21 @@ def guide_latents(frames, models, width, height):
     from ltxnodes.iclora import LTXAddVideoICLoRAGuide
 
     _, vae, positive, negative = models
-    left, top, right, bottom = spatial_padding(width, height)
-    w, h = 2 * (width + left + right), 2 * (height + top + bottom)
+    w, h = canvas.padded_width, canvas.padded_height
     count = padded_frames(len(frames))
     guide = torch.empty((count, h, w, 3), dtype=torch.float32, device="cpu")
     scaler = nodes.ImageScale()
-    for i, bgr in enumerate(frames):
-        if bgr.shape != (height, width, 3):
-            raise ValueError(
-                f"Unexpected input shape {bgr.shape} for {width}x{height}"
-            )
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        rgb = cv2.copyMakeBorder(
-            rgb, top, bottom, left, right, cv2.BORDER_REPLICATE
+
+    def lanczos(frames, width, height):
+        image = torch.from_numpy(frames).float().div_(255)
+        (scaled,) = scaler.upscale(
+            image, "lanczos", width, height, "disabled"
         )
-        image = torch.from_numpy(rgb).unsqueeze(0).float().div_(255)
-        guide[i] = scaler.upscale(image, "lanczos", w, h, "disabled")[0][0]
+        return scaled.numpy()
+
+    for i, bgr in enumerate(frames):
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        guide[i] = torch.from_numpy(canvas.prepare(rgb[None], lanczos)[0])
     if len(frames) < count:
         guide[len(frames) :] = guide[len(frames) - 1]
     (empty,) = EmptyLTXVLatentVideo.execute(w, h, count, 1).result
@@ -204,7 +202,7 @@ def denoise_progress(total):
         fusion._one_sampler_step = original
 
 
-def denoise(frames, models, width, height, seed):
+def denoise(frames, models, canvas, seed):
     import comfy.samplers
     import torch
     from attention_backend import calls, install
@@ -216,15 +214,18 @@ def denoise(frames, models, width, height, seed):
     )
 
     model, vae, _, _ = models
-    positive, negative, guide = guide_latents(frames, models, width, height)
+    positive, negative, guide = guide_latents(frames, models, canvas)
     count = padded_frames(len(frames))
     plan = resolve_tiling_plan(
-        width, height, count, tile_size="HD", output_size="4K"
+        canvas.source_width,
+        canvas.source_height,
+        count,
+        tile_size="HD",
+        output_size="4K",
     )
-    left, top, right, bottom = spatial_padding(width, height)
     nx, ny = spatial_tile_grid(
-        2 * (width + left + right),
-        2 * (height + top + bottom),
+        canvas.padded_width,
+        canvas.padded_height,
         plan.tile_width,
         plan.tile_height,
         plan.overlap_frac,
@@ -283,22 +284,20 @@ def decode_vae(sampled, vae, vae_tile):
     return decoder.decode(vae, sampled, 1536, 64, 128, 32)[0]
 
 
-def decoded_rgb(frames, models, width, height, seed, vae_tile):
+def decoded_rgb(frames, models, canvas, seed, vae_tile):
     import torch
 
-    sampled = denoise(frames, models, width, height, seed)
+    sampled = denoise(frames, models, canvas, seed)
     gc.collect()
     decoded = decode_vae(sampled, models[1], vae_tile)
-    left, top, right, bottom = spatial_padding(width, height)
-    w, h = 2 * (width + left + right), 2 * (height + top + bottom)
+    w, h = canvas.padded_width, canvas.padded_height
     if tuple(decoded.shape) != (padded_frames(len(frames)), h, w, 3):
         raise RuntimeError(
             f"Unexpected LTX output shape {tuple(decoded.shape)}"
         )
+    rows, columns = canvas.content
     for frame in decoded[: len(frames)]:
-        crop = frame[
-            2 * top : 2 * (top + height), 2 * left : 2 * (left + width)
-        ]
+        crop = frame[rows, columns]
         yield (
             crop.cpu()
             .float()
@@ -318,6 +317,7 @@ def main(source, output):
     root = Path.cwd()
     width = int(os.environ["JOB_WIDTH"])
     height = int(os.environ["JOB_HEIGHT"])
+    canvas = ModelCanvas(width, height, *target_dimensions(width, height), 32)
     count = int(os.environ["JOB_COUNT"])
     rate = Fraction(os.environ["JOB_RATE"])
     chunk = int(os.environ["VSR_LTX_CHUNK"])
@@ -343,7 +343,7 @@ def main(source, output):
         with (
             open_reader(source, "cpu", count) as reader,
             open_encoder(
-                output, "cpu", 2 * width, 2 * height, str(rate)
+                output, "cpu", canvas.width, canvas.height, str(rate)
             ) as append,
         ):
 
@@ -361,9 +361,7 @@ def main(source, output):
                     f"LTX Chunk frames {start + 1}–{end} of {count}",
                     flush=True,
                 )
-                rgb = decoded_rgb(
-                    frames, models, width, height, seed, vae_tile
-                )
+                rgb = decoded_rgb(frames, models, canvas, seed, vae_tile)
                 tail = join_chunk(rgb, tail, overlap, end == count, write)
                 print(f"VSR_PROGRESS {written} {count}", flush=True)
     if written != count:

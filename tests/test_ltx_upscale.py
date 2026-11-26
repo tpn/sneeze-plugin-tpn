@@ -27,9 +27,10 @@ class FrameReader:
 
 
 def test_spatial_padding_preserves_exact_2x_crop():
-    assert ltx.spatial_padding(1920, 1080) == (0, 4, 0, 4)
+    assert ltx.ModelCanvas(1920, 1080, 3840, 2160, 32).padding == (0, 8, 0, 8)
     for width, height in ((1280, 720), (354, 206), (197, 351), (1, 1)):
-        left, top, right, bottom = ltx.spatial_padding(width, height)
+        canvas = ltx.ModelCanvas(width, height, 2 * width, 2 * height, 32)
+        left, top, right, bottom = (n // 2 for n in canvas.padding)
         assert 0 <= left + right < 16
         assert 0 <= top + bottom < 16
         assert abs(left - right) <= 1
@@ -161,12 +162,18 @@ def test_guide_and_decoder_pad_replicate_then_crop_exactly(monkeypatch):
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
 
-    def identity_denoise(part, models, width, height, _seed):
-        return ltx.guide_latents(part, models, width, height)[0]
+    def identity_denoise(part, models, canvas, _seed):
+        return ltx.guide_latents(part, models, canvas)[0]
 
     monkeypatch.setattr(ltx, "denoise", identity_denoise)
     output = list(
-        ltx.decoded_rgb(frames, (None,) * 4, width, height, 42, 2048)
+        ltx.decoded_rgb(
+            frames,
+            (None,) * 4,
+            ltx.ModelCanvas(width, height, 2 * width, 2 * height, 32),
+            42,
+            2048,
+        )
     )
     expected = frames[..., ::-1].repeat(2, axis=1).repeat(2, axis=2)
     np.testing.assert_array_equal(np.stack(output), expected)

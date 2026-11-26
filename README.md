@@ -2,23 +2,35 @@
 
 Public Sneeze plugin package for `sneeze.tpn`.
 
-## Local 2× video upscaling
+## Local video upscaling
 
-`sne upscale-video` (alias `sne uv`) doubles the **display width and
-height** of a local constant-frame-rate SDR video and saves a square-pixel
-H.264 MP4 at the source frame rate. Landscape, portrait, odd-sized and
-nonstandard input rasters are supported. The workers pad to their model's
-internal alignment where needed, then crop the result to the target.
+`sne upscale-video` (alias `sne uv`) restores a local constant-frame-rate
+SDR video and saves a square-pixel H.264 MP4 at the source frame rate.
+All three models default to 2× the **display width and height**.
+For example, a 720×576 video with a 16:15 sample aspect ratio displays
+at 768×576 and defaults to 1536×1152. Sizing accounts for quarter-turn
+rotation and rounds fractional display widths to whole pixels first.
 
-For example, 1280×720 becomes 2560×1440. A 720×576 video with a 16:15
-sample aspect ratio displays at 768×576, so its output is 1536×1152.
-The CPU decoder normalizes non-square pixels and applies quarter-turn
-display rotation before inference. Fractional display widths round to the
-nearest whole pixel before doubling. All three presets use 2×. The command
-has no target-size or scale option.
+Choose one sizing option to override the default. Scaling applies to each
+input independently. The model renders at the requested size, with temporary
+padding as needed for its internal alignment.
+
+| Option | Example | Result for a 1280×720 input |
+| --- | --- | --- |
+| `--scale FACTOR` | `--scale 1.5` or `--scale 3/2` | 1920×1080 |
+| `--target-size WIDTHxHEIGHT` | `--target-size 3840x2160` | 3840×2160 |
+| `--target-size WIDTHxauto` | `--target-size 1920xauto` | 1920×1080 |
+| `--target-size autoxHEIGHT` | `--target-size autox1440` | 2560×1440 |
+
+Use `--scale 1` for restoration at the display size. Inferred dimensions
+round to the nearest even pixel for H.264. An explicit dimension must be
+even. If you specify both dimensions, their proportions must match the
+display aspect ratio within rounding. Use `auto` on one axis when processing
+inputs with different aspect ratios.
 
 ```sh
 sne uv input.mp4
+sne uv --target-size autox1080 input.mp4
 sne uv -m seedvr2 -o enhanced.mp4 input.mp4
 sne uv -m seedvr2 --decoder nvdec --encoder nvenc input-av1.mp4
 sne uv -m ltx --compare input.mp4
@@ -33,7 +45,8 @@ sne uv --dry-run --output-dir results "first input.mp4" "second input.mp4"
 | `ltx` | LTX-2.5 22B with the Refine Details adapter at full strength, FlashAttention-4, 2048-pixel VAE tiles, CPU decode and x264 output |
 
 `-m both` selects Turbo and SeedVR2. `-m all` selects all three models.
-Each input and model gets its own file named `<input-stem>-<model>-2x.mp4`.
+Each input and model gets its own file. The default name is
+`<input-stem>-<model>-2x.mp4`. Custom sizes appear in the output names.
 With `--compare`, the command also produces a labeled viewing copy. The
 four-panel version shows the input and Turbo above SeedVR2 and LTX.
 

@@ -13,13 +13,15 @@ import numpy as np
 import seed_input
 import torch
 import tuning
+from worker_canvas import target_dimensions
 from worker_io import open_encoder, open_reader
 
 
 def main():
     source, output = map(Path, sys.argv[1:])
-    width = 2 * int(os.environ["JOB_WIDTH"])
-    height = 2 * int(os.environ["JOB_HEIGHT"])
+    source_width = int(os.environ["JOB_WIDTH"])
+    source_height = int(os.environ["JOB_HEIGHT"])
+    width, height = target_dimensions(source_width, source_height)
     rate = os.environ["JOB_RATE"]
     frame_count = int(os.environ["JOB_COUNT"])
     seed = int(os.environ.get("VSR_SEED", "42"))
@@ -99,6 +101,17 @@ def main():
         "--video_backend",
         "ffmpeg",
     ]
+    if (width, height) != (2 * source_width, 2 * source_height):
+        from src.core import generation_utils
+        from torchvision.transforms import InterpolationMode, Resize
+
+        # The stock shortest-edge transform rounds the longer side down,
+        # which can miss the requested even raster by a pixel or two.
+        # Both its shape probe and inference pipeline use this factory.
+        generation_utils.NaResize = lambda **kwargs: Resize(
+            (height, width), InterpolationMode.BICUBIC, antialias=True
+        )
+
     args = engine.parse_arguments()
     engine.debug.enabled = False
     attention.install()

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Trent Nelson
 # SPDX-License-Identifier: Apache-2.0
-"""Plan serial 2× video jobs and run the pinned inference containers."""
+"""Plan video upscaling jobs and run the pinned inference containers."""
 
 import csv
 import fcntl
@@ -15,9 +15,12 @@ import uuid
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
+from fractions import Fraction
 from itertools import groupby
 from pathlib import Path
 from threading import current_thread, main_thread
+
+from .sizing import parse_scale, parse_target_size
 
 WORKERS = Path(__file__).resolve().parent
 IMAGE = (
@@ -191,6 +194,27 @@ def check_destination(path, force):
             )
 
 
+def requested_size(opts):
+    """Return normalized worker settings and a filesystem-safe size label."""
+    scale = opts.get("scale")
+    target = opts.get("target_size")
+    if scale is not None and target is not None:
+        raise ValueError("Choose either --scale or --target-size")
+    if target is not None:
+        width, height = parse_target_size(target)
+        label = f"{width or 'auto'}x{height or 'auto'}"
+        return {"target_size": label}, label
+    if scale is None:
+        return {}, "2x"
+    factor = parse_scale(scale)
+    # Prefer a short decimal such as 1.5x. Keep the exact fraction in
+    # the filename when rounding would collide with a different scale.
+    label = f"{factor:g}"
+    if Fraction(label) != factor:
+        label = str(factor).replace("/", "over")
+    return {"scale": str(factor)}, f"{label}x"
+
+
 def plan(args, opts):
     if not args:
         raise ValueError(
@@ -202,6 +226,7 @@ def plan(args, opts):
     }
     selected = choice(opts, "model", "turbo", (*groups["all"], *groups))
     models = groups.get(selected, (selected,))
+    size_settings, size_label = requested_size(opts)
     if selected == "ltx" and opts.get("lookahead") is not None:
         raise ValueError("--lookahead applies only to Turbo and SeedVR2")
     specific = {
@@ -264,7 +289,7 @@ def plan(args, opts):
                 Path(output).expanduser()
                 if output
                 else (directory or source.parent)
-                / f"{source.stem}-{model}-2x.mp4"
+                / f"{source.stem}-{model}-{size_label}.mp4"
             )
             # Resolve the directory only so a final symlink is visible.
             dest = dest.parent.resolve() / dest.name
@@ -274,12 +299,15 @@ def plan(args, opts):
                     model,
                     source,
                     dest,
-                    settings(model, opts),
+                    settings(model, opts) | size_settings,
                     encoder_request=opts.get("encoder") or "auto",
                 )
             )
         if opts.get("compare"):
-            preview = dest.with_name(f"{source.stem}-{selected}-compare.mp4")
+            size_suffix = "" if size_label == "2x" else f"-{size_label}"
+            preview = dest.with_name(
+                f"{source.stem}-{selected}{size_suffix}-compare.mp4"
+            )
             reserve(preview)
             jobs[-1].preview = preview
     return jobs
@@ -525,6 +553,8 @@ def describe(job, index, count):
     config = "  ".join(
         f"{k.replace('_', '-')}={v}" for k, v in job.settings.items()
     )
+    if "scale" not in job.settings and "target_size" not in job.settings:
+        config += "  scale=2"
     title = f"[{index}/{count}] {job.model}  {job.source} → {job.output}"
     return f"{title}\n  {config}"
 
