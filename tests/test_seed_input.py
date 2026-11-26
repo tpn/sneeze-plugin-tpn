@@ -4,10 +4,15 @@
 from argparse import Namespace
 from contextlib import contextmanager
 from threading import Event, get_ident
+from unittest.mock import Mock
 
 import pytest
 
-from sneeze.tpn.video_upscale.seed_input import open_input, resolve_lookahead
+from sneeze.tpn.video_upscale.seed_input import (
+    open_input,
+    resize_frames,
+    resolve_lookahead,
+)
 
 
 class Source:
@@ -145,3 +150,35 @@ def test_upstream_chunk_processor_preserves_context_and_prepend(
         calls, ((0, 5), (3, 10), (8, 13)), strict=True
     ):
         assert torch.equal(tensor, expected[start:stop])
+
+
+def test_cuda_resize_retries_oversized_antialias_filter_on_cpu():
+    frames = Mock(is_cuda=True)
+    scaled = Mock()
+    resize = Mock(
+        side_effect=[
+            RuntimeError("Too much shared memory required: 518020 vs 49152"),
+            scaled,
+        ]
+    )
+
+    assert resize_frames(resize, frames) is scaled.to.return_value
+    resize.assert_any_call(frames)
+    resize.assert_called_with(frames.cpu.return_value)
+    scaled.to.assert_called_once_with(frames.device)
+
+
+@pytest.mark.parametrize(
+    ("on_cuda", "message"),
+    [
+        (True, "unrelated CUDA failure"),
+        (False, "Too much shared memory required"),
+    ],
+)
+def test_resize_propagates_other_errors(on_cuda, message):
+    frames = Mock(is_cuda=on_cuda)
+    resize = Mock(side_effect=RuntimeError(message))
+
+    with pytest.raises(RuntimeError, match=message):
+        resize_frames(resize, frames)
+    resize.assert_called_once_with(frames)

@@ -4,6 +4,7 @@
 
 import os
 import sys
+from functools import partial
 from pathlib import Path
 
 import attention
@@ -108,9 +109,12 @@ def main():
         # The stock shortest-edge transform rounds the longer side down,
         # which can miss the requested even raster by a pixel or two.
         # Both its shape probe and inference pipeline use this factory.
-        generation_utils.NaResize = lambda **kwargs: Resize(
+        resize = Resize(
             (height, width), InterpolationMode.BICUBIC, antialias=True
         )
+
+        resize_input = partial(seed_input.resize_frames, resize)
+        generation_utils.NaResize = lambda **kwargs: resize_input
 
     args = engine.parse_arguments()
     engine.debug.enabled = False

@@ -14,6 +14,19 @@ def resolve_lookahead(raw_depth):
     return parse_lookahead(raw_depth, model="SeedVR2", default=0)
 
 
+def resize_frames(resize, frames):
+    try:
+        return resize(frames)
+    except RuntimeError as error:
+        # CUDA antialias needs shared memory proportional to the shrink
+        # factor. Apply the same filter on CPU if the kernel cannot fit it.
+        if not frames.is_cuda or "Too much shared memory required" not in str(
+            error
+        ):
+            raise
+    return resize(frames.cpu()).to(frames.device)
+
+
 def read_windows(make_capture, frame_count, chunk_size, lookahead):
     import cv2
     import numpy as np
