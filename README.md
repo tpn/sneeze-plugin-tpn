@@ -69,6 +69,12 @@ paths alone or `-v` for full worker logs. Audio defaults to stream copy
 with AAC fallback. Outputs are staged and verified before publication.
 See `sne uv --help` for codec, audio and model-specific options.
 
+Press Ctrl-C to cancel the command and its queued jobs. During a render
+or comparison, Sneeze removes its worker container and partial output,
+releases the GPU lock, and exits with status 130. Ctrl-C while waiting
+for the lock cancels only the waiting command. Completed outputs from
+earlier jobs in the batch stay available.
+
 The default CPU input path uses FFmpeg software decoding for AV1 and
 display normalization. Turbo and SeedVR2 also support `--decoder nvdec`
 for 8- or 10-bit 4:2:0 SDR AV1 with even stored dimensions on the

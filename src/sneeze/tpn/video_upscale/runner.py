@@ -6,6 +6,7 @@ import csv
 import fcntl
 import io
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -13,7 +14,7 @@ import time
 import tomllib
 import uuid
 from collections import deque
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from fractions import Fraction
 from itertools import groupby
@@ -428,20 +429,178 @@ def duration(seconds):
     return f"{minutes}:{seconds:02d}"
 
 
+@contextmanager
+def guard_launch_or_cleanup():
+    # Record the first signal while obtaining a child handle or removing
+    # resources. Children keep their normal unblocked signal masks.
+    if current_thread() is not main_thread():
+        yield
+        return
+    pending = None
+
+    def remember(signum, _frame):
+        nonlocal pending
+        if pending is None:
+            pending = signum
+
+    with ExitStack() as restore:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous = signal.signal(signum, remember)
+            restore.callback(signal.signal, signum, previous)
+        yield
+    if pending is not None:
+        signal.raise_signal(pending)
+
+
+def docker_control(arguments, timeout):
+    # GNU timeout forwards TERM then KILL to its process group. It runs as
+    # the caller; the only privileged executable is the configured Docker.
+    command = ["timeout", "--kill-after=1", str(timeout), *DOCKER, *arguments]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            start_new_session=True,
+            timeout=timeout + 3,
+        )
+    except subprocess.TimeoutExpired:
+        result = None
+    if result is None or result.returncode in (124, 137, -signal.SIGKILL):
+        raise TimeoutError(
+            f"Docker {arguments[0]} timed out after {timeout} seconds"
+        )
+    return result
+
+
+def remove_container(container):
+    for attempt in range(3):
+        try:
+            result = docker_control(["rm", "--force", container], 5)
+            message = (
+                result.stderr.strip()
+                or f"Docker returned {result.returncode}"
+            )
+            if (
+                result.returncode == 0
+                or "no such container" in message.lower()
+            ):
+                return
+        except TimeoutError as exc:
+            message = str(exc)
+        if attempt < 2:
+            time.sleep(0.15)
+    raise RuntimeError(
+        f"Could not remove Docker container {container}: {message}"
+    )
+
+
+def create_container(arguments, name):
+    # If the daemon created a container but its response was lost, the label
+    # distinguishes this invocation even from a name collision.
+    owner = f"sneeze.upscale.owner={uuid.uuid4().hex}"
+    try:
+        result = docker_control(["create", "--label", owner, *arguments], 30)
+        if result.returncode:
+            raise RuntimeError(
+                result.stderr.strip()
+                or f"Docker returned {result.returncode}"
+            )
+        container = result.stdout.strip()
+        if not re.fullmatch("[a-f0-9]{64}", container):
+            raise RuntimeError("Docker did not return a container ID")
+        return container
+    except (OSError, RuntimeError) as exc:
+        try:
+            found = docker_control(
+                [
+                    "ps",
+                    "--all",
+                    "--quiet",
+                    "--no-trunc",
+                    "--filter",
+                    f"name=^/{name}$",
+                    "--filter",
+                    f"label={owner}",
+                ],
+                5,
+            )
+            if found.returncode:
+                raise RuntimeError(
+                    found.stderr.strip()
+                    or f"Docker returned {found.returncode}"
+                )
+            for container in found.stdout.split():
+                remove_container(container)
+        except (OSError, RuntimeError) as cleanup:
+            raise RuntimeError(
+                f"Could not create {name}: {exc}. "
+                f"Could not confirm cleanup: {cleanup}"
+            ) from cleanup
+        raise RuntimeError(f"Could not create {name}: {exc}") from exc
+
+
+def reap_client(proc):
+    if proc.poll() is not None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            # Removing the container also releases a privileged attach
+            # client even when the caller cannot signal it directly.
+            pass
+        try:
+            proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+    raise RuntimeError(f"Could not reap worker client process {proc.pid}")
+
+
+@contextmanager
+def worker_client(command, name):
+    container = None
+    proc = None
+    try:
+        if command[: len(DOCKER) + 1] == [*DOCKER, "run"]:
+            # Create cannot launch a worker. Obtain its identity before
+            # starting it, even when Ctrl-C lands during daemon creation.
+            with guard_launch_or_cleanup():
+                args = command[len(DOCKER) + 1 :]
+                container = create_container(args, name)
+            command = [*DOCKER, "start", "--attach", container]
+        with guard_launch_or_cleanup():
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                bufsize=1,
+                start_new_session=True,
+            )
+        yield proc
+    except BaseException:
+        with guard_launch_or_cleanup():
+            try:
+                if container is not None:
+                    remove_container(container)
+            finally:
+                if proc is not None:
+                    reap_client(proc)
+        raise
+    finally:
+        if proc is not None:
+            proc.stdout.close()
+
+
 def monitor(command, name, report, verbose):
     tail = deque(maxlen=20)
     start = time.monotonic()
     frames = expected = 0
     last_count = None
-    proc = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        errors="replace",
-        bufsize=1,
-    )
-    try:
+    with worker_client(command, name) as proc:
         for raw in proc.stdout:
             line = raw.strip()
             if not line:
@@ -482,28 +641,14 @@ def monitor(command, name, report, verbose):
                 ):
                     report(line)
         status = proc.wait()
-    except BaseException:
-        # The model container can outlive its attached Docker client.
-        # Stop creation/attachment first so a late Docker start cannot race
-        # cleanup. sudo forwards TERM to its child.
-        proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass
-        subprocess.run([*DOCKER, "rm", "-f", name], capture_output=True)
-        raise
-    finally:
-        proc.stdout.close()
-        proc.wait()
-    if status:
-        raise RuntimeError(
-            f"Video worker exited {status}:\n" + "\n".join(tail)
-        )
-    if not frames or frames != expected:
-        raise RuntimeError(
-            f"Incomplete video worker progress ({frames}/{expected})"
-        )
+        if status:
+            raise RuntimeError(
+                f"Video worker exited {status}:\n" + "\n".join(tail)
+            )
+        if not frames or frames != expected:
+            raise RuntimeError(
+                f"Incomplete video worker progress ({frames}/{expected})"
+            )
     return frames
 
 
@@ -513,14 +658,26 @@ def cleanup_on_termination():
         yield
         return
 
+    interrupted = False
+
     def terminate(signum, _frame):
+        nonlocal interrupted
+        if interrupted:
+            return
+        interrupted = True
+        if signum == signal.SIGINT:
+            raise KeyboardInterrupt
         raise SystemExit(128 + signum)
 
-    previous = signal.signal(signal.SIGTERM, terminate)
+    previous_term = signal.signal(signal.SIGTERM, terminate)
     try:
-        yield
+        previous_int = signal.signal(signal.SIGINT, terminate)
+        try:
+            yield
+        finally:
+            signal.signal(signal.SIGINT, previous_int)
     finally:
-        signal.signal(signal.SIGTERM, previous)
+        signal.signal(signal.SIGTERM, previous_term)
 
 
 @contextmanager

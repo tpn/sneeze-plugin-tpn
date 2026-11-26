@@ -228,5 +228,10 @@ class UpscaleVideo(InvariantAwareCommand):
             from .runner import execute
 
             execute(self.args, self.options, self.ostream, self.estream)
+        except KeyboardInterrupt:
+            print(
+                "\nVideo upscaling cancelled.", file=self.estream, flush=True
+            )
+            raise SystemExit(130) from None
         except (ValueError, OSError, RuntimeError) as exc:
             raise CommandError(str(exc)) from exc
