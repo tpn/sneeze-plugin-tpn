@@ -80,10 +80,30 @@ def install_io(height, width, rate, frames, decoder, encoder, lookahead):
         return resize(frames, target_height, target_width, **kwargs)
 
     preprocessing.pil_center_crop_resize = pad_resize
-    if decoder == "nvdec":
+    av1_nvdec = decoder == "nvdec" and os.getenv("JOB_INPUT_CODEC") == "av1"
+    if decoder == "nvdec" and not av1_nvdec:
         import decode_rtx
 
         decode_rtx.install()
+    elif av1_nvdec or os.getenv("JOB_FFMPEG_INPUT") == "1":
+        from worker_io import open_reader
+
+        upstream_chunks = pipeline.iter_lq_video
+
+        def read_normalized(request, **kwargs):
+            if request.lq_video is not None:
+                return upstream_chunks(request, **kwargs)
+            return turbo_input.capture_chunks(
+                lambda: open_reader(request.input_path, decoder, frames),
+                preprocessing,
+                request,
+                **kwargs,
+            )
+
+        pipeline.iter_lq_video = read_normalized
+        # The pipeline otherwise opens a second OpenCV decoder just for fps.
+        # media.py already validated the exact rate from source timestamps.
+        pipeline.get_lq_video_fps = lambda request: float(rate)
     if lookahead:
         turbo_input.install_input_buffers(preprocessing, lookahead)
         read_chunks = pipeline.iter_lq_video

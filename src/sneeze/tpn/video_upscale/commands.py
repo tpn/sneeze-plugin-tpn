@@ -18,8 +18,10 @@ class UpscaleVideo(InvariantAwareCommand):
 
     _usage_ = "%prog [options] INPUT [INPUT ...]"
     _description_ = (
-        "Upscale each input 2× with live frame progress and save a lossless "
-        "H.264 MP4 at the original frame rate. To compare the input with "
+        "Double the displayed width and height of each CFR SDR input. "
+        "The CPU decoder handles non-square pixels and quarter-turn "
+        "rotation. Save a lossless H.264 MP4 with live frame progress. "
+        "To compare the input with "
         "all three models, run 'sne uv -m all --compare input.mp4'."
     )
     _vargc_ = True
@@ -63,7 +65,8 @@ class UpscaleVideo(InvariantAwareCommand):
         _metavar = "MODE"
         _help = (
             "auto (default), cpu, or nvenc. Auto uses NVENC for Turbo "
-            "and CPU x264 for SeedVR2 and LTX. LTX requires CPU."
+            "when it accepts the output size, otherwise CPU x264. "
+            "SeedVR2 and LTX default to CPU. LTX requires CPU."
         )
         _mandatory = False
 
@@ -72,8 +75,10 @@ class UpscaleVideo(InvariantAwareCommand):
         _metavar = "MODE"
         _help = (
             "Input video decoder. Choose auto (default), cpu, or nvdec. "
-            "Auto uses CPU. LTX requires CPU. NVDEC accepts tagged "
-            "limited-range BT.709 H.264 8-bit 4:2:0 with left chroma."
+            "Auto uses CPU. Turbo and SeedVR2 can use the codec GPU for "
+            "8/10-bit 4:2:0 SDR AV1 with even stored dimensions, or "
+            "tagged, upright, square-pixel limited-range "
+            "BT.709 H.264 8-bit 4:2:0 with left chroma. LTX requires CPU."
         )
         _mandatory = False
 

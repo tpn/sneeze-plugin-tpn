@@ -1,17 +1,68 @@
 # Copyright (c) 2026 Trent Nelson
 # SPDX-License-Identifier: Apache-2.0
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from threading import Event, get_ident
 from types import SimpleNamespace
 
 import pytest
 
 from sneeze.tpn.video_upscale.turbo_input import (
+    capture_chunks,
     install_input_buffers,
     prefetch,
     resolve_lookahead,
 )
+
+
+@pytest.mark.parametrize(
+    ("limit", "sizes"), [(None, [17, 16, 3]), (1, [1]), (18, [17, 1])]
+)
+@pytest.mark.parametrize("depth", [0, 2])
+def test_capture_windows_preserve_normalized_pixels_and_tail(
+    limit, sizes, depth
+):
+    np = pytest.importorskip("numpy")
+    bgr = [
+        np.broadcast_to(np.uint8([i, 99, 200]), (5, 3, 3)) for i in range(36)
+    ]
+    source = iter(bgr)
+    events = []
+
+    @contextmanager
+    def capture():
+        events.append(("open", get_ident()))
+        try:
+
+            def read():
+                frame = next(source, None)
+                return frame is not None, frame
+
+            yield SimpleNamespace(read=read)
+        finally:
+            events.append(("close", get_ident()))
+
+    request = SimpleNamespace(max_frames=limit, validate=lambda: None)
+    preprocessing = SimpleNamespace(
+        _frames_to_tensor=lambda frames, request, stream: np.stack(frames)
+    )
+
+    def chunks():
+        return capture_chunks(
+            capture,
+            preprocessing,
+            request,
+            first_chunk_frames=17,
+            chunk_frames=16,
+        )
+
+    output = list(prefetch(chunks, depth) if depth else chunks())
+    assert [len(window) for window in output] == sizes
+    np.testing.assert_array_equal(
+        np.concatenate(output), np.stack(bgr[:limit])[..., ::-1]
+    )
+    assert events == [("open", events[0][1]), ("close", events[0][1])]
+    assert (events[0][1] != get_ident()) == bool(depth)
 
 
 @pytest.mark.parametrize("lookahead", [1, 2, 4])

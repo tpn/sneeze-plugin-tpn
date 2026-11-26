@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Trent Nelson
 """Normalize bounded FlashVSR+ input windows ahead of the model."""
 
+from itertools import islice
 from threading import local
 
 # In Docker these modules are mounted as standalone worker scripts.
@@ -20,6 +21,41 @@ def resolve_lookahead(input_mode, raw_depth):
     return parse_lookahead(
         raw_depth, model="Turbo", default=0 if input_mode == "serial" else 1
     )
+
+
+def capture_chunks(
+    make_capture,
+    preprocessing,
+    request,
+    *,
+    chunk_frames,
+    first_chunk_frames=None,
+    stream=True,
+):
+    """Feed a normalized BGR capture to Turbo's usual RGB preprocessing."""
+    request.validate()
+    size = chunk_frames if first_chunk_frames is None else first_chunk_frames
+    if min(size, chunk_frames) <= 0:
+        raise ValueError("Frame window sizes must be positive")
+    with make_capture() as capture:
+
+        def rgb_frames():
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    return
+                # _frames_to_tensor stacks the frames into a contiguous array.
+                yield frame[:, :, ::-1]
+
+        source = islice(rgb_frames(), request.max_frames)
+        while frames := list(islice(source, size)):
+            window = preprocessing._frames_to_tensor(
+                frames, request, stream=stream
+            )
+            del frames
+            yield window
+            del window
+            size = chunk_frames
 
 
 def install_input_buffers(preprocessing, lookahead=1):

@@ -4,13 +4,23 @@ Public Sneeze plugin package for `sneeze.tpn`.
 
 ## Local 2× video upscaling
 
-`sne upscale-video` (alias `sne uv`) doubles both dimensions of a local
-constant-frame-rate SDR video. It saves a lossless H.264 MP4 at the source
-frame rate. Inputs need square pixels and any display rotation applied.
+`sne upscale-video` (alias `sne uv`) doubles the **display width and
+height** of a local constant-frame-rate SDR video and saves a square-pixel
+H.264 MP4 at the source frame rate. Landscape, portrait, odd-sized and
+nonstandard input rasters are supported. The workers pad to their model's
+internal alignment where needed, then crop the result to the target.
+
+For example, 1280×720 becomes 2560×1440. A 720×576 video with a 16:15
+sample aspect ratio displays at 768×576, so its output is 1536×1152.
+The CPU decoder normalizes non-square pixels and applies quarter-turn
+display rotation before inference. Fractional display widths round to the
+nearest whole pixel before doubling. All three presets use 2×. The command
+has no target-size or scale option.
 
 ```sh
 sne uv input.mp4
 sne uv -m seedvr2 -o enhanced.mp4 input.mp4
+sne uv -m seedvr2 --decoder nvdec --encoder nvenc input-av1.mp4
 sne uv -m ltx --compare input.mp4
 sne uv -m all --compare --output-dir results input.mp4
 sne uv --dry-run --output-dir results "first input.mp4" "second input.mp4"
@@ -46,6 +56,20 @@ paths alone or `-v` for full worker logs. Audio defaults to stream copy
 with AAC fallback. Outputs are staged and verified before publication.
 See `sne uv --help` for codec, audio and model-specific options.
 
+The default CPU input path uses FFmpeg software decoding for AV1 and
+display normalization. Turbo and SeedVR2 also support `--decoder nvdec`
+for 8- or 10-bit 4:2:0 SDR AV1 with even stored dimensions on the
+configured codec GPU. Use `--decoder cpu` for an odd stored width or
+height. An explicit hardware request fails if NVDEC cannot decode the input.
+The decoded frames return to host memory for color conversion
+and transfer to the inference GPU. The output remains 8-bit H.264.
+The H.264 NVDEC path requires square pixels, upright orientation and
+tagged limited-range BT.709 8-bit 4:2:0 with left chroma.
+Encoder selection is independent. In auto encoder mode, the command checks
+the requested output size with NVENC before inference and uses CPU x264 when
+NVENC cannot open it. An explicit `--encoder nvenc` reports the error.
+The available GPU memory still limits the model's working resolution.
+
 ### Video runtime configuration
 
 Rendering requires a prepared Linux GPU runtime with Docker, the NVIDIA
@@ -74,7 +98,7 @@ The defaults below show the layout expected of a prepared runtime.
 | `seedvr2` | `seedvr2` | SeedVR2 source and weights, `inference_cli`, `attention`, `norm_kernel` and `tuning` |
 | `ltx` | `ltx` | ComfyUI, LTX nodes and the `attention_backend` and `weights` modules |
 | `ltx_assets` | `ltx-assets` | Directory mounted alongside the LTX runtime for shared assets and symlink targets |
-| `codecs` | `codecs` | The `decode_rtx` and `encode_rtx` adapters for the codec GPU |
+| `codecs` | `codecs` | The `decode_rtx` and `encode_rtx` adapters, each exposing `RTX_UUID` to select the codec GPU |
 
 The launcher mounts runtime assets read-only and the selected model's
 `cache/` directory writable. Model weights, adapter implementations and

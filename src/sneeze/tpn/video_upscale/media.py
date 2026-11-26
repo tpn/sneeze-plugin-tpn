@@ -9,9 +9,14 @@ import sys
 from fractions import Fraction
 from pathlib import Path
 
+if __package__:
+    from .encoder_geometry import resolve_encoder
+else:
+    from encoder_geometry import resolve_encoder
+
 SCRIPTS = Path(__file__).resolve().parent
 WORK = Path("/output")
-NVDEC_FORMAT = {
+H264_NVDEC_FORMAT = {
     "codec_name": "h264",
     "pix_fmt": "yuv420p",
     "color_range": "tv",
@@ -21,7 +26,7 @@ NVDEC_FORMAT = {
     "chroma_location": "left",
 }
 OUTPUT_FORMAT = {
-    k: v for k, v in NVDEC_FORMAT.items() if k != "chroma_location"
+    k: v for k, v in H264_NVDEC_FORMAT.items() if k != "chroma_location"
 }
 
 
@@ -80,20 +85,46 @@ def timestamps(path, info, rate):
     return len(pts), pts[0] * scale
 
 
+def pixel_aspect_ratio(video_info):
+    value = video_info.get("sample_aspect_ratio")
+    if value in (None, "N/A", "0:1"):
+        return Fraction(1)
+    try:
+        ratio = Fraction(value.replace(":", "/"))
+        if ratio > 0:
+            return ratio
+    except (ValueError, ZeroDivisionError):
+        pass
+    raise ValueError(f"Invalid sample aspect ratio {value}") from None
+
+
+def display_geometry(v):
+    """Square-pixel raster in display orientation, rounded to whole pixels."""
+    width = v["width"] * pixel_aspect_ratio(v)
+    width = max(1, int(width + Fraction(1, 2)))
+    height = v["height"]
+    for side in v.get("side_data_list", []):
+        rotation = float(side.get("rotation", 0)) % 360
+        if rotation % 90:
+            raise ValueError(
+                f"Apply the {rotation:g}° display rotation before upscaling. "
+                "Automatic orientation supports multiples of 90°."
+            )
+        if rotation in (90, 270):
+            return height, width
+    return width, height
+
+
+def needs_display_transform(v):
+    return pixel_aspect_ratio(v) != 1 or any(
+        side.get("side_data_type") == "Display Matrix" or side.get("rotation")
+        for side in v.get("side_data_list", [])
+    )
+
+
 def validate_source(v, decoder):
-    if v.get("disposition", {}).get("attached_pic") or v.get(
-        "sample_aspect_ratio"
-    ) not in (None, "N/A", "0:1", "1:1"):
-        raise ValueError(
-            "Use square pixels and put the main video stream first"
-        )
-    if any(
-        float(info.get("rotation", 0)) % 360
-        for info in v.get("side_data_list", [])
-    ):
-        raise ValueError(
-            "Apply the source's display rotation before upscaling"
-        )
+    if v.get("disposition", {}).get("attached_pic"):
+        raise ValueError("Put the main video stream before the cover image")
     if (
         v.get("color_transfer") in ("smpte2084", "arib-std-b67")
         or v.get("color_primaries") == "bt2020"
@@ -101,15 +132,40 @@ def validate_source(v, decoder):
         raise ValueError(
             "Convert HDR or wide-gamut input to SDR before upscaling"
         )
-    if decoder == "nvdec":
-        # The RTX decoder writes these exact tags into its raw pipe.
-        for key, expected in NVDEC_FORMAT.items():
-            if v.get(key) != expected:
-                actual = v.get(key, "unspecified")
-                raise ValueError(
-                    f"NVDEC needs {key}={expected}, input is {actual}. "
-                    "Use --decoder cpu for this source."
-                )
+    if decoder != "nvdec":
+        return
+    if v["codec_name"] == "av1":
+        if v["width"] % 2 or v["height"] % 2:
+            # CUVID can resample into an even-sized surface. Cropping it
+            # back does not reliably recover the original chroma samples.
+            raise ValueError(
+                "AV1 NVDEC requires even stored width and height. "
+                "Use --decoder cpu for this source."
+            )
+        if v.get("pix_fmt") not in ("yuv420p", "yuv420p10le"):
+            raise ValueError(
+                f"AV1 NVDEC requires 8- or 10-bit 4:2:0, "
+                f"input is {v.get('pix_fmt', 'unspecified')}. "
+                "Use --decoder cpu for this source."
+            )
+        return
+    if v["codec_name"] != "h264":
+        raise ValueError(
+            f"NVDEC input supports H.264 and AV1, got {v['codec_name']}. "
+            "Use --decoder cpu for this source."
+        )
+    if needs_display_transform(v):
+        raise ValueError(
+            "Use --decoder cpu to normalize H.264 pixel aspect or orientation"
+        )
+    # The H.264 adapter writes these exact tags into its raw pipe.
+    for key, expected in H264_NVDEC_FORMAT.items():
+        if v.get(key) != expected:
+            actual = v.get(key, "unspecified")
+            raise ValueError(
+                f"H.264 NVDEC needs {key}={expected}, input is {actual}. "
+                "Use --decoder cpu for this source."
+            )
 
 
 def audio_plan(source, audio, mode):
@@ -215,26 +271,51 @@ def finalize_audio(silent, source, dest, audio, codecs, start, duration):
 def main(model, source):
     tracks = streams(source)
     v = video(tracks)
-    validate_source(v, os.environ.get("VSR_DECODER", "auto"))
-    width, height = v["width"], v["height"]
+    decoder = os.environ.get("VSR_DECODER", "cpu")
+    validate_source(v, decoder)
+    width, height = display_geometry(v)
+    # OpenCV's bundled FFmpeg lacks a working software AV1 decoder here.
+    # Keep the measured H.264/HEVC path for normal square-pixel material.
+    if decoder == "nvdec":
+        ffmpeg_input = v["codec_name"] == "av1"
+        input_label = "RTX NVDEC"
+    else:
+        ffmpeg_input = needs_display_transform(v) or v["codec_name"] not in (
+            "h264",
+            "hevc",
+        )
+        input_label = "FFmpeg CPU" if ffmpeg_input else "OpenCV CPU"
     raw_rate = v.get("avg_frame_rate", "0/0")
     rate = Fraction(v["r_frame_rate"] if raw_rate == "0/0" else raw_rate)
     if rate <= 0:
         raise ValueError("Video must have a positive, constant frame rate")
     count, first_pts = timestamps(source, v, rate)
     print(
-        f"Input {width}x{height}, {count} frames at {rate} fps; "
-        f"target {2 * width}x{2 * height}",
+        f"Input {v['codec_name']} {v['width']}x{v['height']} stored "
+        f"(SAR {v.get('sample_aspect_ratio') or 'unspecified'}), "
+        f"{width}x{height} displayed, {count} frames at {rate} fps; "
+        f"target {2 * width}x{2 * height} ({input_label} input)",
         flush=True,
     )
     audio = [t for t in tracks if t["codec_type"] == "audio"]
     codecs = audio_plan(source, audio, os.environ.get("VSR_AUDIO", "auto"))
     env = dict(
         os.environ,
+        VSR_ENCODER=resolve_encoder(
+            os.environ.get("VSR_ENCODER", "cpu"),
+            os.environ.get("VSR_ENCODER_REQUEST", "auto"),
+            2 * width,
+            2 * height,
+            rate,
+        ),
         JOB_WIDTH=str(width),
         JOB_HEIGHT=str(height),
         JOB_RATE=str(rate),
         JOB_COUNT=str(count),
+        JOB_INPUT_CODEC=v["codec_name"],
+        JOB_INPUT_PIX_FMT=v.get("pix_fmt", ""),
+        JOB_INPUT_COLOR_RANGE=v.get("color_range", ""),
+        JOB_FFMPEG_INPUT="1" if ffmpeg_input else "0",
     )
     silent = WORK / "video.mp4"
     dest = WORK / "verified.mp4"
@@ -258,6 +339,8 @@ def main(model, source):
         (w["width"], w["height"], frames) != (2 * width, 2 * height, count)
         or first != 0
         or Fraction(w["avg_frame_rate"]) != rate
+        or pixel_aspect_ratio(w) != 1
+        or display_geometry(w) != (w["width"], w["height"])
         or any(w.get(k) != expected for k, expected in OUTPUT_FORMAT.items())
     ):
         raise ValueError(

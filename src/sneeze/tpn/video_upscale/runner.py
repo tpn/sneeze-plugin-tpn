@@ -59,6 +59,7 @@ class Job:
     output: Path
     settings: dict
     preview: Path | None = None
+    encoder_request: str = "auto"
 
 
 def choice(options, key, default, allowed):
@@ -268,7 +269,15 @@ def plan(args, opts):
             # Resolve the directory only so a final symlink is visible.
             dest = dest.parent.resolve() / dest.name
             reserve(dest)
-            jobs.append(Job(model, source, dest, settings(model, opts)))
+            jobs.append(
+                Job(
+                    model,
+                    source,
+                    dest,
+                    settings(model, opts),
+                    encoder_request=opts.get("encoder") or "auto",
+                )
+            )
         if opts.get("compare"):
             preview = dest.with_name(f"{source.stem}-{selected}-compare.mp4")
             reserve(preview)
@@ -349,6 +358,7 @@ def container_command(job, stage, name):
     ]
     env = {
         "CUDA_VISIBLE_DEVICES": GB300,
+        "VSR_ENCODER_REQUEST": job.encoder_request,
         "NVIDIA_DRIVER_CAPABILITIES": "compute,video,utility",
         "OMP_NUM_THREADS": "8",
         "PYTHONDONTWRITEBYTECODE": "1",
