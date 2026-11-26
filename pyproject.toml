@@ -32,6 +32,7 @@ dev = [
 
 [project.entry-points."sneeze.plugins"]
 tpn = "sneeze.tpn"
+tpn-video = "sneeze.tpn.video_upscale"
 
 [project.scripts]
 sne-tpn-upscale = "sneeze.tpn.upscale.cli:main"

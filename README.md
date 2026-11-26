@@ -2,6 +2,84 @@
 
 Public Sneeze plugin package for `sneeze.tpn`.
 
+## Local 2× video upscaling
+
+`sne upscale-video` (alias `sne uv`) doubles both dimensions of a local
+constant-frame-rate SDR video. It saves a lossless H.264 MP4 at the source
+frame rate. Inputs need square pixels and any display rotation applied.
+
+```sh
+sne uv input.mp4
+sne uv -m seedvr2 -o enhanced.mp4 input.mp4
+sne uv -m ltx --compare input.mp4
+sne uv -m all --compare --output-dir results input.mp4
+sne uv --dry-run --output-dir results "first input.mp4" "second input.mp4"
+```
+
+| Model | Default configuration |
+| --- | --- |
+| `turbo` (default) | FlashVSR+ Turbo, FlashAttention-4, fast decoder with microbatch 2, CPU input decode and NVENC output |
+| `seedvr2` | SeedVR2-7B standard, FlashAttention-4, fused VAE, CPU decode and x264 output |
+| `ltx` | LTX-2.5 22B with the Refine Details adapter at full strength, FlashAttention-4, 2048-pixel VAE tiles, CPU decode and x264 output |
+
+`-m both` selects Turbo and SeedVR2. `-m all` selects all three models.
+Each input and model gets its own file named `<input-stem>-<model>-2x.mp4`.
+With `--compare`, the command also produces a labeled viewing copy. The
+four-panel version shows the input and Turbo above SeedVR2 and LTX.
+
+Use `--lookahead 0..4` to set how many windows the CPU can prepare ahead
+of Turbo or SeedVR2. Zero reads on demand. Turbo defaults to 2 windows
+of typically 16 frames. SeedVR2 defaults to 0 and reads outer chunks of
+53 frames. For independent settings, use
+`--turbo-lookahead 2 --seed-lookahead 1`. SeedVR2's `--seed-overlap`
+controls how many context frames neighboring chunks share.
+
+LTX uses a content-neutral prompt. Set `--ltx-prompt "scene description"`
+to describe the input or `--ltx-strength` to adjust the adapter weight
+from 0 to 1. `--ltx-chunk` controls the number of frames per outer chunk
+(9–241 in steps of 8, default 241). Longer clips use overlapping chunks.
+`--ltx-vae-tile` accepts 512, 1024, 1536 or 2048 pixels.
+
+Jobs run sequentially. The command reports model progress and end-to-end
+fps on stderr and prints completed output paths on stdout. Use `-q` for
+paths alone or `-v` for full worker logs. Audio defaults to stream copy
+with AAC fallback. Outputs are staged and verified before publication.
+See `sne uv --help` for codec, audio and model-specific options.
+
+### Video runtime configuration
+
+Rendering requires a prepared Linux GPU runtime with Docker, the NVIDIA
+Container Toolkit, the pinned images used by the workers, and the selected
+model's weights and runtime adapters. The current workers target NVIDIA
+GB300 inference. Turbo defaults to a separate NVENC-capable codec GPU.
+The host launcher uses `sudo -n docker`. Workers run offline.
+
+Create `sneeze/video-upscale.toml` under your user configuration directory
+(`$XDG_CONFIG_HOME`, normally `~/.config`). Use your own values for
+the runtime root and inference GPU. The GPU UUID is available from
+`nvidia-smi -L`.
+
+```toml
+root = "/path/to/video-runtimes"
+gpu = "GPU-<inference-device-uuid>"
+```
+
+The optional `[paths]` table selects directories relative to `root`.
+The defaults below show the layout expected of a prepared runtime.
+
+| Key | Default directory | Contents |
+| --- | --- | --- |
+| `turbo` | `turbo` | Turbo weights and the `decoder_speed`, `sparse_fa4` and `gpu_writer` adapters |
+| `flashvsr` | `flashvsr/source` | FlashVSR+ source with its pinned dependencies and attention operator |
+| `seedvr2` | `seedvr2` | SeedVR2 source and weights, `inference_cli`, `attention`, `norm_kernel` and `tuning` |
+| `ltx` | `ltx` | ComfyUI, LTX nodes and the `attention_backend` and `weights` modules |
+| `ltx_assets` | `ltx-assets` | Directory mounted alongside the LTX runtime for shared assets and symlink targets |
+| `codecs` | `codecs` | The `decode_rtx` and `encode_rtx` adapters for the codec GPU |
+
+The launcher mounts runtime assets read-only and the selected model's
+`cache/` directory writable. Model weights, adapter implementations and
+container images are provisioned separately from this plugin.
+
 ## Local 4K image upscaling
 
 Use `sne-tpn-upscale` when the only available input is a raster image. If an

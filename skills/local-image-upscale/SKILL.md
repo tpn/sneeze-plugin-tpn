@@ -34,10 +34,9 @@ qualified result.
 
 1. Resolve `sne-tpn-upscale` and record the executable path. Do not assume a
    similarly named checkout or stale worktree is interchangeable.
-2. If it is not installed, use a reviewed checkout of
-   `/home/trentn/src/sneeze-plugin-tpn` and follow its control-environment
-   installation instructions. Keep Torch and the model out of that lightweight
-   environment; `setup` owns the isolated runtime.
+2. If it is not installed, follow the control-environment installation
+   instructions in a reviewed checkout of `sneeze-plugin-tpn`. The
+   `setup` command installs Torch and the model in the isolated runtime.
 3. When setup is needed, inspect the plan before mutation:
 
    ```bash
